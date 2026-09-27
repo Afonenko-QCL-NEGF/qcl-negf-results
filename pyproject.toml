@@ -8,8 +8,8 @@ license = "MIT"
 requires-python = ">=3.14,<3.15"
 
 [project.urls]
-Repository = "https://github.com/AfonenkoA/qcl-negf-results"
-Issues = "https://github.com/AfonenkoA/qcl-negf-results/issues"
+Repository = "https://github.com/Afonenko-QCL-NEGF/qcl-negf-results"
+Issues = "https://github.com/Afonenko-QCL-NEGF/qcl-negf-results/issues"
 
 [project.scripts]
 qcl-negf-results = "qcl_negf_results.cli:main"
