@@ -713,7 +713,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     identity = hashlib.sha256(json_bytes({"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET, "profile": profile,
         "commits": [item.sha256 for item in commits], "coverage": coverage,
         "native_format": "4.0", "history_closure": "verified-cumulative-physical-markers-psd-v4", "inventory": "complete-performance-v2",
-        "derivation": derivation, "exporter_revision": 5,
+        "derivation": derivation, "exporter_revision": 6,
         "size_policy": "single-complete-archive-v1",
         "compressor": compressor,
         "plan": plan_metadata, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
@@ -744,12 +744,17 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                 report("capturing", completed_bytes=captured_bytes, total_bytes=unique_size,
                        completed_files=len(files), total_files=len(object_contracts))
             _verify_recovery_closure(commit, artifact, files[name][0])
+            provenance = None
+            if artifact.media_type == "application/x-hdf5":
+                from .provenance import verify_native_provenance
+                provenance = verify_native_provenance(files[name][0], commit.value["identity"], plan_value)
             window = profile == "science" and artifact.role == "performance.full"
             record_map[commit.sha256]["included"].append({
                 "role": "performance.window" if window else artifact.role,
                 **({"source_role": artifact.role, "selection": "all committed segments per table"} if window else {}),
                 "object": name,
                 "source_path": artifact.path, "sha256": artifact.sha256,
+                **({"native_provenance": provenance} if provenance is not None else {}),
                 **({"schema": artifact.schema} if artifact.schema is not None else {}),
                 "dependencies": [next(f"objects/{item.sha256}" + {
                     "application/x-hdf5": ".h5", "application/vnd.apache.parquet": ".parquet",

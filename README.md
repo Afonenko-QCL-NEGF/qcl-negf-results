@@ -68,6 +68,24 @@ scope, or in the whole plan when none is selected. Absent current series rows
 remain explicit missing records and prevent `complete=true`, even after a
 terminal process status.
 
+Captured native HDF5 metadata is compared with its original owning commit before
+derivation. Analysis and closed history segments store `/metadata/identity_json`
+(`QCLNEGFRunner` `point_artifacts.jl:314`, `scientific_history.jl:138`); full physics
+and recovery store `/metadata/point_identity_json` (`hdf5.jl:288`). Cumulative
+history's `/metadata/source_segments_json` intentionally contains earlier attempts:
+point/execution/plan identity must agree and source attempts lie between one and
+the owning commit cutoff. A borrowed checkpoint is checked against its original
+commit, rather than the newer series attempt. Missing metadata or counterpart
+fields remain explicit `not_available`; an available identity mismatch fails.
+
+Kelvin scalars `/metadata/temperature_K` and `/inputs/T_L_K` are compared exactly
+with the frozen point. Both voltage aliases `/metadata/voltage_per_period_V`
+(`point_artifacts.jl:335`) and `/inputs/V_period_V` (`hdf5.jl:345`) are reconstructed
+by the producer from `F_bias * period_length`. An exact Float64 match is recorded
+as `matched`; a different value retains observed/expected values and producer
+path with `not_verified`, since a floating roundtrip comparison policy has not
+been established. No scientific tolerance or approximate-match pass is added.
+
 Telemetry identifies CPU intervals by `allocation_id` (for example, a Slurm job/step identity), with separate execution and process identities. Missing counters remain unknown. `TelemetryWriter` is a library for producers; it does not run a background machine sampler.
 
 Each new science, full-state or diagnostic export is one `.tar.xz` archive with no fixed archive size ceiling. The v3 scientific receipt identifies its display filename, storage archive name, SHA256, compressed bytes and pinned snapshot identity. The transport index records whole native objects; it never splits or drops them to fit a transfer limit. Compression and independent verification stream through bounded IO buffers before atomic finalization. Storage exhaustion or cancellation before finalization removes temporary output and publishes no successful receipt. Disk usage includes the captured snapshot, any verified derivations and the compressed archive.
