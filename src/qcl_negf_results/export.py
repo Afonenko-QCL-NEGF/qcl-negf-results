@@ -66,6 +66,47 @@ def _pin(path: Path, expected_sha256: str | None = None) -> PinnedCommit:
     return PinnedCommit(path, value, digest, artifacts)
 
 
+def _verify_series_reference(point: dict[str, Any], series: dict[str, Any],
+                              commit: PinnedCommit) -> dict[str, Any]:
+    """Bind this series row to its exact reference, including borrowed checkpoints."""
+    identity = commit.value["identity"]
+    checks: dict[str, Any] = {}
+    expected = {"point_id": point.get("id")}
+    if not isinstance(expected["point_id"], str) or not expected["point_id"]:
+        raise ContractError("series commit reference requires a point ID", "corrupt_result")
+    for key, container in (("execution_id", point), ("plan_fingerprint", series)):
+        if key in container:
+            expected[key] = container[key]
+        else:
+            checks[key] = "not_available"
+    for key, value in expected.items():
+        if identity.get(key) != value:
+            raise ContractError(f"series point differs from its referenced commit {key}", "corrupt_result")
+        checks[key] = "matched"
+    data = point.get("data") or {}
+    row_attempt = point.get("attempt")
+    source_attempt = data.get("checkpoint_source_attempt", row_attempt)
+    if "checkpoint_source_attempt" in data:
+        if (point.get("status") != "paused" or data.get("pause_reason") != "resource_pressure"
+                or data.get("resume_kind") != "checkpoint"
+                or data.get("recovery_origin") != "last_committed_before_resource_pause"
+                or type(source_attempt) is not int or type(row_attempt) is not int
+                or not 0 < source_attempt < row_attempt):
+            raise ContractError("invalid historical checkpoint lineage in series commit reference", "corrupt_result")
+        checks["checkpoint_lineage"] = {"source_attempt": source_attempt, "current_attempt": row_attempt,
+            "pause_reason": data["pause_reason"], "resume_kind": data["resume_kind"],
+            "recovery_origin": data["recovery_origin"]}
+    if "attempt" in point:
+        if type(row_attempt) is not int or row_attempt < 1 or type(identity.get("attempt")) is not int:
+            raise ContractError("series commit reference requires positive integer attempts", "corrupt_result")
+        if identity["attempt"] != source_attempt:
+            raise ContractError("series point differs from its referenced commit attempt", "corrupt_result")
+        checks["attempt"] = "matched"
+    else:
+        checks["attempt"] = "not_available"
+    return checks
+
+
 def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict[str, Any] | None]:
     """Capture the series once, then follow only explicit committed references."""
     commits: list[PinnedCommit] = []
@@ -95,16 +136,20 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
         if series.get("schema") != "qcl-negf-series-result-v3":
             raise ContractError("unsupported scientific series result schema", "incompatible_contract")
         rows = series.get("points", [])
-        if not isinstance(rows, list):
-            raise ContractError("series points must be a list", "corrupt_result")
-        for point in rows:
+        history = series.get("attempt_history", [])
+        if not isinstance(rows, list) or not isinstance(history, list):
+            raise ContractError("series points and attempt history must be lists", "corrupt_result")
+        for row_number, point in enumerate(rows + history):
             if not isinstance(point, dict):
                 raise ContractError("series point must be an object", "corrupt_result")
             data = point.get("data") or {}
             if not isinstance(data, dict):
                 raise ContractError("series point data must be an object", "corrupt_result")
             reference = data.get("result_commit")
-            entry = {key: point[key] for key in ("id", "execution_id", "status", "quality", "converged") if key in point}
+            if "checkpoint_source_attempt" in data and not reference:
+                raise ContractError("historical checkpoint lineage requires a series commit reference", "corrupt_result")
+            entry = {key: point[key] for key in ("id", "execution_id", "attempt", "status", "quality", "converged") if key in point}
+            entry["series_section"] = "points" if row_number < len(rows) else "attempt_history"
             if reference:
                 if isinstance(reference, dict):
                     path = safe_path(root, reference["path"])
@@ -112,14 +157,17 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
                 else:
                     path, expected = safe_path(root, reference), None
                 commit = _pin(path, expected)
+                entry["reference_identity_checks"] = _verify_series_reference(point, series, commit)
                 if path not in seen:
                     commits.append(commit)
                     seen.add(path)
                 entry["commit_sha256"] = commit.sha256
+                entry["source_commit_path"] = str(path.relative_to(root))
                 entry["scientific_accepted"] = commit.value.get("scientific_accepted", False)
             else:
                 entry["availability"] = "no_committed_physical_record"
-            coverage.append(entry)
+            if reference or row_number < len(rows):
+                coverage.append(entry)
     # Standalone CLI point and explicit campaign commit use the same contract.
     for pointer in (root / "artifacts" / "current.json",):
         if pointer.exists():

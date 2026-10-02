@@ -55,6 +55,14 @@ fields are not invented: `identity_verified_against` names the checks actually
 performed. Julia's canonical fingerprint computation remains the runner's
 responsibility. Scientific plans do not acquire a result `contract_set` field.
 
+Every series point or attempt-history reference is also checked against the
+specific pinned commit it names. Matching membership in the same plan is
+insufficient: point ID, available execution/plan identity and attempt must agree.
+An older checkpoint attempt is accepted only with the runner's explicit paused
+resource-pressure lineage and its exact `checkpoint_source_attempt`. Coverage
+records these checks and unavailable fields; referenced historical commits are
+included without treating missing historical records as missing current points.
+
 Telemetry identifies CPU intervals by `allocation_id` (for example, a Slurm job/step identity), with separate execution and process identities. Missing counters remain unknown. `TelemetryWriter` is a library for producers; it does not run a background machine sampler.
 
 Each new science, full-state or diagnostic export is one `.tar.xz` archive with no fixed archive size ceiling. The v3 scientific receipt identifies its display filename, storage archive name, SHA256, compressed bytes and pinned snapshot identity. The transport index records whole native objects; it never splits or drops them to fit a transfer limit. Compression and independent verification stream through bounded IO buffers before atomic finalization. Storage exhaustion or cancellation before finalization removes temporary output and publishes no successful receipt. Disk usage includes the captured snapshot, any verified derivations and the compressed archive.
