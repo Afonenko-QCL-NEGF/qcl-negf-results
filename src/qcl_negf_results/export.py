@@ -582,11 +582,16 @@ def _frozen_plan(plan: Mapping[str, Any] | bytes | None, source: str | None
 
 
 def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
-                          series: dict[str, Any] | None) -> list[str]:
+                          series: dict[str, Any] | None) -> tuple[list[str], list[dict[str, Any]]]:
     """Compare saved identities; Julia's canonical fingerprints are not recomputed here."""
     verified: set[str] = set()
     executions = {item["id"]: item for item in plan["executions"]}
     points = {item["id"]: item for item in plan["points"]}
+    selected = series.get("selected_execution_id") if series is not None else None
+    if selected is not None and (not isinstance(selected, str) or selected not in executions):
+        raise ContractError("frozen plan does not contain selected execution", "corrupt_result")
+    expected_points = {key for key, point in points.items()
+                       if selected is None or point["execution_id"] == selected}
     for point in points.values():
         if point["execution_id"] not in executions:
             raise ContractError("frozen plan point identifies an unknown execution", "corrupt_result")
@@ -606,9 +611,12 @@ def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
         if identifier is not None and point is None:
             raise ContractError(f"frozen plan does not contain {locator} point", "corrupt_result")
         execution = identity.get("execution_id")
-        if execution is not None and (execution not in executions or
+        if execution is not None and (not isinstance(execution, str) or execution not in executions or
                 point is not None and execution != point["execution_id"]):
             raise ContractError(f"frozen plan differs from {locator} execution", "corrupt_result")
+        if selected is not None and (execution is not None and execution != selected
+                or point is not None and point["execution_id"] != selected):
+            raise ContractError(f"frozen plan {locator} is outside the selected execution", "corrupt_result")
         if point is not None:
             verified.add(f"{locator}.point_id")
         if execution is not None:
@@ -620,9 +628,6 @@ def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
                               ("plan_scientific_fingerprint", plan["scientific_fingerprint"]),
                               ("root_definition_id", plan["root_definition_id"])):
             compare(series, key, expected, "series")
-        selected = series.get("selected_execution_id")
-        if selected is not None and selected not in executions:
-            raise ContractError("frozen plan does not contain selected execution", "corrupt_result")
         for row in series.get("points", []) + series.get("attempt_history", []):
             point = point_identity(row, "series.point")
             if point is not None and "coordinates" in row:
@@ -636,7 +641,11 @@ def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
         compare(identity, "plan_fingerprint", plan["fingerprint"], "commit")
         compare(identity, "plan_scientific_fingerprint", plan["scientific_fingerprint"], "commit")
         point_identity(identity, "commit")
-    return sorted(verified)
+    recorded = {row.get("id") for row in (series or {}).get("points", []) if isinstance(row.get("id"), str)}
+    missing = [{"id": identifier, "execution_id": points[identifier]["execution_id"],
+                "series_section": "points", "availability": "no_series_point_record"}
+               for identifier in sorted(expected_points - recorded)]
+    return sorted(verified), missing
 
 
 def export_snapshot(job_root: Path, destination: Path, *, profile: str = "science",
@@ -669,7 +678,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     commits, coverage, series = _collect(root)
     if plan_value is not None:
         assert plan_metadata is not None
-        plan_metadata["identity_verified_against"] = _verify_plan_identity(plan_value, commits, series)
+        plan_metadata["identity_verified_against"], missing_points = _verify_plan_identity(plan_value, commits, series)
+        coverage.extend(missing_points)
     captured_unix = time.time()  # The cutoff describes the now fully pinned reference set.
     replacements = _history_replacements(commits, profile)
     selected: list[tuple[PinnedCommit, Artifact]] = []
@@ -703,7 +713,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     identity = hashlib.sha256(json_bytes({"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET, "profile": profile,
         "commits": [item.sha256 for item in commits], "coverage": coverage,
         "native_format": "4.0", "history_closure": "verified-cumulative-physical-markers-psd-v4", "inventory": "complete-performance-v2",
-        "derivation": derivation, "exporter_revision": 4,
+        "derivation": derivation, "exporter_revision": 5,
         "size_policy": "single-complete-archive-v1",
         "compressor": compressor,
         "plan": plan_metadata, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
@@ -774,7 +784,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         all_objects = set(files)
         if any(dep not in all_objects for record in records for item in record["included"] for dep in item["dependencies"]):
             raise ContractError("export closure contains a dangling object reference", "corrupt_result")
-        missing = [item for item in coverage if item.get("availability") == "no_committed_physical_record"]
+        missing = [item for item in coverage if item.get("availability") in {
+            "no_committed_physical_record", "no_series_point_record"}]
         job_complete = job_status in TERMINAL
         has_science = any(item.role in {"physics.analysis", "science.comparison"} for _, item in selected)
         if not has_science:

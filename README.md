@@ -62,6 +62,11 @@ An older checkpoint attempt is accepted only with the runner's explicit paused
 resource-pressure lineage and its exact `checkpoint_source_attempt`. Coverage
 records these checks and unavailable fields; referenced historical commits are
 included without treating missing historical records as missing current points.
+When a selected execution is declared, every referenced row and commit must
+belong to that execution. The frozen plan defines expected point IDs in that
+scope, or in the whole plan when none is selected. Absent current series rows
+remain explicit missing records and prevent `complete=true`, even after a
+terminal process status.
 
 Telemetry identifies CPU intervals by `allocation_id` (for example, a Slurm job/step identity), with separate execution and process identities. Missing counters remain unknown. `TelemetryWriter` is a library for producers; it does not run a background machine sampler.
 
