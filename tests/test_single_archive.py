@@ -12,12 +12,13 @@ import pytest
 from qcl_negf_results.commits import artifact_row, json_bytes
 from qcl_negf_results.export import export_snapshot
 from test_export import fixture
+from frozen_plan_fixture import frozen_plan
 
 
 def test_export_publishes_one_v3_archive_and_complete_native_inventory(tmp_path: Path) -> None:
     root, output = tmp_path / "run", tmp_path / "exports"
     generation = fixture(root)
-    plan = {"frozen": {"model_identity": "fixture", "run": "e-1", "attempt": 1}}
+    plan = frozen_plan()
     receipt = export_snapshot(root, output, profile="full-state", plan=plan, job_id="fixture-job")
     assert receipt["schema"] == "qcl-negf.science-export.v3"
     assert not ({"parts", "multipart", "part_count", "maximum_part_bytes"} & receipt.keys())

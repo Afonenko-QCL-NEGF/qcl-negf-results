@@ -32,7 +32,9 @@ from pathlib import Path
 from qcl_negf_results.export import export_snapshot
 
 receipt = export_snapshot(
-    Path("calculation"), Path("exports"), profile="science", job_status="completed"
+    Path("calculation"), Path("exports"), profile="science", job_status="completed",
+    plan=Path("calculation/scientific_plan.json").read_bytes(),
+    plan_source="retrieved:scientific_plan.json",
 )
 ```
 
@@ -42,6 +44,16 @@ receipt = export_snapshot(
 | `full-state` | Science contents plus full physics and recovery state |
 
 Exports preserve native values and provenance. Compaction validates logical payloads, including NaN bit patterns and signed zero. Diagnostic witness selection keeps per-attempt boundary and extremum records with an explicit selection proof; full scalar history remains available. Source files are not rewritten.
+
+Pass the authoritative frozen plan as exact `bytes` to retain its byte identity in
+`plan.json`. A schema-valid mapping remains supported and is serialized to JSON.
+The manifest records the source label, byte count, SHA256 and plan fingerprints;
+the exact byte hash and source participate in snapshot identity. The exporter
+checks the owning scientific-plan schema, execution/point membership and available
+series/commit fingerprints and coordinates before publishing. Missing identity
+fields are not invented: `identity_verified_against` names the checks actually
+performed. Julia's canonical fingerprint computation remains the runner's
+responsibility. Scientific plans do not acquire a result `contract_set` field.
 
 Telemetry identifies CPU intervals by `allocation_id` (for example, a Slurm job/step identity), with separate execution and process identities. Missing counters remain unknown. `TelemetryWriter` is a library for producers; it does not run a background machine sampler.
 

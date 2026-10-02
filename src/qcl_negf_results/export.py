@@ -7,7 +7,7 @@ captured bytes before publishing an archive. Scientific arrays are not converted
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import hashlib
 import math
 import os
@@ -19,7 +19,7 @@ from typing import Any
 from qcl_negf_contracts.artifacts import (Artifact, CONTRACT_SET, EXPORT_SCHEMA, MODEL_SCHEMA,
     POINTER_SCHEMA, RECOVERY_SCHEMA, digest_value, relative_path, validate_export_receipt,
     require_contract_set, validate_commit)
-from qcl_negf_contracts.messages import TERMINAL, ContractError
+from qcl_negf_contracts.messages import TERMINAL, MAX_PLAN_BYTES, ContractError, decode, scientific_plan
 from .commits import atomic_write, json_bytes, read_json, safe_path
 from .catalog import catalog_artifacts
 from .native import dataset_blocks as _dataset_blocks, validate_native_handle
@@ -507,9 +507,94 @@ def _download_filename(label: str, profile: str, identity: str) -> str:
     return f"{safe[:100] or 'snapshot'}-{profile}-{identity[:12]}.tar.xz"
 
 
+def _frozen_plan(plan: Mapping[str, Any] | bytes | None, source: str | None
+                 ) -> tuple[dict[str, Any] | None, bytes | None, dict[str, Any] | None]:
+    if plan is None:
+        if source is not None:
+            raise ContractError("frozen scientific plan source requires plan bytes", "corrupt_result")
+        return None, None, None
+    if not isinstance(plan, (bytes, Mapping)):
+        raise ContractError("frozen scientific plan must be exact bytes or a mapping", "corrupt_result")
+    source = source if source is not None else ("caller.bytes" if isinstance(plan, bytes) else "caller.mapping")
+    if (not isinstance(source, str) or not source or len(source) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in source)):
+        raise ContractError("invalid frozen scientific plan source", "corrupt_result")
+    from jsonschema import ValidationError
+    from qcl_negf_contracts import schema_validator
+    try:
+        payload = plan if isinstance(plan, bytes) else json_bytes(dict(plan))
+        value = scientific_plan(decode(payload, maximum=MAX_PLAN_BYTES))
+        schema_validator("scientific-plan.schema.json").validate(value)
+    except (ContractError, ValidationError) as error:
+        raise ContractError(f"invalid frozen scientific plan: {str(error)[:500]}", "corrupt_result") from error
+    return value, payload, {"path": "plan.json", "schema": value["schema"], "source": source,
+        "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload),
+        "fingerprint": value["fingerprint"], "scientific_fingerprint": value["scientific_fingerprint"],
+        "model_revision": value["model_revision"]}
+
+
+def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
+                          series: dict[str, Any] | None) -> list[str]:
+    """Compare saved identities; Julia's canonical fingerprints are not recomputed here."""
+    verified: set[str] = set()
+    executions = {item["id"]: item for item in plan["executions"]}
+    points = {item["id"]: item for item in plan["points"]}
+    for point in points.values():
+        if point["execution_id"] not in executions:
+            raise ContractError("frozen plan point identifies an unknown execution", "corrupt_result")
+    for identifier, execution in executions.items():
+        if set(execution["point_ids"]) != {key for key, point in points.items() if point["execution_id"] == identifier}:
+            raise ContractError("frozen plan execution point membership differs", "corrupt_result")
+
+    def compare(container: Mapping[str, Any], key: str, expected: Any, locator: str) -> None:
+        if key in container:
+            if container[key] != expected:
+                raise ContractError(f"frozen plan identity differs from {locator}.{key}", "corrupt_result")
+            verified.add(f"{locator}.{key}")
+
+    def point_identity(identity: Mapping[str, Any], locator: str) -> dict[str, Any] | None:
+        identifier = identity.get("point_id", identity.get("id"))
+        point = points.get(identifier) if isinstance(identifier, str) else None
+        if identifier is not None and point is None:
+            raise ContractError(f"frozen plan does not contain {locator} point", "corrupt_result")
+        execution = identity.get("execution_id")
+        if execution is not None and (execution not in executions or
+                point is not None and execution != point["execution_id"]):
+            raise ContractError(f"frozen plan differs from {locator} execution", "corrupt_result")
+        if point is not None:
+            verified.add(f"{locator}.point_id")
+        if execution is not None:
+            verified.add(f"{locator}.execution_id")
+        return point
+
+    if series is not None:
+        for key, expected in (("plan_fingerprint", plan["fingerprint"]),
+                              ("plan_scientific_fingerprint", plan["scientific_fingerprint"]),
+                              ("root_definition_id", plan["root_definition_id"])):
+            compare(series, key, expected, "series")
+        selected = series.get("selected_execution_id")
+        if selected is not None and selected not in executions:
+            raise ContractError("frozen plan does not contain selected execution", "corrupt_result")
+        for row in series.get("points", []) + series.get("attempt_history", []):
+            point = point_identity(row, "series.point")
+            if point is not None and "coordinates" in row:
+                coordinates = row["coordinates"]
+                if not isinstance(coordinates, dict):
+                    raise ContractError("frozen plan requires saved point coordinates to be an object", "corrupt_result")
+                for key in ("temperature_K", "voltage_per_period_V", "branch", "order"):
+                    compare(coordinates, key, point[key], "series.point.coordinates")
+    for commit in commits:
+        identity = commit.value["identity"]
+        compare(identity, "plan_fingerprint", plan["fingerprint"], "commit")
+        compare(identity, "plan_scientific_fingerprint", plan["scientific_fingerprint"], "commit")
+        point_identity(identity, "commit")
+    return sorted(verified)
+
+
 def export_snapshot(job_root: Path, destination: Path, *, profile: str = "science",
                     job_id: str | None = None, job_status: str = "running",
-                    plan: dict[str, Any] | None = None,
+                    plan: Mapping[str, Any] | bytes | None = None,
+                    plan_source: str | None = None,
                     progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     operation_started = time.monotonic()
     captured_unix = time.time()
@@ -529,10 +614,14 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                       "phase_seconds": dict(phase_seconds), **counts})
 
     _check_profile(profile)
+    plan_value, plan_payload, plan_metadata = _frozen_plan(plan, plan_source)
     root, destination = Path(job_root).resolve(), Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     report("collecting")
     commits, coverage, series = _collect(root)
+    if plan_value is not None:
+        assert plan_metadata is not None
+        plan_metadata["identity_verified_against"] = _verify_plan_identity(plan_value, commits, series)
     captured_unix = time.time()  # The cutoff describes the now fully pinned reference set.
     replacements = _history_replacements(commits, profile)
     selected: list[tuple[PinnedCommit, Artifact]] = []
@@ -566,10 +655,10 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     identity = hashlib.sha256(json_bytes({"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET, "profile": profile,
         "commits": [item.sha256 for item in commits], "coverage": coverage,
         "native_format": "4.0", "history_closure": "verified-cumulative-physical-markers-psd-v4", "inventory": "complete-performance-v2",
-        "derivation": derivation, "exporter_revision": 3,
+        "derivation": derivation, "exporter_revision": 4,
         "size_policy": "single-complete-archive-v1",
         "compressor": compressor,
-        "plan": plan, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
+        "plan": plan_metadata, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
     receipt_path = destination / f"{identity}.json"
     cached = _cached_receipt(destination, identity)
     if cached is not None:
@@ -665,6 +754,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
             "size_policy": {"measurement": "actual compressed archive including container metadata",
                             "scope": "one complete archive, all profiles",
                             "archive_byte_limit": None, "storage_failure": "fail without publishing a receipt"}}
+        if plan_metadata is not None:
+            manifest["frozen_plan"] = plan_metadata
         metadata: dict[str, bytes] = {"manifest.json": json_bytes(manifest),
             "README.md": ("# QCLNEGF scientific snapshot\n\n"
                 f"Profile: {profile}. Job complete: {job_complete}. Snapshot consistent: true.\n\n"
@@ -680,8 +771,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                 "The receiver also supports legacy multipart sets.\n").encode()}
         from .diagnostic_page import summary as diagnostic_summary
         metadata["diagnostics.json"] = diagnostic_summary(manifest, files)
-        if plan is not None:
-            metadata["plan.json"] = json_bytes(plan)
+        if plan_payload is not None:
+            metadata["plan.json"] = plan_payload
         metadata_bytes = sum(map(len, metadata.values()))
         raw_bytes = sum(path.stat().st_size for path, _ in files.values()) + metadata_bytes
         from .archive import build_archive, verify_archive
