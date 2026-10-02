@@ -107,12 +107,16 @@ def _verify_series_reference(point: dict[str, Any], series: dict[str, Any],
     return checks
 
 
-def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict[str, Any] | None]:
+def _collect(root: Path, *, plan: dict[str, Any] | None = None
+             ) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict[str, Any] | None,
+                        bytes | None, list[dict[str, Any]]]:
     """Capture the series once, then follow only explicit committed references."""
     commits: list[PinnedCommit] = []
     coverage: list[dict[str, Any]] = []
     seen: set[Path] = set()
     series = None
+    series_payload = None
+    excluded_history: list[dict[str, Any]] = []
     root_pointer = root / "current-commit.json"
     if root_pointer.exists():
         root_path, root_sha = _pointer(root_pointer)
@@ -125,12 +129,13 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
         index_artifact = indices[0]
         index = safe_path(root_commit.path.parent, index_artifact.path)
         series, index_payload = read_json(index)
+        series_payload = index_payload
         if len(index_payload) != index_artifact.size or hashlib.sha256(index_payload).hexdigest() != index_artifact.sha256:
             raise ContractError("committed series index bytes changed", "corrupt_result")
     else:
         index = root / "series_result.json"
         if index.exists():
-            series, _ = read_json(index)
+            series, series_payload = read_json(index)
     if series is not None:
         require_contract_set(series)
         if series.get("schema") != "qcl-negf-series-result-v3":
@@ -139,6 +144,15 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
         history = series.get("attempt_history", [])
         if not isinstance(rows, list) or not isinstance(history, list):
             raise ContractError("series points and attempt history must be lists", "corrupt_result")
+        for point in rows + history:
+            if not isinstance(point, dict) or not isinstance(point.get("data") or {}, dict):
+                raise ContractError("series point and its data must be objects", "corrupt_result")
+        if plan is not None:
+            # Validate all saved rows against the whole plan before omitting
+            # history that the producer retained from a previous selection.
+            _verify_plan_identity(plan, [], series)
+        planned_points = {point["id"]: point for point in (plan or {}).get("points", [])}
+        selected_execution = series.get("selected_execution_id")
         for row_number, point in enumerate(rows + history):
             if not isinstance(point, dict):
                 raise ContractError("series point must be an object", "corrupt_result")
@@ -150,6 +164,18 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
                 raise ContractError("historical checkpoint lineage requires a series commit reference", "corrupt_result")
             entry = {key: point[key] for key in ("id", "execution_id", "attempt", "status", "quality", "converged") if key in point}
             entry["series_section"] = "points" if row_number < len(rows) else "attempt_history"
+            planned_point = planned_points.get(point.get("id"))
+            if (row_number >= len(rows) and planned_point is not None
+                    and selected_execution is not None
+                    and planned_point["execution_id"] != selected_execution):
+                excluded_history.append({"history_index": row_number - len(rows),
+                    "identity": {"point_id": point["id"],
+                                 "execution_id": planned_point["execution_id"],
+                                 **({"attempt": point["attempt"]} if "attempt" in point else {})},
+                    "reason": "outside_selected_execution",
+                    "identity_verification": "saved_row_matches_whole_frozen_plan",
+                    "payload_verification": "not_captured"})
+                continue
             if reference:
                 if isinstance(reference, dict):
                     path = safe_path(root, reference["path"])
@@ -211,7 +237,7 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
         if parent_path not in seen:
             commits.append(ancestor)
             seen.add(parent_path)
-    return commits, coverage, series
+    return commits, coverage, series, series_payload, excluded_history
 
 
 def _history_replacements(commits: list[PinnedCommit], profile: str) -> dict[tuple[str, str], tuple[PinnedCommit, Artifact]]:
@@ -605,7 +631,8 @@ def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
                 raise ContractError(f"frozen plan identity differs from {locator}.{key}", "corrupt_result")
             verified.add(f"{locator}.{key}")
 
-    def point_identity(identity: Mapping[str, Any], locator: str) -> dict[str, Any] | None:
+    def point_identity(identity: Mapping[str, Any], locator: str, *, selected_scope: bool = True
+                       ) -> dict[str, Any] | None:
         identifier = identity.get("point_id", identity.get("id"))
         point = points.get(identifier) if isinstance(identifier, str) else None
         if identifier is not None and point is None:
@@ -614,7 +641,7 @@ def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
         if execution is not None and (not isinstance(execution, str) or execution not in executions or
                 point is not None and execution != point["execution_id"]):
             raise ContractError(f"frozen plan differs from {locator} execution", "corrupt_result")
-        if selected is not None and (execution is not None and execution != selected
+        if selected_scope and selected is not None and (execution is not None and execution != selected
                 or point is not None and point["execution_id"] != selected):
             raise ContractError(f"frozen plan {locator} is outside the selected execution", "corrupt_result")
         if point is not None:
@@ -628,14 +655,18 @@ def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
                               ("plan_scientific_fingerprint", plan["scientific_fingerprint"]),
                               ("root_definition_id", plan["root_definition_id"])):
             compare(series, key, expected, "series")
-        for row in series.get("points", []) + series.get("attempt_history", []):
-            point = point_identity(row, "series.point")
-            if point is not None and "coordinates" in row:
-                coordinates = row["coordinates"]
-                if not isinstance(coordinates, dict):
-                    raise ContractError("frozen plan requires saved point coordinates to be an object", "corrupt_result")
-                for key in ("temperature_K", "voltage_per_period_V", "branch", "order"):
-                    compare(coordinates, key, point[key], "series.point.coordinates")
+        for section in ("points", "attempt_history"):
+            for row in series.get(section, []):
+                locator = "series.point" if section == "points" else "series.attempt_history"
+                point = point_identity(row, locator, selected_scope=section == "points")
+                if section == "attempt_history" and point is None:
+                    raise ContractError("frozen plan requires an identified historical point", "corrupt_result")
+                if point is not None and "coordinates" in row:
+                    coordinates = row["coordinates"]
+                    if not isinstance(coordinates, dict):
+                        raise ContractError("frozen plan requires saved point coordinates to be an object", "corrupt_result")
+                    for key in ("temperature_K", "voltage_per_period_V", "branch", "order"):
+                        compare(coordinates, key, point[key], f"{locator}.coordinates")
     for commit in commits:
         identity = commit.value["identity"]
         compare(identity, "plan_fingerprint", plan["fingerprint"], "commit")
@@ -675,7 +706,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     root, destination = Path(job_root).resolve(), Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     report("collecting")
-    commits, coverage, series = _collect(root)
+    commits, coverage, series, series_payload, excluded_history = _collect(root, plan=plan_value)
     if plan_value is not None:
         assert plan_metadata is not None
         plan_metadata["identity_verified_against"], missing_points = _verify_plan_identity(plan_value, commits, series)
@@ -701,6 +732,19 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         if item.sha256 in object_contracts and object_contracts[item.sha256] != contract:
             raise ContractError("one object digest has conflicting size or media type", "corrupt_result")
         object_contracts[item.sha256] = contract
+    series_manifest = None
+    if series_payload is not None:
+        series_sha256 = hashlib.sha256(series_payload).hexdigest()
+        series_contract = (len(series_payload), "application/json")
+        if series_sha256 in object_contracts and object_contracts[series_sha256] != series_contract:
+            raise ContractError("series object digest has conflicting size or media type", "corrupt_result")
+        object_contracts[series_sha256] = series_contract
+        series_manifest = {"object": f"objects/{series_sha256}.json",
+                           "sha256": series_sha256, "bytes": len(series_payload),
+                           "schema": series["schema"]}
+    history_scope = {"selected_execution_id": (series or {}).get("selected_execution_id"),
+                     "excluded_count": len(excluded_history), "excluded": excluded_history,
+                     "policy": "whole-plan historical identity; selected-scope payloads and coverage"}
     unique_size = sum(size for size, _ in object_contracts.values())
     # This identity pins the committed prefix. A later producer generation is a new export.
     compressor: dict[str, Any] = {"format": "xz", "preset": 1,
@@ -713,7 +757,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     identity = hashlib.sha256(json_bytes({"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET, "profile": profile,
         "commits": [item.sha256 for item in commits], "coverage": coverage,
         "native_format": "4.0", "history_closure": "verified-cumulative-physical-markers-psd-v4", "inventory": "complete-performance-v2",
-        "derivation": derivation, "exporter_revision": 6,
+        "derivation": derivation, "exporter_revision": 7,
+        "series_manifest": series_manifest, "history_scope": history_scope,
         "size_policy": "single-complete-archive-v1",
         "compressor": compressor,
         "plan": plan_metadata, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
@@ -785,6 +830,18 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         compaction_proofs = compact_export_records(records, files, spool)
         from .witness_selection import select_export_witnesses
         witness_selection = select_export_witnesses(records, files, spool) if profile == "science" else []
+        # Derivation prunes superseded role objects. The exact source series is
+        # separately retained as provenance, including out-of-scope history.
+        if series_manifest is not None and series_manifest["object"] not in files:
+            assert series_payload is not None
+            target = spool / (series_manifest["sha256"] + ".json")
+            atomic_write(target, series_payload)
+            files[series_manifest["object"]] = (target, {
+                "path": series_manifest["object"], "bytes": series_manifest["bytes"],
+                "sha256": series_manifest["sha256"], "media_type": "application/json"})
+            captured_bytes += len(series_payload)
+            report("capturing", completed_bytes=captured_bytes, total_bytes=unique_size,
+                   completed_files=len(files), total_files=len(object_contracts))
         report("validating_closure")
         all_objects = set(files)
         if any(dep not in all_objects for record in records for item in record["included"] for dep in item["dependencies"]):
@@ -804,6 +861,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
             "requires_full_state": ["arbitrary_new_optical_response", "exact_restart"] if profile == "science" else [],
             "cutoff": "exact committed records named below; active uncommitted work is absent",
             "records": records, "coverage": coverage, "missing_records": missing,
+            "history_scope": history_scope,
             "telemetry_compaction": compaction_proofs,
             "derivation": derivation,
             "witness_selection": witness_selection,
@@ -820,6 +878,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                             "archive_byte_limit": None, "storage_failure": "fail without publishing a receipt"}}
         if plan_metadata is not None:
             manifest["frozen_plan"] = plan_metadata
+        if series_manifest is not None:
+            manifest["series_manifest"] = series_manifest
         metadata: dict[str, bytes] = {"manifest.json": json_bytes(manifest),
             "README.md": ("# QCLNEGF scientific snapshot\n\n"
                 f"Profile: {profile}. Job complete: {job_complete}. Snapshot consistent: true.\n\n"
@@ -903,7 +963,7 @@ def preview(job_root: Path, *, profile: str = "science", job_id: str | None = No
     payload before publishing a receipt. The caller supplies scheduler state.
     """
     _check_profile(profile)
-    commits, coverage, _ = _collect(Path(job_root).resolve())
+    commits, coverage, _, _, _ = _collect(Path(job_root).resolve())
     artifacts = [item for commit in commits for item in _selection(commit, profile)[0]]
     return {"id": job_id, "profile": profile,
             "files": len({item.sha256 for item in artifacts}),

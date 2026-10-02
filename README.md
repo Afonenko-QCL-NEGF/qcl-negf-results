@@ -62,9 +62,17 @@ An older checkpoint attempt is accepted only with the runner's explicit paused
 resource-pressure lineage and its exact `checkpoint_source_attempt`. Coverage
 records these checks and unavailable fields; referenced historical commits are
 included without treating missing historical records as missing current points.
-When a selected execution is declared, every referenced row and commit must
-belong to that execution. The frozen plan defines expected point IDs in that
-scope, or in the whole plan when none is selected. Absent current series rows
+When a selected execution is declared, current rows and included commits must
+belong to that execution. The runner can retain history from other executions
+when reusing one output root with the same plan (`scientific_execution.jl:394–417`).
+Historical rows are validated against the whole frozen plan; references outside
+the selected execution are excluded from payload capture and coverage. The
+manifest's `history_scope` records their identities and count, with payload
+verification explicitly `not_captured`. `series_manifest` locates the exact
+original series bytes as a checksummed JSON object, so excluded history and its
+references remain available alongside the unchanged frozen plan. These excluded
+rows do not become missing records in the selected scope. The frozen plan defines
+expected point IDs in that scope, or in the whole plan when none is selected. Absent current series rows
 remain explicit missing records and prevent `complete=true`, even after a
 terminal process status.
 
