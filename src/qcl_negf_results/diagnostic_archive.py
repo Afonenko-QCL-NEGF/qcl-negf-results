@@ -20,6 +20,7 @@ from qcl_negf_contracts.artifacts import (CONTRACT_SET, DIAGNOSTIC_EXPORT_SCHEMA
 from qcl_negf_contracts.messages import ContractError
 from .commits import json_bytes
 from .archive import BLOCK, build_archive, verify_archive
+from ._atomic_io import fsync_directory
 
 DIAGNOSTIC_SCHEMA = DIAGNOSTIC_EXPORT_SCHEMA
 
@@ -153,5 +154,11 @@ def export_diagnostics(destination: Path, capture: Callable[[ArchiveSink], dict[
             stream.write(json_bytes(receipt))
             stream.flush()
             os.fsync(stream.fileno())
+        fsync_directory(publication)
         os.rename(publication, destination)
+        try:
+            fsync_directory(destination.parent)
+        except BaseException:
+            shutil.rmtree(destination)
+            raise
     return receipt

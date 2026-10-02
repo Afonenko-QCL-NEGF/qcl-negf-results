@@ -62,6 +62,146 @@ def test_single_archive_restores_and_rejects_receipt_or_missing_inventory(tmp_pa
     assert not (tmp_path / "bad").exists()
 
 
+@pytest.mark.parametrize("restore", [False, True])
+def test_receipt_profile_must_match_archive_before_restore(tmp_path: Path, restore: bool) -> None:
+    from qcl_negf_results.archive import receive
+    from qcl_negf_contracts.artifacts import validate_export_receipt
+    from qcl_negf_contracts.messages import ContractError
+    root, output = tmp_path / "run", tmp_path / "exports"
+    fixture(root)
+    receipt = export_snapshot(root, output, profile="science")
+    changed = {**receipt, "profile": "full-state"}
+    validate_export_receipt(changed)  # Independently valid, but labels another profile.
+    destination = tmp_path / "restored" if restore else None
+    with pytest.raises(ContractError, match="receipt and archive"):
+        receive([output / receipt["archive"]], destination, receipt=changed)
+    assert not (tmp_path / "restored").exists()
+
+
+def test_manifest_schema_must_match_archive_before_restore(tmp_path: Path) -> None:
+    import io
+    from qcl_negf_results.archive import receive
+    from qcl_negf_contracts.messages import ContractError
+    root, output = tmp_path / "run", tmp_path / "exports"
+    fixture(root)
+    receipt = export_snapshot(root, output)
+    altered = tmp_path / "wrong-schema.tar.xz"
+    with tarfile.open(output / receipt["archive"], "r:xz") as source:
+        members = [(member, source.extractfile(member).read()) for member in source]
+    manifest = json.loads(dict((member.name, value) for member, value in members)["manifest.json"])
+    manifest["schema"] = "qcl-negf.operational-evidence.v2"
+    payload = json_bytes(manifest)
+    index = json.loads(members[0][1])
+    for row in index["metadata"]:
+        if row["path"] == "manifest.json":
+            row.update(bytes=len(payload), sha256=hashlib.sha256(payload).hexdigest())
+    with tarfile.open(altered, "w:xz") as target:
+        for member, value in members:
+            if member.name == "manifest.json":
+                value = payload
+            elif member.name == "export-index.json":
+                value = json_bytes(index)
+            member.size = len(value)
+            target.addfile(member, io.BytesIO(value))
+    with pytest.raises(ContractError, match="manifest.*schema"):
+        receive([altered], tmp_path / "restored")
+    assert not (tmp_path / "restored").exists()
+
+
+def test_scientific_publication_fsyncs_final_directory_before_completed(tmp_path: Path, monkeypatch) -> None:
+    import qcl_negf_results.export as exporter
+    root, output = tmp_path / "run", tmp_path / "exports"
+    fixture(root)
+    events = []
+    replace = exporter.os.replace
+    def track_replace(source, target):
+        result = replace(source, target)
+        if Path(target).parent == output:
+            events.append("receipt" if Path(target).suffix == ".json" else "archive")
+        return result
+    def sync(path):
+        if path == output:
+            events.append("directory synced")
+    def progress(value):
+        if value["phase"] == "completed":
+            events.append("completed")
+    monkeypatch.setattr(exporter.os, "replace", track_replace)
+    monkeypatch.setattr(exporter, "fsync_directory", sync, raising=False)
+    export_snapshot(root, output, progress=progress)
+    assert events == ["archive", "receipt", "directory synced", "completed"]
+
+
+def test_diagnostic_publication_fsyncs_contents_then_final_parent(tmp_path: Path, monkeypatch) -> None:
+    import io
+    import qcl_negf_results.diagnostic_archive as exporter
+    destination = tmp_path / "evidence"
+    events = []
+    rename = exporter.os.rename
+    def capture(sink):
+        member = tarfile.TarInfo("log.txt")
+        member.size = 3
+        sink.addfile(member, io.BytesIO(b"log"))
+        return {"run": "fixture"}
+    def track_rename(source, target):
+        result = rename(source, target)
+        if Path(target) == destination:
+            events.append("published")
+        return result
+    def sync(path):
+        events.append("parent synced" if path == destination.parent else "contents synced")
+    monkeypatch.setattr(exporter.os, "rename", track_rename)
+    monkeypatch.setattr(exporter, "fsync_directory", sync, raising=False)
+    exporter.export_diagnostics(destination, capture, label="fixture")
+    assert events == ["contents synced", "published", "parent synced"]
+
+
+@pytest.mark.parametrize("profile", ["science", "diagnostic"])
+def test_publication_fsync_failure_rolls_back_new_pair(tmp_path: Path, monkeypatch, profile: str) -> None:
+    import io
+    import qcl_negf_results.export as exporter
+    import qcl_negf_results.diagnostic_archive as diagnostics
+    root, output = tmp_path / "run", tmp_path / "exports"
+    fixture(root)
+    def fail_sync(path):
+        if profile == "diagnostic" and path != output.parent:
+            return  # Exercise failure after the final directory rename.
+        raise OSError(5, "directory fsync failed")
+    monkeypatch.setattr(exporter, "fsync_directory", fail_sync, raising=False)
+    monkeypatch.setattr(diagnostics, "fsync_directory", fail_sync, raising=False)
+    def capture(sink):
+        member = tarfile.TarInfo("log.txt")
+        member.size = 3
+        sink.addfile(member, io.BytesIO(b"log"))
+        return {"run": "fixture"}
+    with pytest.raises(OSError, match="directory fsync failed"):
+        if profile == "science":
+            export_snapshot(root, output)
+        else:
+            diagnostics.export_diagnostics(output, capture, label="fixture")
+    assert not output.exists() or list(output.iterdir()) == []
+
+
+def test_publication_fsync_failure_preserves_existing_receipt_and_cas(tmp_path: Path, monkeypatch) -> None:
+    import qcl_negf_results.export as exporter
+    root, output = tmp_path / "run", tmp_path / "exports"
+    fixture(root)
+    receipt = export_snapshot(root, output)
+    receipt_path = output / f'{receipt["snapshot_identity"]}.json'
+    original = receipt_path.read_bytes()
+    archive_path = output / receipt["archive"]
+    previous_archive = b"corrupted cached archive"
+    archive_path.write_bytes(previous_archive)
+    previous_paths = set(output.iterdir())
+    def fail_sync(path):
+        raise OSError(5, "directory fsync failed")
+    monkeypatch.setattr(exporter, "fsync_directory", fail_sync, raising=False)
+    with pytest.raises(OSError, match="directory fsync failed"):
+        export_snapshot(root, output)
+    assert receipt_path.read_bytes() == original
+    assert archive_path.read_bytes() == previous_archive
+    assert set(output.iterdir()) == previous_paths
+
+
 def test_compression_cancellation_never_publishes_archive_or_receipt(tmp_path: Path) -> None:
     root, output = tmp_path / "run", tmp_path / "exports"
     fixture(root)

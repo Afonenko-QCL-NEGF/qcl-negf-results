@@ -23,6 +23,7 @@ from qcl_negf_contracts.messages import TERMINAL, ContractError
 from .commits import atomic_write, json_bytes, read_json, safe_path
 from .catalog import catalog_artifacts
 from .native import dataset_blocks as _dataset_blocks, validate_native_handle
+from ._atomic_io import fsync_directory
 
 CHUNK_BYTES = 1024 * 1024
 
@@ -717,12 +718,23 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         atomic_write(temporary_receipt, json_bytes(receipt))
         os.chmod(temporary_archive, 0o640)
         archive_existed = archive_path.exists()
+        previous_receipt = receipt_path.read_bytes() if receipt_path.exists() else None
+        receipt_published = False
         os.replace(temporary_archive, archive_path)
         try:
             os.replace(temporary_receipt, receipt_path)
+            receipt_published = True
+            fsync_directory(destination)
         except BaseException:
-            if not archive_existed:
-                archive_path.unlink(missing_ok=True)
+            try:
+                if receipt_published:
+                    if previous_receipt is None:
+                        receipt_path.unlink(missing_ok=True)
+                    else:
+                        atomic_write(receipt_path, previous_receipt)
+            finally:
+                if not archive_existed:
+                    archive_path.unlink(missing_ok=True)
             raise
         report("completed", completed_bytes=size, total_bytes=size)
         return receipt

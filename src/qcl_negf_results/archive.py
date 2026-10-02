@@ -18,7 +18,8 @@ import tarfile
 import tempfile
 from typing import Any
 
-from qcl_negf_contracts.artifacts import (CONTRACT_SET, EXPORT_TRANSPORT_SCHEMA,
+from qcl_negf_contracts.artifacts import (CONTRACT_SET, DIAGNOSTIC_EXPORT_SCHEMA,
+    EXPORT_SCHEMA, EXPORT_TRANSPORT_SCHEMA,
     digest_value, relative_path, validate_export_receipt)
 from qcl_negf_contracts.messages import ContractError
 from .commits import decode_json, json_bytes
@@ -152,6 +153,9 @@ def _json_object(payload: bytes) -> dict[str, Any]:
 
 def _manifest_closure(manifest: dict[str, Any], index: dict[str, Any]) -> None:
     objects = {row["path"]: row for row in index["objects"]}
+    expected_schema = DIAGNOSTIC_EXPORT_SCHEMA if index["profile"] == "diagnostic" else EXPORT_SCHEMA
+    if manifest.get("schema") != expected_schema:
+        raise ContractError("manifest schema differs from its transport profile", "corrupt_result")
     if (manifest.get("contract_set") != CONTRACT_SET
             or manifest.get("snapshot_identity") != index["snapshot_identity"]
             or manifest.get("profile") != index["profile"]):
@@ -169,6 +173,14 @@ def _manifest_closure(manifest: dict[str, Any], index: dict[str, Any]) -> None:
             if (row.get("object") not in objects or not isinstance(dependencies, list)
                     or any(dep not in objects for dep in dependencies)):
                 raise ContractError("snapshot has dangling dependencies", "corrupt_result")
+
+
+def _receipt_closure(receipt: dict[str, Any] | None, index: dict[str, Any]) -> None:
+    if receipt is not None and (
+            receipt["snapshot_identity"] != index["snapshot_identity"]
+            or receipt["profile"] != index["profile"]
+            or receipt["transport_schema"] != index["schema"]):
+        raise ContractError("receipt and archive identify different snapshots or profiles", "corrupt_result")
 
 
 def _read_archive(path: Path, root: Path | None, report: Callable[..., None]) -> dict[str, Any]:
@@ -259,6 +271,7 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
             raise ContractError("archive size differs from receipt", "corrupt_result")
     if destination is None:
         index = verify_archive(path)
+        _receipt_closure(receipt, index)
     else:
         destination = Path(destination)
         if destination.exists():
@@ -268,11 +281,8 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
             root = Path(temporary) / "restored"
             root.mkdir()
             index = _read_archive(path, root, _quiet)
-            if receipt is not None and receipt["snapshot_identity"] != index["snapshot_identity"]:
-                raise ContractError("receipt and archive identify different snapshots", "corrupt_result")
+            _receipt_closure(receipt, index)
             os.replace(root, destination)
-    if receipt is not None and receipt["snapshot_identity"] != index["snapshot_identity"]:
-        raise ContractError("receipt and archive identify different snapshots", "corrupt_result")
     return {"snapshot_identity": index["snapshot_identity"], "verified": True,
             "archive_count": 1, "objects": len(index["objects"]),
             "destination": str(destination) if destination is not None else None}
