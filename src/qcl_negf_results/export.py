@@ -7,7 +7,7 @@ captured bytes before publishing an archive. Scientific arrays are not converted
 from __future__ import annotations
 
 from dataclasses import dataclass
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 import hashlib
 import math
 import os
@@ -17,12 +17,13 @@ import time
 from typing import Any
 
 from qcl_negf_contracts.artifacts import (Artifact, CONTRACT_SET, EXPORT_SCHEMA, MODEL_SCHEMA,
-    POINTER_SCHEMA, RECOVERY_SCHEMA, SCIENCE_MAX_BYTES, digest_value, relative_path,
+    POINTER_SCHEMA, RECOVERY_SCHEMA, digest_value, relative_path, validate_export_receipt,
     require_contract_set, validate_commit)
-from qcl_negf_contracts.messages import TERMINAL, ContractError
+from qcl_negf_contracts.messages import TERMINAL, MAX_PLAN_BYTES, ContractError, decode, scientific_plan
 from .commits import atomic_write, json_bytes, read_json, safe_path
 from .catalog import catalog_artifacts
 from .native import dataset_blocks as _dataset_blocks, validate_native_handle
+from ._atomic_io import fsync_directory
 
 CHUNK_BYTES = 1024 * 1024
 
@@ -65,12 +66,57 @@ def _pin(path: Path, expected_sha256: str | None = None) -> PinnedCommit:
     return PinnedCommit(path, value, digest, artifacts)
 
 
-def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict[str, Any] | None]:
+def _verify_series_reference(point: dict[str, Any], series: dict[str, Any],
+                              commit: PinnedCommit) -> dict[str, Any]:
+    """Bind this series row to its exact reference, including borrowed checkpoints."""
+    identity = commit.value["identity"]
+    checks: dict[str, Any] = {}
+    expected = {"point_id": point.get("id")}
+    if not isinstance(expected["point_id"], str) or not expected["point_id"]:
+        raise ContractError("series commit reference requires a point ID", "corrupt_result")
+    for key, container in (("execution_id", point), ("plan_fingerprint", series)):
+        if key in container:
+            expected[key] = container[key]
+        else:
+            checks[key] = "not_available"
+    for key, value in expected.items():
+        if identity.get(key) != value:
+            raise ContractError(f"series point differs from its referenced commit {key}", "corrupt_result")
+        checks[key] = "matched"
+    data = point.get("data") or {}
+    row_attempt = point.get("attempt")
+    source_attempt = data.get("checkpoint_source_attempt", row_attempt)
+    if "checkpoint_source_attempt" in data:
+        if (point.get("status") != "paused" or data.get("pause_reason") != "resource_pressure"
+                or data.get("resume_kind") != "checkpoint"
+                or data.get("recovery_origin") != "last_committed_before_resource_pause"
+                or type(source_attempt) is not int or type(row_attempt) is not int
+                or not 0 < source_attempt < row_attempt):
+            raise ContractError("invalid historical checkpoint lineage in series commit reference", "corrupt_result")
+        checks["checkpoint_lineage"] = {"source_attempt": source_attempt, "current_attempt": row_attempt,
+            "pause_reason": data["pause_reason"], "resume_kind": data["resume_kind"],
+            "recovery_origin": data["recovery_origin"]}
+    if "attempt" in point:
+        if type(row_attempt) is not int or row_attempt < 1 or type(identity.get("attempt")) is not int:
+            raise ContractError("series commit reference requires positive integer attempts", "corrupt_result")
+        if identity["attempt"] != source_attempt:
+            raise ContractError("series point differs from its referenced commit attempt", "corrupt_result")
+        checks["attempt"] = "matched"
+    else:
+        checks["attempt"] = "not_available"
+    return checks
+
+
+def _collect(root: Path, *, plan: dict[str, Any] | None = None
+             ) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict[str, Any] | None,
+                        bytes | None, list[dict[str, Any]]]:
     """Capture the series once, then follow only explicit committed references."""
     commits: list[PinnedCommit] = []
     coverage: list[dict[str, Any]] = []
     seen: set[Path] = set()
     series = None
+    series_payload = None
+    excluded_history: list[dict[str, Any]] = []
     root_pointer = root / "current-commit.json"
     if root_pointer.exists():
         root_path, root_sha = _pointer(root_pointer)
@@ -83,27 +129,53 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
         index_artifact = indices[0]
         index = safe_path(root_commit.path.parent, index_artifact.path)
         series, index_payload = read_json(index)
+        series_payload = index_payload
         if len(index_payload) != index_artifact.size or hashlib.sha256(index_payload).hexdigest() != index_artifact.sha256:
             raise ContractError("committed series index bytes changed", "corrupt_result")
     else:
         index = root / "series_result.json"
         if index.exists():
-            series, _ = read_json(index)
+            series, series_payload = read_json(index)
     if series is not None:
         require_contract_set(series)
         if series.get("schema") != "qcl-negf-series-result-v3":
             raise ContractError("unsupported scientific series result schema", "incompatible_contract")
         rows = series.get("points", [])
-        if not isinstance(rows, list):
-            raise ContractError("series points must be a list", "corrupt_result")
-        for point in rows:
+        history = series.get("attempt_history", [])
+        if not isinstance(rows, list) or not isinstance(history, list):
+            raise ContractError("series points and attempt history must be lists", "corrupt_result")
+        for point in rows + history:
+            if not isinstance(point, dict) or not isinstance(point.get("data") or {}, dict):
+                raise ContractError("series point and its data must be objects", "corrupt_result")
+        if plan is not None:
+            # Validate all saved rows against the whole plan before omitting
+            # history that the producer retained from a previous selection.
+            _verify_plan_identity(plan, [], series)
+        planned_points = {point["id"]: point for point in (plan or {}).get("points", [])}
+        selected_execution = series.get("selected_execution_id")
+        for row_number, point in enumerate(rows + history):
             if not isinstance(point, dict):
                 raise ContractError("series point must be an object", "corrupt_result")
             data = point.get("data") or {}
             if not isinstance(data, dict):
                 raise ContractError("series point data must be an object", "corrupt_result")
             reference = data.get("result_commit")
-            entry = {key: point[key] for key in ("id", "execution_id", "status", "quality", "converged") if key in point}
+            if "checkpoint_source_attempt" in data and not reference:
+                raise ContractError("historical checkpoint lineage requires a series commit reference", "corrupt_result")
+            entry = {key: point[key] for key in ("id", "execution_id", "attempt", "status", "quality", "converged") if key in point}
+            entry["series_section"] = "points" if row_number < len(rows) else "attempt_history"
+            planned_point = planned_points.get(point.get("id"))
+            if (row_number >= len(rows) and planned_point is not None
+                    and selected_execution is not None
+                    and planned_point["execution_id"] != selected_execution):
+                excluded_history.append({"history_index": row_number - len(rows),
+                    "identity": {"point_id": point["id"],
+                                 "execution_id": planned_point["execution_id"],
+                                 **({"attempt": point["attempt"]} if "attempt" in point else {})},
+                    "reason": "outside_selected_execution",
+                    "identity_verification": "saved_row_matches_whole_frozen_plan",
+                    "payload_verification": "not_captured"})
+                continue
             if reference:
                 if isinstance(reference, dict):
                     path = safe_path(root, reference["path"])
@@ -111,14 +183,17 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
                 else:
                     path, expected = safe_path(root, reference), None
                 commit = _pin(path, expected)
+                entry["reference_identity_checks"] = _verify_series_reference(point, series, commit)
                 if path not in seen:
                     commits.append(commit)
                     seen.add(path)
                 entry["commit_sha256"] = commit.sha256
+                entry["source_commit_path"] = str(path.relative_to(root))
                 entry["scientific_accepted"] = commit.value.get("scientific_accepted", False)
             else:
                 entry["availability"] = "no_committed_physical_record"
-            coverage.append(entry)
+            if reference or row_number < len(rows):
+                coverage.append(entry)
     # Standalone CLI point and explicit campaign commit use the same contract.
     for pointer in (root / "artifacts" / "current.json",):
         if pointer.exists():
@@ -162,7 +237,7 @@ def _collect(root: Path) -> tuple[list[PinnedCommit], list[dict[str, Any]], dict
         if parent_path not in seen:
             commits.append(ancestor)
             seen.add(parent_path)
-    return commits, coverage, series
+    return commits, coverage, series, series_payload, excluded_history
 
 
 def _history_replacements(commits: list[PinnedCommit], profile: str) -> dict[tuple[str, str], tuple[PinnedCommit, Artifact]]:
@@ -484,42 +559,130 @@ def _freshness(commits: list[PinnedCommit], spool: Path,
         "history_timestamp_policy": "native last row coordinates; UTC unavailable unless explicitly recorded"}
 
 
-def _cached_receipt(destination: Path, identity: str, maximum_bytes: int) -> dict[str, Any] | None:
+def _cached_receipt(destination: Path, identity: str) -> dict[str, Any] | None:
     receipt_path = destination / f"{identity}.json"
     if not receipt_path.exists():
         return None
     receipt, _ = read_json(receipt_path)
-    require_contract_set(receipt)
-    parts = receipt.get("parts", [])
-    if not parts or receipt.get("maximum_part_bytes") != maximum_bytes:
+    validate_export_receipt(receipt)
+    if receipt["snapshot_identity"] != identity:
+        raise ContractError("cached receipt identifies another snapshot", "corrupt_result")
+    existing = destination / receipt["archive"]
+    if not existing.exists() or existing.stat().st_size != receipt["bytes"]:
         return None
-    for part in parts:
-        existing = destination / f'{digest_value(part["sha256"])}.tar.xz'
-        if not existing.exists() or existing.stat().st_size != part["bytes"] or part["bytes"] > maximum_bytes:
+    with existing.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != receipt["sha256"]:
             return None
-        with existing.open("rb") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != part["sha256"]:
-                return None
     return receipt
 
 
-def _publish_parts(finalized: list[tuple[Path, dict[str, Any]]], destination: Path, label: str) -> list[dict[str, Any]]:
-    parts = []
-    for temporary, part in finalized:
-        digest = part["sha256"]
-        archive_path = destination / f"{digest}.tar.xz"
-        os.chmod(temporary, 0o640)
-        os.replace(temporary, archive_path)
-        filename = (f"{label}.tar.xz" if len(finalized) == 1 else
-                    f"{label}.part-{part['index']:04d}-of-{len(finalized):04d}.tar.xz")
-        parts.append({**part, "filename": filename, "archive": archive_path.name})
-    return parts
+def _download_filename(label: str, profile: str, identity: str) -> str:
+    safe = "".join(char if char.isascii() and (char.isalnum() or char in "-_") else "_" for char in label)
+    return f"{safe[:100] or 'snapshot'}-{profile}-{identity[:12]}.tar.xz"
+
+
+def _frozen_plan(plan: Mapping[str, Any] | bytes | None, source: str | None
+                 ) -> tuple[dict[str, Any] | None, bytes | None, dict[str, Any] | None]:
+    if plan is None:
+        if source is not None:
+            raise ContractError("frozen scientific plan source requires plan bytes", "corrupt_result")
+        return None, None, None
+    if not isinstance(plan, (bytes, Mapping)):
+        raise ContractError("frozen scientific plan must be exact bytes or a mapping", "corrupt_result")
+    source = source if source is not None else ("caller.bytes" if isinstance(plan, bytes) else "caller.mapping")
+    if (not isinstance(source, str) or not source or len(source) > 512
+            or any(ord(char) < 32 or ord(char) == 127 for char in source)):
+        raise ContractError("invalid frozen scientific plan source", "corrupt_result")
+    from jsonschema import ValidationError
+    from qcl_negf_contracts import schema_validator
+    try:
+        payload = plan if isinstance(plan, bytes) else json_bytes(dict(plan))
+        value = scientific_plan(decode(payload, maximum=MAX_PLAN_BYTES))
+        schema_validator("scientific-plan.schema.json").validate(value)
+    except (ContractError, ValidationError) as error:
+        raise ContractError(f"invalid frozen scientific plan: {str(error)[:500]}", "corrupt_result") from error
+    return value, payload, {"path": "plan.json", "schema": value["schema"], "source": source,
+        "sha256": hashlib.sha256(payload).hexdigest(), "bytes": len(payload),
+        "fingerprint": value["fingerprint"], "scientific_fingerprint": value["scientific_fingerprint"],
+        "model_revision": value["model_revision"]}
+
+
+def _verify_plan_identity(plan: dict[str, Any], commits: list[PinnedCommit],
+                          series: dict[str, Any] | None) -> tuple[list[str], list[dict[str, Any]]]:
+    """Compare saved identities; Julia's canonical fingerprints are not recomputed here."""
+    verified: set[str] = set()
+    executions = {item["id"]: item for item in plan["executions"]}
+    points = {item["id"]: item for item in plan["points"]}
+    selected = series.get("selected_execution_id") if series is not None else None
+    if selected is not None and (not isinstance(selected, str) or selected not in executions):
+        raise ContractError("frozen plan does not contain selected execution", "corrupt_result")
+    expected_points = {key for key, point in points.items()
+                       if selected is None or point["execution_id"] == selected}
+    for point in points.values():
+        if point["execution_id"] not in executions:
+            raise ContractError("frozen plan point identifies an unknown execution", "corrupt_result")
+    for identifier, execution in executions.items():
+        if set(execution["point_ids"]) != {key for key, point in points.items() if point["execution_id"] == identifier}:
+            raise ContractError("frozen plan execution point membership differs", "corrupt_result")
+
+    def compare(container: Mapping[str, Any], key: str, expected: Any, locator: str) -> None:
+        if key in container:
+            if container[key] != expected:
+                raise ContractError(f"frozen plan identity differs from {locator}.{key}", "corrupt_result")
+            verified.add(f"{locator}.{key}")
+
+    def point_identity(identity: Mapping[str, Any], locator: str, *, selected_scope: bool = True
+                       ) -> dict[str, Any] | None:
+        identifier = identity.get("point_id", identity.get("id"))
+        point = points.get(identifier) if isinstance(identifier, str) else None
+        if identifier is not None and point is None:
+            raise ContractError(f"frozen plan does not contain {locator} point", "corrupt_result")
+        execution = identity.get("execution_id")
+        if execution is not None and (not isinstance(execution, str) or execution not in executions or
+                point is not None and execution != point["execution_id"]):
+            raise ContractError(f"frozen plan differs from {locator} execution", "corrupt_result")
+        if selected_scope and selected is not None and (execution is not None and execution != selected
+                or point is not None and point["execution_id"] != selected):
+            raise ContractError(f"frozen plan {locator} is outside the selected execution", "corrupt_result")
+        if point is not None:
+            verified.add(f"{locator}.point_id")
+        if execution is not None:
+            verified.add(f"{locator}.execution_id")
+        return point
+
+    if series is not None:
+        for key, expected in (("plan_fingerprint", plan["fingerprint"]),
+                              ("plan_scientific_fingerprint", plan["scientific_fingerprint"]),
+                              ("root_definition_id", plan["root_definition_id"])):
+            compare(series, key, expected, "series")
+        for section in ("points", "attempt_history"):
+            for row in series.get(section, []):
+                locator = "series.point" if section == "points" else "series.attempt_history"
+                point = point_identity(row, locator, selected_scope=section == "points")
+                if section == "attempt_history" and point is None:
+                    raise ContractError("frozen plan requires an identified historical point", "corrupt_result")
+                if point is not None and "coordinates" in row:
+                    coordinates = row["coordinates"]
+                    if not isinstance(coordinates, dict):
+                        raise ContractError("frozen plan requires saved point coordinates to be an object", "corrupt_result")
+                    for key in ("temperature_K", "voltage_per_period_V", "branch", "order"):
+                        compare(coordinates, key, point[key], f"{locator}.coordinates")
+    for commit in commits:
+        identity = commit.value["identity"]
+        compare(identity, "plan_fingerprint", plan["fingerprint"], "commit")
+        compare(identity, "plan_scientific_fingerprint", plan["scientific_fingerprint"], "commit")
+        point_identity(identity, "commit")
+    recorded = {row.get("id") for row in (series or {}).get("points", []) if isinstance(row.get("id"), str)}
+    missing = [{"id": identifier, "execution_id": points[identifier]["execution_id"],
+                "series_section": "points", "availability": "no_series_point_record"}
+               for identifier in sorted(expected_points - recorded)]
+    return sorted(verified), missing
 
 
 def export_snapshot(job_root: Path, destination: Path, *, profile: str = "science",
                     job_id: str | None = None, job_status: str = "running",
-                    plan: dict[str, Any] | None = None,
-                    maximum_bytes: int = SCIENCE_MAX_BYTES,
+                    plan: Mapping[str, Any] | bytes | None = None,
+                    plan_source: str | None = None,
                     progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     operation_started = time.monotonic()
     captured_unix = time.time()
@@ -539,13 +702,15 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                       "phase_seconds": dict(phase_seconds), **counts})
 
     _check_profile(profile)
-    if (not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool)
-            or not 0 < maximum_bytes <= SCIENCE_MAX_BYTES):
-        raise ContractError("export part limit must be between 1 and 200000000 bytes")
+    plan_value, plan_payload, plan_metadata = _frozen_plan(plan, plan_source)
     root, destination = Path(job_root).resolve(), Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     report("collecting")
-    commits, coverage, series = _collect(root)
+    commits, coverage, series, series_payload, excluded_history = _collect(root, plan=plan_value)
+    if plan_value is not None:
+        assert plan_metadata is not None
+        plan_metadata["identity_verified_against"], missing_points = _verify_plan_identity(plan_value, commits, series)
+        coverage.extend(missing_points)
     captured_unix = time.time()  # The cutoff describes the now fully pinned reference set.
     replacements = _history_replacements(commits, profile)
     selected: list[tuple[PinnedCommit, Artifact]] = []
@@ -567,6 +732,19 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         if item.sha256 in object_contracts and object_contracts[item.sha256] != contract:
             raise ContractError("one object digest has conflicting size or media type", "corrupt_result")
         object_contracts[item.sha256] = contract
+    series_manifest = None
+    if series_payload is not None:
+        series_sha256 = hashlib.sha256(series_payload).hexdigest()
+        series_contract = (len(series_payload), "application/json")
+        if series_sha256 in object_contracts and object_contracts[series_sha256] != series_contract:
+            raise ContractError("series object digest has conflicting size or media type", "corrupt_result")
+        object_contracts[series_sha256] = series_contract
+        series_manifest = {"object": f"objects/{series_sha256}.json",
+                           "sha256": series_sha256, "bytes": len(series_payload),
+                           "schema": series["schema"]}
+    history_scope = {"selected_execution_id": (series or {}).get("selected_execution_id"),
+                     "excluded_count": len(excluded_history), "excluded": excluded_history,
+                     "policy": "whole-plan historical identity; selected-scope payloads and coverage"}
     unique_size = sum(size for size, _ in object_contracts.values())
     # This identity pins the committed prefix. A later producer generation is a new export.
     compressor: dict[str, Any] = {"format": "xz", "preset": 1,
@@ -579,16 +757,15 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     identity = hashlib.sha256(json_bytes({"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET, "profile": profile,
         "commits": [item.sha256 for item in commits], "coverage": coverage,
         "native_format": "4.0", "history_closure": "verified-cumulative-physical-markers-psd-v4", "inventory": "complete-performance-v2",
-        "derivation": derivation, "exporter_revision": 2,
-        "size_policy": "actual-compressed-independent-parts-v1",
-        "maximum_bytes": maximum_bytes,
+        "derivation": derivation, "exporter_revision": 7,
+        "series_manifest": series_manifest, "history_scope": history_scope,
+        "size_policy": "single-complete-archive-v1",
         "compressor": compressor,
-        "plan": plan, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
+        "plan": plan_metadata, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
     receipt_path = destination / f"{identity}.json"
-    cached = _cached_receipt(destination, identity, maximum_bytes)
+    cached = _cached_receipt(destination, identity)
     if cached is not None:
-        report("cached", completed_bytes=cached["total_archive_bytes"], total_bytes=cached["total_archive_bytes"],
-               completed_parts=cached["part_count"], total_parts=cached["part_count"])
+        report("cached", completed_bytes=cached["bytes"], total_bytes=cached["bytes"])
         return cached
     with tempfile.TemporaryDirectory(prefix=".export-pin-", dir=destination) as directory:
         spool = Path(directory)
@@ -612,12 +789,17 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                 report("capturing", completed_bytes=captured_bytes, total_bytes=unique_size,
                        completed_files=len(files), total_files=len(object_contracts))
             _verify_recovery_closure(commit, artifact, files[name][0])
+            provenance = None
+            if artifact.media_type == "application/x-hdf5":
+                from .provenance import verify_native_provenance
+                provenance = verify_native_provenance(files[name][0], commit.value["identity"], plan_value)
             window = profile == "science" and artifact.role == "performance.full"
             record_map[commit.sha256]["included"].append({
                 "role": "performance.window" if window else artifact.role,
                 **({"source_role": artifact.role, "selection": "all committed segments per table"} if window else {}),
                 "object": name,
                 "source_path": artifact.path, "sha256": artifact.sha256,
+                **({"native_provenance": provenance} if provenance is not None else {}),
                 **({"schema": artifact.schema} if artifact.schema is not None else {}),
                 "dependencies": [next(f"objects/{item.sha256}" + {
                     "application/x-hdf5": ".h5", "application/vnd.apache.parquet": ".parquet",
@@ -648,11 +830,24 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         compaction_proofs = compact_export_records(records, files, spool)
         from .witness_selection import select_export_witnesses
         witness_selection = select_export_witnesses(records, files, spool) if profile == "science" else []
+        # Derivation prunes superseded role objects. The exact source series is
+        # separately retained as provenance, including out-of-scope history.
+        if series_manifest is not None and series_manifest["object"] not in files:
+            assert series_payload is not None
+            target = spool / (series_manifest["sha256"] + ".json")
+            atomic_write(target, series_payload)
+            files[series_manifest["object"]] = (target, {
+                "path": series_manifest["object"], "bytes": series_manifest["bytes"],
+                "sha256": series_manifest["sha256"], "media_type": "application/json"})
+            captured_bytes += len(series_payload)
+            report("capturing", completed_bytes=captured_bytes, total_bytes=unique_size,
+                   completed_files=len(files), total_files=len(object_contracts))
         report("validating_closure")
         all_objects = set(files)
         if any(dep not in all_objects for record in records for item in record["included"] for dep in item["dependencies"]):
             raise ContractError("export closure contains a dangling object reference", "corrupt_result")
-        missing = [item for item in coverage if item.get("availability") == "no_committed_physical_record"]
+        missing = [item for item in coverage if item.get("availability") in {
+            "no_committed_physical_record", "no_series_point_record"}]
         job_complete = job_status in TERMINAL
         has_science = any(item.role in {"physics.analysis", "science.comparison"} for _, item in selected)
         if not has_science:
@@ -666,6 +861,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
             "requires_full_state": ["arbitrary_new_optical_response", "exact_restart"] if profile == "science" else [],
             "cutoff": "exact committed records named below; active uncommitted work is absent",
             "records": records, "coverage": coverage, "missing_records": missing,
+            "history_scope": history_scope,
             "telemetry_compaction": compaction_proofs,
             "derivation": derivation,
             "witness_selection": witness_selection,
@@ -678,8 +874,12 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
             "freshness": _freshness(commits, spool, selected, captured_unix),
             "compressor": compressor,
             "size_policy": {"measurement": "actual compressed archive including container metadata",
-                            "maximum_bytes": maximum_bytes, "scope": "each finalized transport part, all profiles",
-                            "on_overflow": "paginate whole objects; explicit checksummed chunks for oversized objects"}}
+                            "scope": "one complete archive, all profiles",
+                            "archive_byte_limit": None, "storage_failure": "fail without publishing a receipt"}}
+        if plan_metadata is not None:
+            manifest["frozen_plan"] = plan_metadata
+        if series_manifest is not None:
+            manifest["series_manifest"] = series_manifest
         metadata: dict[str, bytes] = {"manifest.json": json_bytes(manifest),
             "README.md": ("# QCLNEGF scientific snapshot\n\n"
                 f"Profile: {profile}. Job complete: {job_complete}. Snapshot consistent: true.\n\n"
@@ -687,53 +887,71 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                 "manifest.json maps scientific roles and native numerical sources to content-addressed files.\n"
                 "The science profile supports declared analyses, not arbitrary new full-matrix optics or exact restart.\n"
                 "Scientific acceptance is explicit per record; successful export does not imply convergence.\n\n"
-                "Every .tar.xz part is independently readable and at most 200000000 decimal bytes.\n"
-                "Part 1 contains the shared export-index.json, manifest, plan and prioritised diagnostics.\n"
-                "Later parts contain whole native objects or explicitly indexed transport chunks.\n"
-                "Verify: python -m qcl_negf_results.multipart verify PART...\n"
-                "Restore native files: python -m qcl_negf_results.multipart reassemble --destination recovered PART...\n"
-                "Input part order does not matter. Keep the receipt to additionally verify final archive hashes.\n"
-                "Missing or corrupt parts are rejected; no giant combined archive is required.\n").encode()}
+                "One .tar.xz contains the complete selected committed snapshot.\n"
+                "export-index.json describes whole native objects and metadata with their hashes.\n"
+                "Verify: python -m qcl_negf_results.archive verify ARCHIVE --receipt RECEIPT\n"
+                "Restore native files: python -m qcl_negf_results.archive reassemble --destination recovered ARCHIVE\n"
+                "Keep the receipt to additionally verify the finalized archive hash and snapshot identity.\n"
+                "The receiver also supports legacy multipart sets.\n").encode()}
         from .diagnostic_page import summary as diagnostic_summary
         metadata["diagnostics.json"] = diagnostic_summary(manifest, files)
-        if plan is not None:
-            metadata["plan.json"] = json_bytes(plan)
+        if plan_payload is not None:
+            metadata["plan.json"] = plan_payload
         metadata_bytes = sum(map(len, metadata.values()))
         raw_bytes = sum(path.stat().st_size for path, _ in files.values()) + metadata_bytes
-        from .multipart import build_parts, verify_parts
+        from .archive import build_archive, verify_archive
         started = time.monotonic()
-        finalized, transport_index = build_parts(spool, files, metadata, records=records,
-            identity=identity, profile=profile, maximum=maximum_bytes,
-            preset=int(compressor["preset"]), report=report)
+        temporary_archive, archive_info, transport_index = build_archive(spool, files, metadata,
+            identity=identity, profile=profile, preset=int(compressor["preset"]), report=report)
         compression_seconds = time.monotonic() - started
-        # Independently verify every complete tar/XZ stream before publishing any
-        # receipt. Source containers and exact object closure were verified above.
-        transport_metadata_bytes = verify_parts(finalized, transport_index, metadata, report)
-        report("publishing", completed_parts=0, total_parts=len(finalized))
-        parts = _publish_parts(finalized, destination, job_id or root.name)
-        first = parts[0]
-        size = sum(part["bytes"] for part in parts)
+        # Readback has its own inventory parser and checks every complete member
+        # plus the XZ footer; source containers and object closure were checked above.
+        verified_index = verify_archive(temporary_archive, report=report)
+        if verified_index != transport_index:
+            raise ContractError("final archive inventory changed", "corrupt_result")
+        transport_metadata_bytes = len(json_bytes(transport_index))
+        report("publishing")
+        digest, size = archive_info["sha256"], archive_info["bytes"]
+        archive_path = destination / f"{digest}.tar.xz"
         receipt = {"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET,
-            "snapshot_id": first["sha256"], "id": job_id or root.name, "profile": profile,
-            "sha256": first["sha256"], "bytes": first["bytes"], "payload_bytes": raw_bytes + transport_metadata_bytes,
+            "snapshot_id": digest, "id": job_id or root.name, "profile": profile,
+            "sha256": digest, "bytes": size, "payload_bytes": raw_bytes + transport_metadata_bytes,
             "source_payload_bytes": raw_bytes, "transport_metadata_bytes": transport_metadata_bytes,
-            "parts": parts, "part_count": len(parts), "multipart": len(parts) > 1,
-            "total_archive_bytes": size, "maximum_part_bytes": maximum_bytes,
-            "transport_schema": transport_index["schema"],
+            "total_archive_bytes": size, "transport_schema": transport_index["schema"],
+            "filename": _download_filename(job_id or root.name, profile, identity),
             "complete": manifest["complete"], "job_complete": job_complete,
             "snapshot_consistent": True, "snapshot_identity": identity,
             "export_seconds": time.monotonic() - operation_started,
             "compression_seconds": compression_seconds,
             "phase_seconds": {**phase_seconds, "publishing": time.monotonic() - phase_started},
-            "freshness": manifest["freshness"],
-            "manifest_bytes": len(metadata["manifest.json"]),
+            "freshness": manifest["freshness"], "manifest_bytes": len(metadata["manifest.json"]),
             "captured_unix": captured_unix, "committed_records": len(commits),
-            "compressor": manifest["compressor"],
-            "size_policy": manifest["size_policy"],
-            "archive": first["archive"]}
-        atomic_write(receipt_path, json_bytes(receipt))
-        report("completed", completed_bytes=size, total_bytes=size,
-               completed_parts=len(parts), total_parts=len(parts))
+            "compressor": manifest["compressor"], "size_policy": manifest["size_policy"],
+            "archive": archive_path.name}
+        validate_export_receipt(receipt)
+        temporary_receipt = spool / "receipt.json"
+        atomic_write(temporary_receipt, json_bytes(receipt))
+        os.chmod(temporary_archive, 0o640)
+        archive_existed = archive_path.exists()
+        previous_receipt = receipt_path.read_bytes() if receipt_path.exists() else None
+        receipt_published = False
+        os.replace(temporary_archive, archive_path)
+        try:
+            os.replace(temporary_receipt, receipt_path)
+            receipt_published = True
+            fsync_directory(destination)
+        except BaseException:
+            try:
+                if receipt_published:
+                    if previous_receipt is None:
+                        receipt_path.unlink(missing_ok=True)
+                    else:
+                        atomic_write(receipt_path, previous_receipt)
+            finally:
+                if not archive_existed:
+                    archive_path.unlink(missing_ok=True)
+            raise
+        report("completed", completed_bytes=size, total_bytes=size)
         return receipt
 
 
@@ -745,11 +963,11 @@ def preview(job_root: Path, *, profile: str = "science", job_id: str | None = No
     payload before publishing a receipt. The caller supplies scheduler state.
     """
     _check_profile(profile)
-    commits, coverage, _ = _collect(Path(job_root).resolve())
+    commits, coverage, _, _, _ = _collect(Path(job_root).resolve())
     artifacts = [item for commit in commits for item in _selection(commit, profile)[0]]
     return {"id": job_id, "profile": profile,
             "files": len({item.sha256 for item in artifacts}),
             "bytes": sum({item.sha256: item.size for item in artifacts}.values()),
             "complete": job_status in TERMINAL, "committed_records": len(commits),
             "selected_roles": sorted({item.role for item in artifacts}),
-            "coverage": coverage, "maximum_part_bytes": SCIENCE_MAX_BYTES}
+            "coverage": coverage, "transport_schema": "qcl-negf.export-archive.v1"}

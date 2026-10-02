@@ -1,0 +1,436 @@
+{
+  "fingerprint": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "executions": [
+    {
+      "outputs": {
+        "intermediate_history": 64,
+        "optical": false,
+        "full_state": false,
+        "projections": false
+      },
+      "provenance": {
+        "sources": {}
+      },
+      "purpose": "diagnostic",
+      "effective_inputs": {
+        "energy_nodes": 30721,
+        "energy_min_eV": -0.3,
+        "seed": {
+          "grid_floor_eV": 3.90625e-05,
+          "rule": "explicit_requested",
+          "grid_floor_scaled": 0.00039062499999999997,
+          "requested_scaled": 0.012499999999999999,
+          "effective_scaled": 0.012499999999999999,
+          "clamped": false,
+          "effective_eV": 0.00125,
+          "working_eta_eV": 0.0,
+          "requested_eV": 0.00125
+        },
+        "energy_max_eV": 0.9,
+        "energy_shift": "sparse_plan"
+      },
+      "variant_id": "baseline",
+      "resolved_configuration": {
+        "run": {
+          "name": "operator-a-baseline",
+          "description": "Synthetic transport test configuration",
+          "classification": "study"
+        },
+        "output": {
+          "light_max_momentum_points": 64,
+          "progress": {
+            "significant_digits": 4,
+            "event_log_file": "progress/events.csv",
+            "terminal": false,
+            "enabled": true,
+            "latest_snapshot_file": "progress/latest.csv",
+            "human_every": 5,
+            "dashboard_file": null
+          },
+          "resume": false,
+          "checkpoint_prefix": "state",
+          "snapshot_every_outer": 1,
+          "save_plots": false,
+          "save_comparison_plots": true,
+          "light_max_space_points": 2048,
+          "save_expert_markdown": true,
+          "live_visualization": false,
+          "debug_hdf5": false,
+          "report_directory": "expert_report",
+          "save_csv": true,
+          "light_max_energy_points": 512,
+          "snapshot_every_scba": 64,
+          "light_max_snapshots": 64,
+          "device_geometry": {
+            "cavity_length": "1.8 mm",
+            "periods": 405,
+            "ridge_width": "150 μm"
+          },
+          "directory": "results/base",
+          "save_comparison_csv": true,
+          "fail_fast": false,
+          "save_full_state": false
+        },
+        "numerical": {
+          "longitudinal_momentum_max": "10.0 nm^-1",
+          "longitudinal_momentum_nodes": 81,
+          "momentum_max": "0.60 nm^-1",
+          "basis_states": 5,
+          "basis_periods": 3,
+          "energy_min": "-0.30 eV",
+          "angular_nodes": 32,
+          "energy_max": "0.90 eV",
+          "energy_nodes": 30721,
+          "seed_broadening": "1.25 meV",
+          "energy_trust_margin": "80 meV",
+          "spatial_nodes": 96,
+          "momentum_nodes": 11
+        },
+        "scattering": {
+          "lo_phonon": true,
+          "acoustic_phonon": true,
+          "interface_roughness": true,
+          "alloy_disorder": true,
+          "ionized_impurity": true
+        },
+        "kernel_construction": {
+          "impurity_angular_tolerance": 1e-05,
+          "relative_tolerance": 0.0002,
+          "lookup_power": 2.0,
+          "validation_fractions": [
+            0.25,
+            0.5,
+            0.75
+          ],
+          "maximum_lookup_nodes": 513,
+          "strict": true,
+          "initial_lookup_nodes": 65,
+          "angular_validation_pairs": 3
+        },
+        "algorithms": {
+          "occupation_normalization": "paired_convex",
+          "embedding": "finite_chain",
+          "mixing": "linear",
+          "self_energy_structure": "full",
+          "kernel_build": "direct",
+          "energy_shift": "sparse_plan",
+          "localization": "pzp",
+          "contraction": "dense_blas",
+          "anderson": {
+            "damping": 1.0,
+            "regularization": 1e-12,
+            "history_depth": 6
+          },
+          "low_rank": {
+            "relative_tolerance": 0.0,
+            "maximum_rank": 0
+          },
+          "retarded_real_part": "kramers_kronig",
+          "transverse_momentum": "resolved",
+          "embedding_periods": 4,
+          "hilbert": "fft"
+        },
+        "study": {
+          "comparison_profiles": [],
+          "photon_energy_min": "1 meV",
+          "methods": [],
+          "voltages_per_period": [
+            "56 mV"
+          ],
+          "optical_edge_tolerance": 0.0001,
+          "reference_profile": null,
+          "photon_energy_points": 321,
+          "calculate_optical_response": false,
+          "repetitions": 1,
+          "mode": "single",
+          "temperatures": [
+            "70 K"
+          ],
+          "photon_energy_max": "80 meV",
+          "convergence": {
+            "energy_nodes": [],
+            "angular_nodes": [],
+            "spatial_nodes": [],
+            "momentum_nodes": []
+          }
+        },
+        "production": {
+          "checkpoint_every_scba": 0,
+          "hilbert_columns": 32,
+          "worker_count": 0,
+          "energy_chunk": 64,
+          "phase_timing": true,
+          "checkpoint_every_outer": 0,
+          "verify_fft_roundoff": true,
+          "residual_chunk": 256,
+          "progress_every_scba": 5,
+          "parallel_backend": "threads",
+          "progress_every_outer": 1
+        },
+        "execution": {
+          "strategy": "auto_exact",
+          "solver_backend": "production",
+          "fail_on_thread_mismatch": false,
+          "julia_threads": 0,
+          "blas_threads": 1,
+          "auto": {
+            "hilbert_columns_per_worker": 8,
+            "minimum_energy_chunk": 8,
+            "minimum_outer_parallel_threads": 4,
+            "energy_jobs_per_worker": 2,
+            "large_basis_threshold": 32,
+            "memory_reserve_fraction": 0.125,
+            "minimum_memory_reserve_bytes": 2147483648,
+            "energy_chunk_alignment": 8,
+            "workspace_budget_fraction": 0.05,
+            "blocks_per_worker": 4,
+            "workspace_complex_arrays_per_energy_block": 12
+          }
+        },
+        "scales": {
+          "length": "10 nm",
+          "energy": "0.1 eV",
+          "reference_mass_ratio": 0.067
+        },
+        "solver": {
+          "self_energy_mixing": 0.1,
+          "convergence": {
+            "diagnostic_quality": {
+              "enabled": true,
+              "strict_attempt_iterations": 8,
+              "observables": 0.001,
+              "self_energy": 0.001,
+              "outer_threshold": 0.0001,
+              "normalization": 0.0001,
+              "keldysh": 0.001,
+              "target_fixed_point": 0.0001,
+              "causality": 1e-10,
+              "coarse_wait_iterations": 64,
+              "positivity": 1e-06,
+              "required_consecutive_passes": 3
+            },
+            "minimum_scba_iterations": 2,
+            "required_consecutive_poisson_passes": 2,
+            "minimum_poisson_iterations": 2,
+            "trend": {
+              "max_regression": 2.0,
+              "promising_threshold": 0.0001,
+              "max_oscillation": 10.0,
+              "window": 32,
+              "minimum_reduction": 0.5
+            },
+            "required_consecutive_scba_passes": 3,
+            "mode": "adaptive_working",
+            "stagnation_window": 0,
+            "stagnation_relative_improvement": 0
+          },
+          "poisson_mixing": 0.15,
+          "tolerances": {
+            "fft_roundoff": 1e-10,
+            "collision": 1e-08,
+            "energy_edge": 1e-06,
+            "observables": 0.0001,
+            "self_energy": 1e-08,
+            "poisson": 1e-11,
+            "density": 1e-07,
+            "poisson_gauge": 1e-10,
+            "tail": 1e-06,
+            "hartree": 1e-07,
+            "neutrality": 1e-10,
+            "normalization": 1e-08,
+            "sum_rule": 0.001,
+            "keldysh": 1e-08,
+            "power": 0.0001,
+            "causality": 1e-10,
+            "current_continuity": 1e-06,
+            "spectral_identity": 1e-09,
+            "positivity": 1e-10,
+            "dyson": 1e-11,
+            "imaginary_part": 1e-10
+          },
+          "validation_windows": {
+            "momentum_tail_fraction": 0.1,
+            "energy_tail_fraction": 0.05
+          },
+          "maximum_scba_iterations": 64,
+          "maximum_poisson_iterations": 100
+        },
+        "physical": {
+          "layers": [
+            {
+              "doped": false,
+              "aluminium_fraction": 0.25,
+              "relative_permittivity": 12.9,
+              "transverse_relative_mass": 0.08775,
+              "material": "AlGaAs",
+              "longitudinal_relative_mass": 0.08775,
+              "conduction_band_edge": "0.20775 eV",
+              "thickness": "3.26 nm"
+            },
+            {
+              "doped": false,
+              "aluminium_fraction": 0.0,
+              "relative_permittivity": 12.9,
+              "transverse_relative_mass": 0.067,
+              "material": "GaAs",
+              "longitudinal_relative_mass": 0.067,
+              "conduction_band_edge": "0 eV",
+              "thickness": "7.99 nm"
+            },
+            {
+              "doped": false,
+              "aluminium_fraction": 0.25,
+              "relative_permittivity": 12.9,
+              "transverse_relative_mass": 0.08775,
+              "material": "AlGaAs",
+              "longitudinal_relative_mass": 0.08775,
+              "conduction_band_edge": "0.20775 eV",
+              "thickness": "1.90 nm"
+            },
+            {
+              "doped": false,
+              "aluminium_fraction": 0.0,
+              "relative_permittivity": 12.9,
+              "transverse_relative_mass": 0.067,
+              "material": "GaAs",
+              "longitudinal_relative_mass": 0.067,
+              "conduction_band_edge": "0 eV",
+              "thickness": "8.40 nm"
+            },
+            {
+              "doped": true,
+              "aluminium_fraction": 0.0,
+              "relative_permittivity": 12.9,
+              "transverse_relative_mass": 0.067,
+              "material": "GaAs",
+              "longitudinal_relative_mass": 0.067,
+              "conduction_band_edge": "0 eV",
+              "thickness": "2.90 nm"
+            },
+            {
+              "doped": false,
+              "aluminium_fraction": 0.0,
+              "relative_permittivity": 12.9,
+              "transverse_relative_mass": 0.067,
+              "material": "GaAs",
+              "longitudinal_relative_mass": 0.067,
+              "conduction_band_edge": "0 eV",
+              "thickness": "5.16 nm"
+            }
+          ],
+          "high_frequency_relative_permittivity": 10.89,
+          "voltage_per_period": "56 mV",
+          "acoustic_deformation_potential": "7.0 eV",
+          "position_origin": "0 nm",
+          "interfaces": [
+            "0 nm",
+            "3.26 nm",
+            "11.25 nm",
+            "13.15 nm"
+          ],
+          "interface_roughness_height": "0.10 nm",
+          "lattice_temperature": "70.0 K",
+          "lo_phonon_energy": "36.7 meV",
+          "sound_velocity": "5240 m/s",
+          "alloy_potential": "0.60 eV",
+          "mass_density": "5317 kg/m^3",
+          "lo_temperature": "70.0 K",
+          "ionization_fraction": 1.0,
+          "impurity_screening_wavenumber": "0.20 nm^-1",
+          "lo_screening_wavenumber": "0.20 nm^-1",
+          "interface_correlation_length": "9.0 nm",
+          "spin_degeneracy": 2,
+          "donor_sheet_density": "4.5e14 m^-2",
+          "static_relative_permittivity": 12.9,
+          "field_bias": null,
+          "primitive_cell_volume": "4.5168e-29 m^3",
+          "reference_energy": "0 eV"
+        }
+      },
+      "label": "Operator algebra fixture",
+      "repetition": 1,
+      "method_id": "configured",
+      "definition_id": "operator-a",
+      "operation": "operator_algebra",
+      "point_ids": [
+        "point-1"
+      ],
+      "estimated_peak_bytes": 0,
+      "id": "execution-1",
+      "policies": {
+        "scba_to_poisson": "adaptive_working",
+        "on_child_failure": "continue",
+        "voltage": {
+          "invalid_predecessor": "stop_branch",
+          "mode": "independent"
+        }
+      }
+    }
+  ],
+  "name": "Synthetic transport contract fixture",
+  "points": [
+    {
+      "initialization": "cold",
+      "voltage_per_period_V": 0.0,
+      "id": "point-1",
+      "effective_inputs": {
+        "voltage_per_period_V": 0.0,
+        "axes_applied": true,
+        "configuration_hash": "ff1e33eb31dd29d6a52a9289378a13bc56ebfc94be0a3e710a5ac718760e7537",
+        "hash_encoding": "qcl-negf-canonical-bytes-v1",
+        "temperature_K": 70.0
+      },
+      "predecessor_id": null,
+      "branch": "T1/forward",
+      "execution_id": "execution-1",
+      "order": 1,
+      "temperature_K": 70.0
+    }
+  ],
+  "resources": {
+    "estimated_peak_bytes": 0,
+    "minimum_output_bytes": 0,
+    "scheduling": "scheduler",
+    "maximum_active_executions": 4,
+    "output_estimate_basis": "uncompressed native physical arrays; local full state is independent of the analytical archive budget"
+  },
+  "root_kind": "study",
+  "root_definition_id": "operator-a",
+  "campaign": null,
+  "maximum_solver_runs": 10000,
+  "inclusions": [
+    {
+      "path": [
+        "operator-a"
+      ],
+      "label": "Operator algebra fixture",
+      "id": "inclusion-1",
+      "definition_id": "operator-a",
+      "parent_id": null,
+      "execution_ids": [
+        "execution-1"
+      ]
+    }
+  ],
+  "science_archive_preflight": null,
+  "nodes": [
+    {
+      "estimated_memory_bytes": 0,
+      "stage_id": "standalone",
+      "required_evidence": [],
+      "comparable_fingerprint": "6fd2c4b0ebc13e6fad6e3731b20c9448e333c24296ef2f63a7e9b6aa9a4319cd",
+      "execution_id": "execution-1",
+      "comparison_reference": null,
+      "forbidden_evidence": [],
+      "priority": 0,
+      "reserve": false,
+      "comparison_kind": "controlled_axis",
+      "controlled_paths": [],
+      "depends_on": []
+    }
+  ],
+  "scientific_fingerprint": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "schema": "qcl-negf-scientific-plan-v2",
+  "model_revision": "transport-contract-v2",
+  "computation_count": 1
+}
