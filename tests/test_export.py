@@ -64,7 +64,7 @@ def test_running_science_pins_complete_native_hdf5_without_recovery(tmp_path: Pa
     assert [item["role"] for item in included] == ["physics.analysis"]
     assert members[included[0]["object"]] == (generation / "analysis.h5").read_bytes()
     assert manifest["records"][0]["omitted_by_policy"][0]["role"] == "recovery"
-    assert receipt["bytes"] <= 200_000_000
+    assert receipt["bytes"] > 0
 
 
 def test_full_state_includes_recovery(tmp_path: Path) -> None:
@@ -219,22 +219,13 @@ def test_running_series_advancement_does_not_mix_generations(tmp_path: Path, mon
     assert manifest["snapshot_consistent"] is True
 
 
-def test_mandatory_payload_is_not_trimmed_to_fit(tmp_path: Path) -> None:
+def test_mandatory_payload_is_not_trimmed_by_transport(tmp_path: Path) -> None:
     root, output = tmp_path / "run", tmp_path / "exports"
     generation = fixture(root)
     before = (generation / "analysis.h5").read_bytes()
-    with pytest.raises(ContractError, match="metadata alone exceeds"):
-        export_snapshot(root, output, maximum_bytes=16)
+    manifest, members = unpack(export_snapshot(root, output), output)
+    assert members[manifest["records"][0]["included"][0]["object"]] == before
     assert (generation / "analysis.h5").read_bytes() == before
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_actual_compressed_cap_is_enforced(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    with pytest.raises(ContractError, match="metadata alone exceeds"):
-        export_snapshot(root, output, maximum_bytes=100)
-    assert not list(output.glob("*.tar.xz"))
 
 
 def test_required_dependency_omission_is_rejected(tmp_path: Path) -> None:
@@ -312,16 +303,19 @@ def test_complete_queue_without_physical_record_is_not_complete_export(tmp_path:
     assert manifest["missing_records"] == [{"availability": "no_committed_scientific_records"}]
 
 
-def test_compressed_cap_is_checked_before_writing_and_includes_footer(tmp_path: Path) -> None:
-    from qcl_negf_results.multipart import _write_page, _PartTooLarge
-    whole = tmp_path / "whole.tar.xz"
-    size = _write_page(whole, {"hello.txt": b"hello"}, [], 10_000, 1)
-    target = tmp_path / "bounded.tar.xz"
-    with pytest.raises(_PartTooLarge):
-        _write_page(target, {"hello.txt": b"hello"}, [], size - 1, 1)
-    assert target.stat().st_size <= size - 1
-    assert _write_page(target, {"hello.txt": b"hello"}, [], size, 1) == size
-    assert target.read_bytes() == whole.read_bytes()
+def test_single_archive_verification_checks_xz_footer_after_valid_members(tmp_path: Path) -> None:
+    import lzma
+    from qcl_negf_results.archive import verify_archive
+    root, output = tmp_path / "run", tmp_path / "exports"
+    fixture(root)
+    receipt = export_snapshot(root, output)
+    source = output / receipt["archive"]
+    payload = bytearray(source.read_bytes())
+    payload[-12] ^= 1  # Corrupt only the footer CRC after valid native members.
+    target = tmp_path / "damaged-footer.tar.xz"
+    target.write_bytes(payload)
+    with pytest.raises((lzma.LZMAError, EOFError, tarfile.ReadError)):
+        verify_archive(target)
 
 
 def test_empty_chunked_diagnostic_dataset_is_a_valid_native_state(tmp_path: Path) -> None:
@@ -481,14 +475,6 @@ def test_exact_parent_history_dependency_is_retained(tmp_path: Path) -> None:
             assert all(dependency in {row["path"] for row in manifest["files"]} for dependency in item["dependencies"])
 
 
-def test_cumulative_history_keeps_compressed_limit_after_lossless_dedup(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    cumulative_fixture(root)
-    with pytest.raises(ContractError, match="metadata alone exceeds"):
-        export_snapshot(root, output, maximum_bytes=16)
-    assert not list(output.iterdir())
-
-
 def test_cumulative_history_cannot_hide_an_earlier_attempt_provenance(tmp_path: Path) -> None:
     root, output = tmp_path / "run", tmp_path / "exports"
     generations = cumulative_fixture(root)
@@ -530,7 +516,6 @@ def test_verified_history_reports_raw_size_without_using_it_for_admission(tmp_pa
     assert all_history_bytes > exported_history_bytes
     assert receipt["payload_bytes"] == sum(map(len, members.values()))
     assert receipt["bytes"] < receipt["payload_bytes"]
-    assert receipt["size_policy"]["maximum_bytes"] == 200_000_000
-    assert receipt["size_policy"]["on_overflow"] == "paginate whole objects; explicit checksummed chunks for oversized objects"
-
+    assert receipt["size_policy"]["archive_byte_limit"] is None
+    assert receipt["size_policy"]["scope"] == "one complete archive, all profiles"
 

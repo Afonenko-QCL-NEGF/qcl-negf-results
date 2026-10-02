@@ -45,13 +45,20 @@ Exports preserve native values and provenance. Compaction validates logical payl
 
 Telemetry identifies CPU intervals by `allocation_id` (for example, a Slurm job/step identity), with separate execution and process identities. Missing counters remain unknown. `TelemetryWriter` is a library for producers; it does not run a background machine sampler.
 
-Every archive part is at most 200,000,000 decimal bytes. Receipts describe all parts and hashes. The receiving command verifies the complete part set before restoring objects. Archive metadata and paths are checked; incomplete, altered or unsupported input fails explicitly. Disk usage includes a temporary captured snapshot in addition to the published archive.
+Each new science, full-state or diagnostic export is one `.tar.xz` archive with no fixed archive size ceiling. The v3 scientific receipt identifies its display filename, storage archive name, SHA256, compressed bytes and pinned snapshot identity. The transport index records whole native objects; it never splits or drops them to fit a transfer limit. Compression and independent verification stream through bounded IO buffers before atomic finalization. Storage exhaustion or cancellation before finalization removes temporary output and publishes no successful receipt. Disk usage includes the captured snapshot, any verified derivations and the compressed archive.
+
+```console
+qcl-negf-receive verify EXPORT.tar.xz --receipt RECEIPT.json
+qcl-negf-receive reassemble --destination recovered EXPORT.tar.xz
+```
+
+The same receiver continues to verify and restore legacy multipart exports, including unordered parts and checksummed chunks. Supply all old parts together. Missing, duplicate, altered, mixed-snapshot or unsupported input fails explicitly. New exports never generate multipart sets.
 
 Only `qcl-negf.results.v1` / native HDF5 `4.0` is accepted. Missing declarations are errors. Snapshot consistency, process completion and scientific acceptance are separate fields: none is inferred from the others.
 
 ## Modules
 
-- `export`, `multipart`, `diagnostic_archive`: verified snapshots and transport.
+- `export`, `archive`, `multipart`, `diagnostic_archive`: verified snapshots and transport.
 - `native`, `model`, `history`, `witnesses`: native payload validation and provenance.
 - `telemetry`, `catalog`, `compaction`: durable typed performance records.
 - `render`, `progress`, `presentation`: derived local diagnostic views. Scientific source arrays remain authoritative.

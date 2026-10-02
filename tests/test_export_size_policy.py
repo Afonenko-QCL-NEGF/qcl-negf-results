@@ -55,28 +55,9 @@ def test_raw_payload_above_450mb_fits_actual_compressed_archive(tmp_path: Path) 
     assert receipt["snapshot_consistent"] is True
     compressed = [row for row in progress if row["phase"] == "compressing"]
     assert max(row["archive_bytes"] for row in compressed) == receipt["bytes"]
-    assert all(row["archive_limit_bytes"] == 200_000_000 for row in compressed)
+    assert all("archive_limit_bytes" not in row for row in compressed)
     processed = [row["completed_bytes"] for row in compressed]
     assert processed == sorted(processed)
-
-
-def test_incompressible_archive_overflow_paginates_without_omitting_payload(tmp_path: Path) -> None:
-    from qcl_negf_results.multipart import receive
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    rng = np.random.default_rng(42)
-    payload = json_bytes({"samples": rng.integers(0, 2**32, size=50_000).tolist()})
-    (generation / "comparison.json").write_bytes(payload)
-    _register(generation, "comparison.json", "application/json")
-    progress = []
-    receipt = export_snapshot(root, output, maximum_bytes=10_000, progress=progress.append)
-    paths = [output / (part["sha256"] + ".tar.xz") for part in receipt["parts"]]
-    assert len(paths) > 1 and all(path.stat().st_size <= 10_000 for path in paths)
-    restored = tmp_path / "restored"
-    assert receive(paths, restored, receipt=receipt)["verified"]
-    assert (restored / "objects" / (hashlib.sha256(payload).hexdigest() + ".json")).read_bytes() == payload
-    assert (generation / "comparison.json").read_bytes() == payload
-    assert not list(output.glob(".export-pin-*"))
 
 
 @pytest.mark.parametrize("payload", [b'{"x":1,"x":2}', b'{"x":NaN}', b'{"x":1e999}',

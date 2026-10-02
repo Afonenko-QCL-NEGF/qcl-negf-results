@@ -1,7 +1,7 @@
 [project]
 name = "qcl-negf-results"
 version = "0.2.0"
-description = "Validated scientific result snapshots, diagnostics and bounded exports"
+description = "Validated scientific result snapshots, diagnostics and streaming exports"
 dependencies = ["qcl-negf-contracts==0.2.0", "numpy>=2.3,<3", "h5py>=3.14,<4", "ijson>=3.4,<4", "pyarrow>=21,<26"]
 readme = "README.md"
 license = "MIT"
@@ -13,7 +13,7 @@ Issues = "https://github.com/Afonenko-QCL-NEGF/qcl-negf-results/issues"
 
 [project.scripts]
 qcl-negf-results = "qcl_negf_results.cli:main"
-qcl-negf-receive = "qcl_negf_results.multipart:main"
+qcl-negf-receive = "qcl_negf_results.archive:main"
 
 [project.optional-dependencies]
 test = ["pytest>=8.4,<10", "jsonschema>=4.23,<5"]

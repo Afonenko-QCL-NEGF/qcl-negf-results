@@ -17,7 +17,7 @@ import time
 from typing import Any
 
 from qcl_negf_contracts.artifacts import (Artifact, CONTRACT_SET, EXPORT_SCHEMA, MODEL_SCHEMA,
-    POINTER_SCHEMA, RECOVERY_SCHEMA, SCIENCE_MAX_BYTES, digest_value, relative_path,
+    POINTER_SCHEMA, RECOVERY_SCHEMA, digest_value, relative_path, validate_export_receipt,
     require_contract_set, validate_commit)
 from qcl_negf_contracts.messages import TERMINAL, ContractError
 from .commits import atomic_write, json_bytes, read_json, safe_path
@@ -484,42 +484,31 @@ def _freshness(commits: list[PinnedCommit], spool: Path,
         "history_timestamp_policy": "native last row coordinates; UTC unavailable unless explicitly recorded"}
 
 
-def _cached_receipt(destination: Path, identity: str, maximum_bytes: int) -> dict[str, Any] | None:
+def _cached_receipt(destination: Path, identity: str) -> dict[str, Any] | None:
     receipt_path = destination / f"{identity}.json"
     if not receipt_path.exists():
         return None
     receipt, _ = read_json(receipt_path)
-    require_contract_set(receipt)
-    parts = receipt.get("parts", [])
-    if not parts or receipt.get("maximum_part_bytes") != maximum_bytes:
+    validate_export_receipt(receipt)
+    if receipt["snapshot_identity"] != identity:
+        raise ContractError("cached receipt identifies another snapshot", "corrupt_result")
+    existing = destination / receipt["archive"]
+    if not existing.exists() or existing.stat().st_size != receipt["bytes"]:
         return None
-    for part in parts:
-        existing = destination / f'{digest_value(part["sha256"])}.tar.xz'
-        if not existing.exists() or existing.stat().st_size != part["bytes"] or part["bytes"] > maximum_bytes:
+    with existing.open("rb") as stream:
+        if hashlib.file_digest(stream, "sha256").hexdigest() != receipt["sha256"]:
             return None
-        with existing.open("rb") as stream:
-            if hashlib.file_digest(stream, "sha256").hexdigest() != part["sha256"]:
-                return None
     return receipt
 
 
-def _publish_parts(finalized: list[tuple[Path, dict[str, Any]]], destination: Path, label: str) -> list[dict[str, Any]]:
-    parts = []
-    for temporary, part in finalized:
-        digest = part["sha256"]
-        archive_path = destination / f"{digest}.tar.xz"
-        os.chmod(temporary, 0o640)
-        os.replace(temporary, archive_path)
-        filename = (f"{label}.tar.xz" if len(finalized) == 1 else
-                    f"{label}.part-{part['index']:04d}-of-{len(finalized):04d}.tar.xz")
-        parts.append({**part, "filename": filename, "archive": archive_path.name})
-    return parts
+def _download_filename(label: str, profile: str, identity: str) -> str:
+    safe = "".join(char if char.isascii() and (char.isalnum() or char in "-_") else "_" for char in label)
+    return f"{safe[:100] or 'snapshot'}-{profile}-{identity[:12]}.tar.xz"
 
 
 def export_snapshot(job_root: Path, destination: Path, *, profile: str = "science",
                     job_id: str | None = None, job_status: str = "running",
                     plan: dict[str, Any] | None = None,
-                    maximum_bytes: int = SCIENCE_MAX_BYTES,
                     progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     operation_started = time.monotonic()
     captured_unix = time.time()
@@ -539,9 +528,6 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                       "phase_seconds": dict(phase_seconds), **counts})
 
     _check_profile(profile)
-    if (not isinstance(maximum_bytes, int) or isinstance(maximum_bytes, bool)
-            or not 0 < maximum_bytes <= SCIENCE_MAX_BYTES):
-        raise ContractError("export part limit must be between 1 and 200000000 bytes")
     root, destination = Path(job_root).resolve(), Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     report("collecting")
@@ -579,16 +565,14 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     identity = hashlib.sha256(json_bytes({"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET, "profile": profile,
         "commits": [item.sha256 for item in commits], "coverage": coverage,
         "native_format": "4.0", "history_closure": "verified-cumulative-physical-markers-psd-v4", "inventory": "complete-performance-v2",
-        "derivation": derivation, "exporter_revision": 2,
-        "size_policy": "actual-compressed-independent-parts-v1",
-        "maximum_bytes": maximum_bytes,
+        "derivation": derivation, "exporter_revision": 3,
+        "size_policy": "single-complete-archive-v1",
         "compressor": compressor,
         "plan": plan, "job_id": job_id or root.name, "job_status": job_status})).hexdigest()
     receipt_path = destination / f"{identity}.json"
-    cached = _cached_receipt(destination, identity, maximum_bytes)
+    cached = _cached_receipt(destination, identity)
     if cached is not None:
-        report("cached", completed_bytes=cached["total_archive_bytes"], total_bytes=cached["total_archive_bytes"],
-               completed_parts=cached["part_count"], total_parts=cached["part_count"])
+        report("cached", completed_bytes=cached["bytes"], total_bytes=cached["bytes"])
         return cached
     with tempfile.TemporaryDirectory(prefix=".export-pin-", dir=destination) as directory:
         spool = Path(directory)
@@ -678,8 +662,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
             "freshness": _freshness(commits, spool, selected, captured_unix),
             "compressor": compressor,
             "size_policy": {"measurement": "actual compressed archive including container metadata",
-                            "maximum_bytes": maximum_bytes, "scope": "each finalized transport part, all profiles",
-                            "on_overflow": "paginate whole objects; explicit checksummed chunks for oversized objects"}}
+                            "scope": "one complete archive, all profiles",
+                            "archive_byte_limit": None, "storage_failure": "fail without publishing a receipt"}}
         metadata: dict[str, bytes] = {"manifest.json": json_bytes(manifest),
             "README.md": ("# QCLNEGF scientific snapshot\n\n"
                 f"Profile: {profile}. Job complete: {job_complete}. Snapshot consistent: true.\n\n"
@@ -687,53 +671,60 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                 "manifest.json maps scientific roles and native numerical sources to content-addressed files.\n"
                 "The science profile supports declared analyses, not arbitrary new full-matrix optics or exact restart.\n"
                 "Scientific acceptance is explicit per record; successful export does not imply convergence.\n\n"
-                "Every .tar.xz part is independently readable and at most 200000000 decimal bytes.\n"
-                "Part 1 contains the shared export-index.json, manifest, plan and prioritised diagnostics.\n"
-                "Later parts contain whole native objects or explicitly indexed transport chunks.\n"
-                "Verify: python -m qcl_negf_results.multipart verify PART...\n"
-                "Restore native files: python -m qcl_negf_results.multipart reassemble --destination recovered PART...\n"
-                "Input part order does not matter. Keep the receipt to additionally verify final archive hashes.\n"
-                "Missing or corrupt parts are rejected; no giant combined archive is required.\n").encode()}
+                "One .tar.xz contains the complete selected committed snapshot.\n"
+                "export-index.json describes whole native objects and metadata with their hashes.\n"
+                "Verify: python -m qcl_negf_results.archive verify ARCHIVE --receipt RECEIPT\n"
+                "Restore native files: python -m qcl_negf_results.archive reassemble --destination recovered ARCHIVE\n"
+                "Keep the receipt to additionally verify the finalized archive hash and snapshot identity.\n"
+                "The receiver also supports legacy multipart sets.\n").encode()}
         from .diagnostic_page import summary as diagnostic_summary
         metadata["diagnostics.json"] = diagnostic_summary(manifest, files)
         if plan is not None:
             metadata["plan.json"] = json_bytes(plan)
         metadata_bytes = sum(map(len, metadata.values()))
         raw_bytes = sum(path.stat().st_size for path, _ in files.values()) + metadata_bytes
-        from .multipart import build_parts, verify_parts
+        from .archive import build_archive, verify_archive
         started = time.monotonic()
-        finalized, transport_index = build_parts(spool, files, metadata, records=records,
-            identity=identity, profile=profile, maximum=maximum_bytes,
-            preset=int(compressor["preset"]), report=report)
+        temporary_archive, archive_info, transport_index = build_archive(spool, files, metadata,
+            identity=identity, profile=profile, preset=int(compressor["preset"]), report=report)
         compression_seconds = time.monotonic() - started
-        # Independently verify every complete tar/XZ stream before publishing any
-        # receipt. Source containers and exact object closure were verified above.
-        transport_metadata_bytes = verify_parts(finalized, transport_index, metadata, report)
-        report("publishing", completed_parts=0, total_parts=len(finalized))
-        parts = _publish_parts(finalized, destination, job_id or root.name)
-        first = parts[0]
-        size = sum(part["bytes"] for part in parts)
+        # Readback has its own inventory parser and checks every complete member
+        # plus the XZ footer; source containers and object closure were checked above.
+        verified_index = verify_archive(temporary_archive, report=report)
+        if verified_index != transport_index:
+            raise ContractError("final archive inventory changed", "corrupt_result")
+        transport_metadata_bytes = len(json_bytes(transport_index))
+        report("publishing")
+        digest, size = archive_info["sha256"], archive_info["bytes"]
+        archive_path = destination / f"{digest}.tar.xz"
         receipt = {"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET,
-            "snapshot_id": first["sha256"], "id": job_id or root.name, "profile": profile,
-            "sha256": first["sha256"], "bytes": first["bytes"], "payload_bytes": raw_bytes + transport_metadata_bytes,
+            "snapshot_id": digest, "id": job_id or root.name, "profile": profile,
+            "sha256": digest, "bytes": size, "payload_bytes": raw_bytes + transport_metadata_bytes,
             "source_payload_bytes": raw_bytes, "transport_metadata_bytes": transport_metadata_bytes,
-            "parts": parts, "part_count": len(parts), "multipart": len(parts) > 1,
-            "total_archive_bytes": size, "maximum_part_bytes": maximum_bytes,
-            "transport_schema": transport_index["schema"],
+            "total_archive_bytes": size, "transport_schema": transport_index["schema"],
+            "filename": _download_filename(job_id or root.name, profile, identity),
             "complete": manifest["complete"], "job_complete": job_complete,
             "snapshot_consistent": True, "snapshot_identity": identity,
             "export_seconds": time.monotonic() - operation_started,
             "compression_seconds": compression_seconds,
             "phase_seconds": {**phase_seconds, "publishing": time.monotonic() - phase_started},
-            "freshness": manifest["freshness"],
-            "manifest_bytes": len(metadata["manifest.json"]),
+            "freshness": manifest["freshness"], "manifest_bytes": len(metadata["manifest.json"]),
             "captured_unix": captured_unix, "committed_records": len(commits),
-            "compressor": manifest["compressor"],
-            "size_policy": manifest["size_policy"],
-            "archive": first["archive"]}
-        atomic_write(receipt_path, json_bytes(receipt))
-        report("completed", completed_bytes=size, total_bytes=size,
-               completed_parts=len(parts), total_parts=len(parts))
+            "compressor": manifest["compressor"], "size_policy": manifest["size_policy"],
+            "archive": archive_path.name}
+        validate_export_receipt(receipt)
+        temporary_receipt = spool / "receipt.json"
+        atomic_write(temporary_receipt, json_bytes(receipt))
+        os.chmod(temporary_archive, 0o640)
+        archive_existed = archive_path.exists()
+        os.replace(temporary_archive, archive_path)
+        try:
+            os.replace(temporary_receipt, receipt_path)
+        except BaseException:
+            if not archive_existed:
+                archive_path.unlink(missing_ok=True)
+            raise
+        report("completed", completed_bytes=size, total_bytes=size)
         return receipt
 
 
@@ -752,4 +743,4 @@ def preview(job_root: Path, *, profile: str = "science", job_id: str | None = No
             "bytes": sum({item.sha256: item.size for item in artifacts}.values()),
             "complete": job_status in TERMINAL, "committed_records": len(commits),
             "selected_roles": sorted({item.role for item in artifacts}),
-            "coverage": coverage, "maximum_part_bytes": SCIENCE_MAX_BYTES}
+            "coverage": coverage, "transport_schema": "qcl-negf.export-archive.v1"}
