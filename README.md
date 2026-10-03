@@ -135,6 +135,13 @@ qcl-negf-receive reassemble --destination recovered EXPORT.tar.xz
 
 The same receiver continues to verify and restore legacy multipart exports, including unordered parts and checksummed chunks. Supply all old parts together. Missing, duplicate, altered, mixed-snapshot or unsupported input fails explicitly. New exports never generate multipart sets.
 
+Receiver results state their `verification_scope`. New archives verify transport
+hashes and self-contained HDF5 storage before restoration; external raw storage,
+virtual datasets and non-owned links are rejected even for old producer archives.
+Checking compressed HDF5 metadata may repeat decompression, but does not create
+another numerical payload tree. Legacy multipart verification covers transport
+hashes only. Neither scope establishes scientific acceptance or resumability.
+
 Only `qcl-negf.results.v1` / native HDF5 `4.0` is accepted. Missing declarations are errors. Snapshot consistency, process completion and scientific acceptance are separate fields: none is inferred from the others.
 
 ## Modules

@@ -250,6 +250,7 @@ def receive(paths: Sequence[Path], destination: Path | None = None,
         if destination is not None:
             os.replace(root, destination)
     return {"snapshot_identity": index["snapshot_identity"], "verified": True,
+            "verification_scope": "transport_hashes",
             "part_count": len(parts), "objects": len(index["objects"]),
             "destination": str(destination) if destination is not None else None}
 

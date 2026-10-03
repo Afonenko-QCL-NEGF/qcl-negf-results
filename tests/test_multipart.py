@@ -76,6 +76,7 @@ def test_legacy_multipart_restore_exact_object_without_current_exporter(tmp_path
     target = tmp_path / "restored"
     result = receiver(list(reversed(paths)), target, receipt=receipt)
     assert result["verified"] is True and result["part_count"] == 3
+    assert result["verification_scope"] == "transport_hashes"
     assert (target / name).read_bytes() == payload
     assert json.loads((target / "manifest.json").read_bytes())["schema"] == "qcl-negf.science-export.v2"
 

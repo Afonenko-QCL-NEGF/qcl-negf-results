@@ -48,7 +48,9 @@ def test_single_archive_restores_and_rejects_receipt_or_missing_inventory(tmp_pa
     receipt = export_snapshot(root, output)
     path = output / receipt["archive"]
     restored = tmp_path / "restored"
-    assert receive([path], restored, receipt=receipt)["verified"] is True
+    verified = receive([path], restored, receipt=receipt)
+    assert verified["verified"] is True
+    assert verified["verification_scope"] == "transport_hashes_and_hdf5_storage"
     manifest = json.loads((restored / "manifest.json").read_bytes())
     assert all((restored / row["path"]).stat().st_size == row["bytes"] for row in manifest["files"])
     with pytest.raises(ContractError, match="checksum"):

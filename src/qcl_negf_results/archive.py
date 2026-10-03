@@ -242,14 +242,38 @@ def _read_archive(path: Path, root: Path | None, report: Callable[..., None]) ->
         assert archive.fileobj is not None
         while archive.fileobj.read(BLOCK):
             pass  # Force XZ footer and checksum verification beyond tar padding.
-    _manifest_closure(manifest, index)
+        _manifest_closure(manifest, index)
+        # Old hash-valid exports may contain HDF5 values stored outside their
+        # object. Verify ownership independently before claiming closure or
+        # publishing a restored tree. Tar members provide seekable file objects;
+        # verification does not allocate a second numerical payload copy.
+        from .state import _internal_storage
+        import h5py
+        for row in manifest["files"]:
+            name = row["path"]
+            if row.get("media_type") != "application/x-hdf5" and not name.endswith(".h5"):
+                continue
+            source = archive.extractfile(name) if root is None else root / relative_path(name)
+            assert source is not None
+            try:
+                with h5py.File(source, "r") as handle:
+                    _internal_storage(handle)
+            except (OSError, ValueError) as error:
+                raise ContractError(f"invalid HDF5 archive object: {error}", "corrupt_result") from error
+            finally:
+                if root is None:
+                    source.close()
     if root is not None:
         (root / INDEX_NAME).write_bytes(index_payload)
     return index
 
 
 def verify_archive(path: Path, *, report: Callable[..., None] = _quiet) -> dict[str, Any]:
-    """Verify a single archive without extracting a second payload tree."""
+    """Verify hashes and self-contained HDF5 storage without a second payload tree.
+
+    Random access to compressed members may repeat decompression; native arrays
+    remain on disk and no numerical values are read for this ownership check.
+    """
     return _read_archive(path, None, report)
 
 
@@ -290,6 +314,7 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
             _receipt_closure(receipt, index)
             os.replace(root, destination)
     return {"snapshot_identity": index["snapshot_identity"], "verified": True,
+            "verification_scope": "transport_hashes_and_hdf5_storage",
             "archive_count": 1, "objects": len(index["objects"]),
             "destination": str(destination) if destination is not None else None}
 
