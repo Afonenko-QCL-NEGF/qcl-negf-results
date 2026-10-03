@@ -69,6 +69,10 @@ def verify_recovery_bundle(directory: str | Path,
     for artifact in artifacts:
         with safe_path(root, artifact.path).open("rb") as stream:
             _verify_stream(stream, artifact.size, artifact.sha256)
+            if artifact.media_type == "application/x-hdf5":
+                with h5py.File(stream, "r") as handle:
+                    _internal_storage(handle)
+                    validate_native_handle(handle, artifact.role, artifact.schema)
     prior_finals = 0
     for artifact in artifacts:
         if artifact.role != "execution.progress":
@@ -83,6 +87,8 @@ def verify_recovery_bundle(directory: str | Path,
             final_path = safe_path(Path(archive_directory), entry["final_commit"])
             final, final_bytes = read_json(final_path, maximum=16 * 1024 * 1024)
             owned = validate_commit(final)
+            if final.get("storage_class") != "archive" or not {"physics.full", "model", "science.history"} <= {item.role for item in owned}:
+                _fail("prior final must own full state, resolved model and history in the scientific archive")
             proof = entry["receipt"]
             if hashlib.sha256(final_bytes).hexdigest() != proof["commit_sha256"]:
                 _fail("prior archive commit checksum differs from progress")
@@ -94,6 +100,11 @@ def verify_recovery_bundle(directory: str | Path,
                     "sha256": item.sha256} for item in owned)):
                 with safe_path(final_path.parent, dependency["path"]).open("rb") as stream:
                     _verify_stream(stream, dependency["bytes"], dependency["sha256"])
+            for item in owned:
+                if item.media_type == "application/x-hdf5":
+                    with h5py.File(safe_path(final_path.parent, item.path), "r") as handle:
+                        _internal_storage(handle)
+                        validate_native_handle(handle, item.role, item.schema)
             prior_finals += 1
     return {"commit": commit, "receipt": receipt, "verified_artifacts": len(artifacts),
             "verified_prior_finals": prior_finals}
@@ -131,7 +142,10 @@ class StateReader:
         try:
             _verify_stream(self._stream, owner.size, owner.sha256)
             self._handle = h5py.File(self._stream, "r")
+            _internal_storage(self._handle)
             validate_native_handle(self._handle, owner.role, owner.schema)
+            if "state_id" in self.commit and "metadata/point_identity_json" not in self._handle:
+                _fail("native state identity is missing")
             for name in ("metadata/identity_json", "metadata/point_identity_json"):
                 if name in self._handle:
                     identity = _json_scalar(self._handle, name)
@@ -223,6 +237,27 @@ class StateReader:
 
 def _text(value: Any) -> str:
     return value.decode("utf-8") if isinstance(value, bytes) else str(value)
+
+
+def _internal_storage(handle: Any) -> None:
+    """Reject payloads whose values can change outside the committed HDF5 file."""
+    seen: set[int] = set()
+    pending = [handle]
+    while pending:
+        group = pending.pop()
+        address = h5py.h5o.get_info(group.id).addr
+        if address in seen:
+            continue
+        seen.add(address)
+        for name in group:
+            link = group.get(name, getlink=True)
+            if not isinstance(link, h5py.HardLink):
+                _fail("state payload rejects unowned external or soft links")
+            child = group[name]
+            if isinstance(child, h5py.Group):
+                pending.append(child)
+            elif isinstance(child, h5py.Dataset) and (child.external or child.is_virtual):
+                _fail("state payload rejects unowned external or virtual storage")
 
 
 def _weight_paths(axis: str) -> tuple[str, ...]:

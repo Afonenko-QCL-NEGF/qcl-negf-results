@@ -10,6 +10,7 @@ from qcl_negf_contracts.artifacts import CONTRACT_SET
 from qcl_negf_contracts.messages import ContractError
 from qcl_negf_results.commits import artifact_row, json_bytes
 from qcl_negf_results.state import StateReader, verify_recovery_bundle
+from qcl_negf_results.model import canonical_bytes
 from native_result_fixtures import declare_native
 
 
@@ -17,7 +18,7 @@ IDENTITY = {"execution_id": "execution-1", "point_id": "point-1", "attempt": 1,
             "plan_fingerprint": "a" * 64, "state_id": "state-1", "state_sequence": 1}
 
 
-def bundle(root, identity=IDENTITY):
+def bundle(root, identity=IDENTITY, storage_class="recovery", omit_roles=()):
     root.mkdir()
     physics = root / "physics.h5"
     with h5py.File(physics, "w") as handle:
@@ -38,10 +39,27 @@ def bundle(root, identity=IDENTITY):
         handle["grids_dimensionless/wE"][5:7] = [0.1, 0.1]
     commit = {"schema": "qcl-negf.artifact-commit.v2", "contract_set": CONTRACT_SET,
               "generation": 1, "state_id": "state-1", "state_sequence": 1,
-              "identity": identity, "storage_class": "recovery",
+              "identity": identity, "storage_class": storage_class,
               "artifacts": [artifact_row(physics, relative="physics.h5", role="physics.full",
                             media_type="application/x-hdf5", profile="full-state",
                             schema="qcl-negf-physics-v4")]}
+    if storage_class == "archive":
+        history = root / "history.h5"
+        with h5py.File(history, "w") as handle:
+            declare_native(handle, "qcl-negf-scientific-history-v4", "science.history", scba_rows=0)
+            handle["metadata/state_identity_json"] = json.dumps(identity)
+        model = root / "resolved_configuration.json"
+        configuration = {"fixture_only": True}
+        model.write_bytes(json_bytes({"schema": "qcl-negf-resolved-configuration-v3",
+            "contract_set": CONTRACT_SET, "configuration": configuration,
+            "hash_encoding": "qcl-negf-canonical-bytes-v1",
+            "configuration_hash": hashlib.sha256(canonical_bytes(configuration)).hexdigest()}))
+        commit["artifacts"].extend([
+            artifact_row(history, relative=history.name, role="science.history", media_type="application/x-hdf5",
+                         schema="qcl-negf-scientific-history-v4"),
+            artifact_row(model, relative=model.name, role="model", media_type="application/json",
+                         schema="qcl-negf-resolved-configuration-v3")])
+    commit["artifacts"] = [row for row in commit["artifacts"] if row["role"] not in omit_roles]
     payload = json_bytes(commit)
     (root / "commit.json").write_bytes(payload)
     receipt = {"schema": "qcl-negf-recovery-receipt-v1", "status": "verified",
@@ -52,15 +70,18 @@ def bundle(root, identity=IDENTITY):
     return commit
 
 
-def attach_progress(root, commit, archive):
+def attach_progress(root, commit, archive, storage_class="archive", omit_roles=()):
     final = archive / "execution-1/point-0/final"
     final.parent.mkdir(parents=True)
-    prior = bundle(final, {**IDENTITY, "point_id": "point-0"})
+    bundle(final, {**IDENTITY, "point_id": "point-0"}, storage_class=storage_class, omit_roles=omit_roles)
     receipt = json.loads((final / "receipt.json").read_text())
     progress = {"schema": "qcl-negf-execution-progress-v1", "contract_set": CONTRACT_SET,
                 "identity": IDENTITY, "execution_id": "execution-1", "active_point_id": "point-1",
                 "plan_fingerprint": "a"*64, "completed_points": [{
-                    "point": {"point_id": "point-0", "status": "completed"},
+                    "point": {"id": "point-0", "execution_id": "execution-1", "attempt": 1,
+                              "status": "completed", "coordinates": {"temperature_K": 70.0,
+                              "voltage_per_period_V": 0.0, "branch": "base", "order": 1},
+                              "data": {"result_commit": "archive/execution-1/point-0/final/commit.json"}},
                     "final_commit": "execution-1/point-0/final/commit.json", "receipt": receipt,
                     "files": [{"path": path.name, "bytes": path.stat().st_size,
                                "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
@@ -131,11 +152,15 @@ def test_state_reader_rejects_another_attempt_even_with_valid_bytes(tmp_path):
         StateReader(root / "commit.json", expected_identity={**IDENTITY, "attempt": 2})
 
 
-def test_state_reader_rejects_wrong_native_state_with_valid_checksums(tmp_path):
+@pytest.mark.parametrize("change", ["mismatch", "missing"])
+def test_state_reader_rejects_wrong_native_state_with_valid_checksums(tmp_path, change):
     root = tmp_path / "bundle"
     commit = bundle(root)
     with h5py.File(root / "physics.h5", "r+") as handle:
-        handle["metadata/point_identity_json"][()] = json.dumps({**IDENTITY, "state_id": "other"})
+        if change == "missing":
+            del handle["metadata/point_identity_json"]
+        else:
+            handle["metadata/point_identity_json"][()] = json.dumps({**IDENTITY, "state_id": "other"})
     commit["artifacts"] = [artifact_row(root / "physics.h5", relative="physics.h5",
         role="physics.full", media_type="application/x-hdf5", profile="full-state",
         schema="qcl-negf-physics-v4")]
@@ -160,3 +185,55 @@ def test_portable_recovery_requires_verified_prior_final_dependencies(tmp_path):
         stream.write(b"corrupt")
     with pytest.raises(ContractError):
         verify_recovery_bundle(root, archive_directory=archive)
+
+
+def test_prior_final_cannot_be_a_hash_correct_recovery_checkpoint(tmp_path):
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    commit = bundle(root)
+    attach_progress(root, commit, archive, storage_class="recovery")
+    with pytest.raises(ContractError, match="archive"):
+        verify_recovery_bundle(root, archive_directory=archive)
+
+
+@pytest.mark.parametrize("role", ["model", "science.history"])
+def test_prior_final_requires_resolved_model_and_cumulative_history(tmp_path, role):
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    commit = bundle(root)
+    attach_progress(root, commit, archive, omit_roles=(role,))
+    with pytest.raises(ContractError, match="archive"):
+        verify_recovery_bundle(root, archive_directory=archive)
+
+
+@pytest.mark.parametrize("storage", ["raw", "link", "virtual"])
+def test_state_reader_rejects_unowned_external_or_virtual_values(tmp_path, storage):
+    root = tmp_path / "bundle"
+    commit = bundle(root)
+    raw = tmp_path / "unowned.raw"
+    with h5py.File(root / "physics.h5", "r+") as handle:
+        target = "state_dimensionless/GR/real"
+        attributes = dict(handle[target].attrs)
+        del handle[target]
+        if storage == "raw":
+            dataset = handle.create_dataset(target, shape=(100000, 2, 2), dtype="f8",
+                external=[(str(raw), 0, h5py.h5f.UNLIMITED)])
+        elif storage == "link":
+            source = tmp_path / "external.h5"
+            with h5py.File(source, "w") as other:
+                other.create_dataset("values", shape=(100000, 2, 2), dtype="f8")
+            handle[target] = h5py.ExternalLink(str(source), "/values")
+            dataset = handle[target]
+        else:
+            layout = h5py.VirtualLayout(shape=(100000, 2, 2), dtype="f8")
+            layout[:] = h5py.VirtualSource(str(tmp_path / "missing.h5"), "values", shape=(100000, 2, 2))
+            dataset = handle.create_virtual_dataset(target, layout)
+        dataset.attrs.update(attributes)
+    commit["artifacts"] = [artifact_row(root / "physics.h5", relative="physics.h5", role="physics.full",
+        media_type="application/x-hdf5", profile="full-state", schema="qcl-negf-physics-v4")]
+    payload = json_bytes(commit)
+    (root / "commit.json").write_bytes(payload)
+    receipt = json.loads((root / "receipt.json").read_text())
+    receipt["commit_sha256"] = hashlib.sha256(payload).hexdigest()
+    (root / "receipt.json").write_bytes(json_bytes(receipt))
+    with pytest.raises(ContractError, match="external|virtual|unowned"):
+        with StateReader(root / "commit.json") as reader:
+            reader.read("state_dimensionless/GR/real", (slice(5, 7), 0, 1))

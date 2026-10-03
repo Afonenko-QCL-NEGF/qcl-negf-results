@@ -19,6 +19,7 @@ from qcl_negf_results.export import export_snapshot
 from qcl_negf_results.telemetry import TelemetryWriter
 from qcl_negf_results.witnesses import selected_witness_records
 from qcl_negf_results.native import validate_native_handle, _text
+from qcl_negf_results.state import StateReader, verify_recovery_bundle
 
 ROOT = Path(os.environ.get("QCL_NEGF_SOLVER_PROJECT", ".")).resolve()
 
@@ -99,7 +100,9 @@ def test_native_julia_continues_during_scientific_snapshot(tmp_path: Path) -> No
                     assert "spectral_integral_eigenvalues" in native_analysis["diagnostics/matrix_audit"]
                     psd = native_analysis["diagnostics/psd_history"]
                     assert psd["available"][0] == 1 and len(psd["selected_blocks"]) >= 1
-                    assert len(native_analysis["diagnostics/physical_markers/available"]) == 1
+                    assert len(native_analysis["diagnostics/physical_markers/available"]) == 6
+                    owner = manifest["records"][0]["identity"]
+                    assert json.loads(native_analysis["metadata/identity_json"][()]) == owner
                 with h5py.File(io.BytesIO(archive.extractfile(histories[0]["object"]).read()), "r") as native_history:
                     assert _text(native_history["metadata"].attrs["schema_version"]) == "4.0"
                     assert validate_native_handle(native_history, "science.history") == "qcl-negf-scientific-history-v4"
@@ -121,8 +124,18 @@ def test_native_julia_continues_during_scientific_snapshot(tmp_path: Path) -> No
                         assert "E0_eV" in record.attributes and "L0_m" in record.attributes
                 proofs = [item["replacement_verification"] for record in manifest["records"]
                           for item in record["omitted_by_policy"] if "replacement_verification" in item]
-                assert len(proofs) == 1 and proofs[0]["previous_psd_rows"] == 1
-                assert proofs[0]["previous_physical_marker_rows"] == 1
+                # The selected generation owns its complete cumulative
+                # history; it has no inherited old-analysis/history parent.
+                assert proofs == []
+            pointer = json.loads((run / "artifacts/current.json").read_bytes())
+            committed = run / "artifacts" / pointer["commit_path"]
+            proof = verify_recovery_bundle(committed.parent)
+            assert proof["commit"]["scientific_accepted"] is False
+            with StateReader(committed) as reader:
+                block = reader.read("state_dimensionless/GR/real", (slice(0, 2), 0, 0, 0),
+                                    maximum_bytes=256)
+                assert block.values.shape == (2,) and block.axes == ("E", "k", "a", "b")
+                assert block.source_identity == proof["commit"]["identity"]
             # A successful export must leave the numerical producer running and
             # progressing; no mock file writer substitutes for Julia here.
             continuation_deadline = time.monotonic() + 15

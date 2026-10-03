@@ -18,6 +18,10 @@ uv build
 
 ## Inspect and export
 
+Intermediate export storage has a finite configurable [byte budget](docs/export-budget.md).
+Publication is refused if the complete selected snapshot cannot fit; scientific
+finals are preserved.
+
 Bounded native state reads do not deserialize the solver:
 
 ```python
@@ -34,7 +38,10 @@ proof = verify_recovery_bundle("/data/recovery/generation-000001",
 
 Use the stored external axis order and one selector for every dataset axis.
 The budget covers values and selected coordinates/weights. Hash verification
-streams the whole file once; hyperslab access allocates only the selected block.
+streams the whole file once; hyperslab access returns the selected block.
+`maximum_bytes` limits returned buffers, including coordinates/weights. HDF5
+chunk decompression, cache and metadata use additional RAM; this is not a limit
+on the whole process.
 Missing weights remain `None`. Recovery verification checks the publication
 receipt, payloads and declared prior-final archive dependencies; it does not
 certify application compatibility or availability from another machine.
