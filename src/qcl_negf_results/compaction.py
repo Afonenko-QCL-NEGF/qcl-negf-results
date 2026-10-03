@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -14,6 +15,7 @@ from qcl_negf_contracts.artifacts import CONTRACT_SET
 from qcl_negf_contracts.messages import ContractError
 from qcl_negf_contracts.telemetry import TABLE_FIELDS, TELEMETRY_SCHEMA
 from .commits import json_bytes
+from .export_budget import ExportBudget
 
 BATCH_ROWS = 4096
 ROW_GROUP_ROWS = 65536
@@ -70,7 +72,8 @@ def _payload_hash(paths: list[Path]) -> str:
     return digest.hexdigest()
 
 
-def compact_performance(paths: list[Path], destination: Path) -> dict[str, Any]:
+def compact_performance(paths: list[Path], destination: Path, *,
+                        budget: ExportBudget | None = None) -> dict[str, Any]:
     """Keep order, every row, nulls, NaN bits and signed zeros; prove by rereading."""
     if not paths:
         raise ValueError("compaction requires committed source segments")
@@ -90,7 +93,9 @@ def compact_performance(paths: list[Path], destination: Path) -> dict[str, Any]:
         sources.append({"sha256": sha, "bytes": path.stat().st_size,
                         "row_start": rows, "row_stop": rows + count})
         rows += count
-    with pq.ParquetWriter(destination, schema, compression="zstd", use_dictionary=True) as writer:
+    with ExitStack() as stack:
+        sink = stack.enter_context(budget.open(destination, "wb")) if budget is not None else destination
+        writer = stack.enter_context(pq.ParquetWriter(sink, schema, compression="zstd", use_dictionary=True))
         pending: list[pa.Table] = []
         count = 0
         for batch in _batches(paths):
@@ -116,7 +121,7 @@ def compact_performance(paths: list[Path], destination: Path) -> dict[str, Any]:
 
 
 def compact_export_records(records: list[dict[str, Any]], files: dict[str, Any],
-                           spool: Path) -> list[dict[str, Any]]:
+                           spool: Path, *, budget: ExportBudget | None = None) -> list[dict[str, Any]]:
     """Replace segment containers with proven compact objects in each pinned record."""
     proofs = []
     depended_on = {name for record in records for item in record["included"] for name in item["dependencies"]}
@@ -131,7 +136,7 @@ def compact_export_records(records: list[dict[str, Any]], files: dict[str, Any],
             if len(items) < 2:
                 continue
             target = spool / f"compacted-{len(proofs):06d}.parquet"
-            proof = compact_performance([files[item["object"]][0] for item in items], target)
+            proof = compact_performance([files[item["object"]][0] for item in items], target, budget=budget)
             with target.open("rb") as stream:
                 digest = hashlib.file_digest(stream, "sha256").hexdigest()
             name = f"objects/{digest}.parquet"

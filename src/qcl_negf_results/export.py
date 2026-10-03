@@ -24,6 +24,7 @@ from .commits import atomic_write, json_bytes, read_json, safe_path
 from .catalog import catalog_artifacts
 from .native import dataset_blocks as _dataset_blocks, validate_native_handle
 from ._atomic_io import fsync_directory
+from .export_budget import ExportBudget, DEFAULT_BYTE_BUDGET, DEFAULT_RESERVE_BYTES, validate_options
 
 CHUNK_BYTES = 1024 * 1024
 
@@ -455,13 +456,17 @@ def _validate_container(path: Path, media_type: str, *, role: str | None = None,
 
 
 def _capture(source: Path, destination: Path, artifact: Artifact,
-             on_bytes: Callable[[int], None] | None = None) -> None:
+             on_bytes: Callable[[int], None] | None = None, *,
+             budget: ExportBudget | None = None) -> None:
     """Pin bytes to a private spool and reject any mismatch, never truncate."""
     count = 0
     digest = hashlib.sha256()
+    if budget is not None:
+        budget.check(artifact.size)
     try:
         descriptor = os.open(source, os.O_RDONLY | os.O_NOFOLLOW)
-        with os.fdopen(descriptor, "rb") as stream, destination.open("xb") as captured:
+        with os.fdopen(descriptor, "rb") as stream, (
+                budget.open(destination, "xb") if budget is not None else destination.open("xb")) as captured:
             while chunk := stream.read(CHUNK_BYTES):
                 count += len(chunk)
                 if count > artifact.size:
@@ -686,6 +691,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                     job_id: str | None = None, job_status: str = "running",
                     plan: Mapping[str, Any] | bytes | None = None,
                     plan_source: str | None = None,
+                    byte_budget: int = DEFAULT_BYTE_BUDGET,
+                    reserve_bytes: int = DEFAULT_RESERVE_BYTES,
                     progress: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
     operation_started = time.monotonic()
     captured_unix = time.time()
@@ -705,6 +712,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                       "phase_seconds": dict(phase_seconds), **counts})
 
     _check_profile(profile)
+    validate_options(byte_budget, reserve_bytes)
     plan_value, plan_payload, plan_metadata = _frozen_plan(plan, plan_source)
     root, destination = Path(job_root).resolve(), Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
@@ -772,6 +780,15 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         return cached
     with tempfile.TemporaryDirectory(prefix=".export-pin-", dir=destination) as directory:
         spool = Path(directory)
+        budget = ExportBudget(spool, byte_budget=byte_budget, reserve_bytes=reserve_bytes)
+        # Preflight all selected unique copies, plus cumulative-history proofs.
+        # Compression/derivation size is checked from actual writes, not guessed.
+        proof_sources = {artifact.sha256: artifact.size for commit in commits for artifact in commit.artifacts
+                         if (commit.sha256, artifact.path) in replacements}
+        required_copies = unique_size + sum(proof_sources.values())
+        free_bytes = budget.check(required_copies)
+        report("collecting", required_copy_bytes=required_copies, free_bytes=free_bytes,
+               byte_budget=byte_budget, reserve_bytes=reserve_bytes)
         files: dict[str, tuple[Path, dict[str, Any]]] = {}
         record_map = {record["source_commit_sha256"]: record for record in records}
         captured_bytes = 0
@@ -785,7 +802,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                 target = spool / (artifact.sha256 + suffix)
                 _capture(safe_path(commit.path.parent, artifact.path), target, artifact,
                     lambda count: report("capturing", completed_bytes=captured_bytes + count,
-                        total_bytes=unique_size, completed_files=len(files), total_files=len(object_contracts)))
+                        total_bytes=unique_size, completed_files=len(files), total_files=len(object_contracts)),
+                    budget=budget)
                 files[name] = (target, {"path": name, "bytes": artifact.size,
                     "sha256": artifact.sha256, "media_type": artifact.media_type})
                 captured_bytes += artifact.size
@@ -819,7 +837,8 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
                     raise ContractError("cumulative history replacement requires native HDF5", "corrupt_result")
                 old_capture = spool / ("history-proof-" + old_artifact.sha256 + ".h5")
                 if not old_capture.exists():
-                    _capture(safe_path(old_commit.path.parent, old_artifact.path), old_capture, old_artifact)
+                    _capture(safe_path(old_commit.path.parent, old_artifact.path), old_capture, old_artifact,
+                             budget=budget)
                 new_capture = spool / (new_artifact.sha256 + ".h5")
                 proof = verify_cumulative_history(old_capture, new_capture, new_commit.value["identity"])
                 proof["applies_to"] = "captured cumulative source before declared science-export witness selection"
@@ -830,15 +849,17 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         from .compaction import compact_export_records
         if any(item.media_type == "application/vnd.apache.parquet" for _, item in selected):
             report("compacting_telemetry")
-        compaction_proofs = compact_export_records(records, files, spool)
+        compaction_proofs = compact_export_records(records, files, spool, budget=budget)
         from .witness_selection import select_export_witnesses
-        witness_selection = select_export_witnesses(records, files, spool) if profile == "science" else []
+        witness_selection = select_export_witnesses(records, files, spool, budget=budget) if profile == "science" else []
         # Derivation prunes superseded role objects. The exact source series is
         # separately retained as provenance, including out-of-scope history.
         if series_manifest is not None and series_manifest["object"] not in files:
             assert series_payload is not None
             target = spool / (series_manifest["sha256"] + ".json")
-            atomic_write(target, series_payload)
+            budget.check(len(series_payload))
+            with budget.open(target, "xb") as stream:
+                stream.write(series_payload)
             files[series_manifest["object"]] = (target, {
                 "path": series_manifest["object"], "bytes": series_manifest["bytes"],
                 "sha256": series_manifest["sha256"], "media_type": "application/json"})
@@ -905,7 +926,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         from .archive import build_archive, verify_archive
         started = time.monotonic()
         temporary_archive, archive_info, transport_index = build_archive(spool, files, metadata,
-            identity=identity, profile=profile, preset=int(compressor["preset"]), report=report)
+            identity=identity, profile=profile, preset=int(compressor["preset"]), report=report, budget=budget)
         compression_seconds = time.monotonic() - started
         # Readback has its own inventory parser and checks every complete member
         # plus the XZ footer; source containers and object closure were checked above.
@@ -913,7 +934,9 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
         if verified_index != transport_index:
             raise ContractError("final archive inventory changed", "corrupt_result")
         transport_metadata_bytes = len(json_bytes(transport_index))
-        report("publishing")
+        free_bytes = budget.check_actual()
+        report("publishing", temporary_bytes=budget.used, free_bytes=free_bytes,
+               byte_budget=byte_budget, reserve_bytes=reserve_bytes)
         digest, size = archive_info["sha256"], archive_info["bytes"]
         archive_path = destination / f"{digest}.tar.xz"
         receipt = {"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET,
@@ -933,7 +956,13 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
             "archive": archive_path.name}
         validate_export_receipt(receipt)
         temporary_receipt = spool / "receipt.json"
-        atomic_write(temporary_receipt, json_bytes(receipt))
+        receipt_payload = json_bytes(receipt)
+        budget.check(len(receipt_payload))
+        with budget.open(temporary_receipt, "xb") as stream:
+            os.fchmod(stream.fileno(), 0o640)
+            stream.write(receipt_payload)
+            os.fsync(stream.fileno())
+        budget.check_actual()
         os.chmod(temporary_archive, 0o640)
         archive_existed = archive_path.exists()
         previous_receipt = receipt_path.read_bytes() if receipt_path.exists() else None

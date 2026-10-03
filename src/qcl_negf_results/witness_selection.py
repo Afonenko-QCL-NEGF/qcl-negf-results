@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import hashlib
+from contextlib import ExitStack
 from pathlib import Path
 import shutil
 from typing import Any
@@ -12,6 +13,7 @@ import numpy as np
 from qcl_negf_contracts.artifacts import CONTRACT_SET
 from .commits import decode_json, json_bytes
 from .native import validate_native_handle
+from .export_budget import ExportBudget
 
 POLICY = "per-attempt-first-first-positive-ratio-worst-last-v1"
 
@@ -115,7 +117,8 @@ def _select_packed(table: Any, selected: np.ndarray) -> None:
     _replace_dataset(table, "payload_values", values.astype(np.float64, copy=False))
 
 
-def select_history_witnesses(source: Path, destination: Path) -> dict[str, Any] | None:
+def select_history_witnesses(source: Path, destination: Path, *,
+                            budget: ExportBudget | None = None) -> dict[str, Any] | None:
     with h5py.File(source, "r") as handle:
         validate_native_handle(handle, "science.history")
         sequences = handle["psd_history/selected_blocks/record_sequence"][:]
@@ -124,8 +127,15 @@ def select_history_witnesses(source: Path, destination: Path) -> dict[str, Any] 
         selected, attempts = _attempt_selection(handle)
         if len(selected) == len(sequences):
             return None
-    shutil.copyfile(source, destination)
-    with h5py.File(destination, "r+") as handle:
+    if budget is None:
+        shutil.copyfile(source, destination)
+    else:
+        budget.check(source.stat().st_size)
+        with source.open("rb") as old, budget.open(destination, "wb") as new:
+            shutil.copyfileobj(old, new, length=1024 * 1024)
+    with ExitStack() as stack:
+        sink = stack.enter_context(budget.open(destination, "r+b", defer_errors=True)) if budget is not None else destination
+        handle = stack.enter_context(h5py.File(sink, "r+"))
         psd = handle["psd_history"]
         _select_packed(psd["selected_blocks"], selected)
         psd.attrs["export_witness_policy"] = POLICY
@@ -136,12 +146,18 @@ def select_history_witnesses(source: Path, destination: Path) -> dict[str, Any] 
         validate_native_handle(handle, "science.history")
     # Repack removes free HDF5 blocks left by replacing large packed datasets.
     packed = destination.with_suffix(".repacked.h5")
-    with h5py.File(destination, "r") as old, h5py.File(packed, "w") as new:
+    with ExitStack() as stack:
+        old = stack.enter_context(h5py.File(destination, "r"))
+        sink = stack.enter_context(budget.open(packed, "w+b", defer_errors=True)) if budget is not None else packed
+        new = stack.enter_context(h5py.File(sink, "w"))
         for name in old:
             old.copy(name, new)
         for key, value in old.attrs.items():
             new.attrs[key] = value
-    packed.replace(destination)
+    if budget is None:
+        packed.replace(destination)
+    else:
+        budget.replace(packed, destination)
     omitted = np.delete(sequences, selected).tolist()
     return {"schema": "qcl-negf.witness-selection-proof.v1", "contract_set": CONTRACT_SET,
             "policy": POLICY, "scope": "each source attempt independently", "attempts": attempts,
@@ -152,7 +168,8 @@ def select_history_witnesses(source: Path, destination: Path) -> dict[str, Any] 
             "matrix_payload_scope": "selected witnesses only; omitted matrices require original local history"}
 
 
-def select_export_witnesses(records: list[dict[str, Any]], files: dict[str, Any], spool: Path) -> list[dict[str, Any]]:
+def select_export_witnesses(records: list[dict[str, Any]], files: dict[str, Any], spool: Path, *,
+                            budget: ExportBudget | None = None) -> list[dict[str, Any]]:
     proofs = []
     depended_on = {name for record in records for item in record["included"] for name in item["dependencies"]}
     for record in records:
@@ -162,7 +179,7 @@ def select_export_witnesses(records: list[dict[str, Any]], files: dict[str, Any]
             source_name = item["object"]
             source, descriptor = files[source_name]
             target = spool / f"selected-witnesses-{len(proofs):06d}.h5"
-            proof = select_history_witnesses(source, target)
+            proof = select_history_witnesses(source, target, budget=budget)
             if proof is None:
                 continue
             with target.open("rb") as stream:

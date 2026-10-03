@@ -7,6 +7,7 @@ from pathlib import Path
 
 from qcl_negf_contracts.messages import ContractError
 from .export import export_snapshot, preview
+from .export_budget import DEFAULT_BYTE_BUDGET, DEFAULT_RESERVE_BYTES
 
 
 def main() -> None:
@@ -17,6 +18,10 @@ def main() -> None:
         command.add_argument("results", type=Path)
         if name == "export":
             command.add_argument("destination", type=Path)
+            command.add_argument("--byte-budget", type=int, default=DEFAULT_BYTE_BUDGET,
+                                 help="maximum simultaneous intermediate export bytes (default: 64 GiB)")
+            command.add_argument("--reserve-bytes", type=int, default=DEFAULT_RESERVE_BYTES,
+                                 help="free-space publication reserve (default: 64 MiB)")
         command.add_argument("--profile", choices=("science", "full-state"), default="science")
         command.add_argument("--status", choices=("running", "completed", "completed_with_warnings",
                             "failed", "cancelled", "paused"), default="running")
@@ -32,7 +37,8 @@ def main() -> None:
             value = materialize(generation, commit, digest, args.destination)
         elif args.command == "export":
             value = export_snapshot(args.results, args.destination, profile=args.profile,
-                                    job_status=args.status)
+                                    job_status=args.status, byte_budget=args.byte_budget,
+                                    reserve_bytes=args.reserve_bytes)
         else:
             value = preview(args.results, profile=args.profile, job_status=args.status)
     except (ContractError, ValueError, OSError) as error:

@@ -23,6 +23,7 @@ from qcl_negf_contracts.artifacts import (CONTRACT_SET, DIAGNOSTIC_EXPORT_SCHEMA
     digest_value, relative_path, validate_export_receipt)
 from qcl_negf_contracts.messages import ContractError
 from .commits import decode_json, json_bytes
+from .export_budget import ExportBudget
 
 BLOCK = 1024 * 1024
 INDEX_NAME = "export-index.json"
@@ -65,7 +66,7 @@ class _Reader:
 
 def _write_archive(path: Path, files: dict[str, tuple[Path, dict[str, Any]]],
                    metadata: dict[str, bytes], index_payload: bytes, preset: int,
-                   report: Callable[..., None]) -> None:
+                   report: Callable[..., None], budget: ExportBudget | None = None) -> None:
     total = len(index_payload) + sum(len(value) for value in metadata.values()) + sum(
         row["bytes"] for _, row in files.values())
     completed, archive_bytes = 0, 0
@@ -76,10 +77,12 @@ def _write_archive(path: Path, files: dict[str, tuple[Path, dict[str, Any]]],
         if compressed is not None:
             archive_bytes = compressed
         report("compressing", completed_bytes=completed, total_bytes=total,
-               archive_bytes=archive_bytes)
+               archive_bytes=archive_bytes,
+               **({"temporary_bytes": budget.used, "byte_budget": budget.byte_budget,
+                   "reserve_bytes": budget.reserve_bytes} if budget is not None else {}))
 
     update()
-    with path.open("wb") as raw:
+    with (budget.open(path, "wb") if budget is not None else path.open("wb")) as raw:
         sink = _Writer(raw, lambda count: update(compressed=count))
         with lzma.LZMAFile(sink, "wb", preset=preset, check=lzma.CHECK_CRC64) as compressed:
             with tarfile.open(fileobj=compressed, mode="w|", format=tarfile.PAX_FORMAT) as archive:
@@ -100,7 +103,8 @@ def _write_archive(path: Path, files: dict[str, tuple[Path, dict[str, Any]]],
 
 def build_archive(spool: Path, files: dict[str, tuple[Path, dict[str, Any]]],
                   metadata: dict[str, bytes], *, identity: str, profile: str,
-                  preset: int = 1, report: Callable[..., None] = _quiet
+                  preset: int = 1, report: Callable[..., None] = _quiet,
+                  budget: ExportBudget | None = None
                   ) -> tuple[Path, dict[str, Any], dict[str, Any]]:
     """Write one temporary tar/XZ stream; never paginate or omit an object."""
     index = {"schema": EXPORT_TRANSPORT_SCHEMA, "contract_set": CONTRACT_SET,
@@ -113,7 +117,9 @@ def build_archive(spool: Path, files: dict[str, tuple[Path, dict[str, Any]]],
     _inventory(index)
     index_payload = json_bytes(index)
     path = spool / "snapshot.tar.xz"
-    _write_archive(path, files, metadata, index_payload, preset, report)
+    if budget is not None:
+        budget.check()
+    _write_archive(path, files, metadata, index_payload, preset, report, budget)
     with path.open("rb") as stream:
         digest = hashlib.file_digest(stream, "sha256").hexdigest()
     return path, {"sha256": digest, "bytes": path.stat().st_size}, index

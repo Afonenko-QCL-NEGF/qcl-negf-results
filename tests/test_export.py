@@ -193,11 +193,11 @@ def test_atomic_replacement_cannot_create_old_length_truncation(tmp_path: Path, 
     root, output = tmp_path / "run", tmp_path / "exports"
     generation = fixture(root)
     original = exporter._capture
-    def replace_before_open(source: Path, destination: Path, artifact: object, on_bytes=None) -> None:
+    def replace_before_open(source: Path, destination: Path, artifact: object, on_bytes=None, **kwargs) -> None:
         replacement = source.with_suffix(".replacement")
         replacement.write_bytes(source.read_bytes() + b"expanded new generation")
         replacement.replace(source)
-        original(source, destination, artifact, on_bytes)
+        original(source, destination, artifact, on_bytes, **kwargs)
     monkeypatch.setattr(exporter, "_capture", replace_before_open)
     with pytest.raises(ContractError, match="grew beyond committed"):
         export_snapshot(root, output)
@@ -209,9 +209,9 @@ def test_running_series_advancement_does_not_mix_generations(tmp_path: Path, mon
     root, output = tmp_path / "run", tmp_path / "exports"
     fixture(root)
     original = exporter._capture
-    def advance_series(source: Path, destination: Path, artifact: object, on_bytes=None) -> None:
+    def advance_series(source: Path, destination: Path, artifact: object, on_bytes=None, **kwargs) -> None:
         atomic_write(root / "series_result.json", json_bytes({"schema": "qcl-negf-series-result-v3", "contract_set": "qcl-negf.results.v1", "points": [{"id": "point-2", "data": {}}]}))
-        original(source, destination, artifact, on_bytes)
+        original(source, destination, artifact, on_bytes, **kwargs)
     monkeypatch.setattr(exporter, "_capture", advance_series)
     receipt = export_snapshot(root, output)
     manifest, _ = unpack(receipt, output)
@@ -518,4 +518,3 @@ def test_verified_history_reports_raw_size_without_using_it_for_admission(tmp_pa
     assert receipt["bytes"] < receipt["payload_bytes"]
     assert receipt["size_policy"]["archive_byte_limit"] is None
     assert receipt["size_policy"]["scope"] == "one complete archive, all profiles"
-
