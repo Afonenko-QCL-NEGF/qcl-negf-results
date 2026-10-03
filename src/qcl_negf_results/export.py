@@ -405,8 +405,10 @@ def _validate_container(path: Path, media_type: str, *, role: str | None = None,
         _validate_json_contract(path, declared_schema)
     elif media_type == "application/x-hdf5":
         import h5py
+        from .state import _internal_storage
         try:
             with h5py.File(path, "r") as handle:
+                _internal_storage(handle)
                 validate_native_handle(handle, role, declared_schema)
                 seen: set[int] = set()
                 def validate_group(group: Any) -> None:
@@ -768,7 +770,7 @@ def export_snapshot(job_root: Path, destination: Path, *, profile: str = "scienc
     identity = hashlib.sha256(json_bytes({"schema": EXPORT_SCHEMA, "contract_set": CONTRACT_SET, "profile": profile,
         "commits": [item.sha256 for item in commits], "coverage": coverage,
         "native_format": "4.0", "history_closure": "verified-cumulative-physical-markers-psd-v4", "inventory": "complete-performance-v2",
-        "derivation": derivation, "exporter_revision": 7,
+        "derivation": derivation, "exporter_revision": 8,
         "series_manifest": series_manifest, "history_scope": history_scope,
         "size_policy": "single-complete-archive-v1",
         "compressor": compressor,

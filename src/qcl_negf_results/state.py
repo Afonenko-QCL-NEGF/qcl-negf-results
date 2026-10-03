@@ -252,7 +252,7 @@ def _internal_storage(handle: Any) -> None:
         for name in group:
             link = group.get(name, getlink=True)
             if not isinstance(link, h5py.HardLink):
-                _fail("state payload rejects unowned external or soft links")
+                _fail("state payload rejects unowned external HDF5 or soft links")
             child = group[name]
             if isinstance(child, h5py.Group):
                 pending.append(child)
