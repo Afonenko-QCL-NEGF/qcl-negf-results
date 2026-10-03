@@ -7,6 +7,7 @@ from typing import Any, Mapping
 
 import h5py
 
+from qcl_negf_contracts.artifacts import digest_value
 from qcl_negf_contracts.messages import ContractError
 from .commits import decode_json
 
@@ -55,6 +56,11 @@ def _identity_report(matched: set[str], **extra: Any) -> dict[str, Any]:
             **extra}
 
 
+def _state_identity(source: Any, owner: Mapping[str, Any]) -> None:
+    if "state_id" in owner and (not isinstance(source, dict) or source != owner):
+        raise ContractError("native state identity differs from its owning commit", "corrupt_result")
+
+
 def verify_native_provenance(path: Path, owner: Mapping[str, Any],
                              plan: Mapping[str, Any] | None) -> dict[str, Any]:
     """Check captured original bytes before export derivations; never rewrite them."""
@@ -63,9 +69,18 @@ def verify_native_provenance(path: Path, owner: Mapping[str, Any],
         matched: set[str] = set()
         for name in ("/metadata/identity_json", "/metadata/point_identity_json"):
             if name in handle:
-                matched |= _identity_fields(_json_scalar(handle, name), owner)
+                source = _json_scalar(handle, name)
+                _state_identity(source, owner)
+                matched |= _identity_fields(source, owner)
                 sources.append(name)
+        if "/metadata/state_identity_json" in handle:
+            _state_identity(_json_scalar(handle, "/metadata/state_identity_json"), owner)
         result = {"identity": _identity_report(matched, sources=sources, scope="owning_commit")}
+        schema = handle["metadata"].attrs.get("schema", "") if "metadata" in handle else ""
+        if isinstance(schema, bytes):
+            schema = schema.decode("utf-8")
+        if schema == "qcl-negf-optical-v4":
+            result.update(_optical_provenance(handle, owner))
         if "/metadata/source_segments_json" in handle:
             segments = _json_scalar(handle, "/metadata/source_segments_json")
             if not isinstance(segments, list):
@@ -114,3 +129,35 @@ def verify_native_provenance(path: Path, owner: Mapping[str, Any],
                     coordinates[field]["aliases"] = observations
         result["coordinates"] = coordinates
         return result
+
+
+def _optical_provenance(handle: Any, owner: Mapping[str, Any]) -> dict[str, Any]:
+    source_path = "/metadata/source_state_receipt_json"
+    quality_path = "/metadata/stationary_quality_json"
+    if source_path not in handle or quality_path not in handle:
+        raise ContractError("optical artifact requires embedded source and stationary quality receipts",
+                            "corrupt_result")
+    source, quality = _json_scalar(handle, source_path), _json_scalar(handle, quality_path)
+    if not isinstance(source, dict) or not isinstance(quality, dict):
+        raise ContractError("optical source and stationary quality must be objects", "corrupt_result")
+    identity = source.get("identity")
+    _state_identity(identity, owner)
+    matched = _identity_fields(identity, owner)
+    if not set(IDENTITY_FIELDS) <= matched:
+        raise ContractError("optical source identity is incomplete", "corrupt_result")
+    digest_value(source.get("commit_sha256"))
+    if (not isinstance(source.get("state_id"), str) or not source["state_id"]
+            or type(source.get("state_sequence")) is not int or source["state_sequence"] < 1):
+        raise ContractError("optical source state identity is invalid", "corrupt_result")
+    if "state_id" in owner and any(source[key] != owner[key] for key in ("state_id", "state_sequence")):
+        raise ContractError("optical source state coordinates differ from its owner", "corrupt_result")
+    accepted = quality.get("scientific_accepted")
+    if type(accepted) is not bool:
+        raise ContractError("optical stationary quality must explicitly declare scientific acceptance",
+                            "corrupt_result")
+    if accepted and (quality.get("iterative_converged") is not True
+                     or quality.get("physical_gates_passed") is not True
+                     or quality.get("discretization_verified") not in (True, "verified")):
+        raise ContractError("optical stationary quality cannot treat unknown evidence as acceptance",
+                            "corrupt_result")
+    return {"source_state": source, "stationary_quality": quality}

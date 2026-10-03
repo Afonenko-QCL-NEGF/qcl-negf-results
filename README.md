@@ -18,6 +18,29 @@ uv build
 
 ## Inspect and export
 
+Bounded native state reads do not deserialize the solver:
+
+```python
+from qcl_negf_results.state import StateReader, verify_recovery_bundle
+
+with StateReader("/data/archive/execution/point/final/commit.json") as reader:
+    block = reader.read("state_dimensionless/GR/real",
+                        (slice(0, 2), 0, slice(None), slice(None)),
+                        maximum_bytes=1024 * 1024)
+
+proof = verify_recovery_bundle("/data/recovery/generation-000001",
+                               archive_directory="/data/archive")
+```
+
+Use the stored external axis order and one selector for every dataset axis.
+The budget covers values and selected coordinates/weights. Hash verification
+streams the whole file once; hyperslab access allocates only the selected block.
+Missing weights remain `None`. Recovery verification checks the publication
+receipt, payloads and declared prior-final archive dependencies; it does not
+certify application compatibility or availability from another machine.
+Optical HDF5 requires embedded source-state and stationary-quality receipts;
+unknown discretization/experimental evidence remains unknown.
+
 ```console
 .venv/bin/qcl-negf-results preview /data/calculation --profile science
 .venv/bin/qcl-negf-results export /data/calculation /data/exports --profile science --status completed

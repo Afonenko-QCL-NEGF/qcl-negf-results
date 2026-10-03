@@ -385,6 +385,9 @@ def _validate_json_contract(path: Path, declared_schema: str | None) -> None:
     if declared_schema == MODEL_SCHEMA:
         from .model import validate_model
         validate_model(value)
+    if declared_schema == "qcl-negf-execution-progress-v1":
+        from qcl_negf_contracts.artifacts import validate_execution_progress
+        validate_execution_progress(value)
     if declared_schema == RECOVERY_SCHEMA:
         payload = value.get("payload")
         if not isinstance(payload, dict) or payload.get("path") != "physics.h5":

@@ -4,6 +4,7 @@ from __future__ import annotations
 import hashlib
 import io
 import json
+import math
 import os
 from pathlib import Path
 import shutil
@@ -37,7 +38,10 @@ def test_native_julia_continues_during_scientific_snapshot(tmp_path: Path) -> No
             stdout=log, stderr=subprocess.STDOUT,
             env={**os.environ, "JULIA_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1"})
         try:
-            deadline = time.monotonic() + 240
+            preparation_seconds = float(os.environ.get("QCL_NEGF_INTEGRATION_TIMEOUT_SECONDS", "240"))
+            if not math.isfinite(preparation_seconds) or not 0 < preparation_seconds <= 900:
+                raise ValueError("integration preparation timeout must be in (0, 900] seconds")
+            deadline = time.monotonic() + preparation_seconds
             # Six native generations extend the first analysis. More than four
             # witnesses exercise export selection using Julia's source bounds.
             def selection_generation_published() -> bool:
