@@ -1,4 +1,4 @@
-"""Operational evidence capture using the scientific multipart transport.
+"""Operational evidence capture using the scientific single-archive transport.
 
 The caller owns source selection and safe file descriptors. This module owns
 bounded capture, content identities, archive framing and independent verification.
@@ -15,12 +15,14 @@ import tarfile
 import tempfile
 from typing import Any, BinaryIO, Protocol
 
-from qcl_negf_contracts.artifacts import CONTRACT_SET, SCIENCE_MAX_BYTES, relative_path
+from qcl_negf_contracts.artifacts import (CONTRACT_SET, DIAGNOSTIC_EXPORT_SCHEMA,
+    relative_path, validate_export_receipt)
 from qcl_negf_contracts.messages import ContractError
 from .commits import json_bytes
-from .multipart import BLOCK, build_parts, verify_parts
+from .archive import BLOCK, build_archive, verify_archive
+from ._atomic_io import fsync_directory
 
-DIAGNOSTIC_SCHEMA = "qcl-negf-operational-evidence.v1"
+DIAGNOSTIC_SCHEMA = DIAGNOSTIC_EXPORT_SCHEMA
 
 
 class ArchiveSink(Protocol):
@@ -93,23 +95,22 @@ class DiagnosticCapture:
 def _metadata(manifest: dict[str, Any]) -> dict[str, bytes]:
     return {"manifest.json": json_bytes(manifest), "README.md": (
         "# QCLNEGF operational evidence\n\n"
-        "Every finalized part is at most 200000000 decimal bytes. Keep all parts.\n"
-        "The first part contains this manifest and the shared transport index.\n"
+        "One complete archive contains the captured evidence and its transport index.\n"
         "manifest.json records the original evidence paths in records[].included[].source_path,\n"
         "mapped to immutable content-addressed objects. The captured manifest.yaml object\n"
         "lists unavailable and excluded source files and the capture time.\n"
         "This is operational evidence; live files are not an atomic scientific checkpoint.\n\n"
-        "Verify: python -m qcl_negf_results.multipart verify PART...\n"
-        "Restore: python -m qcl_negf_results.multipart reassemble --destination recovered PART...\n"
-        "The same receiver accepts scientific and diagnostic transport parts.\n"
+        "Verify: python -m qcl_negf_results.archive verify ARCHIVE --receipt receipt.json\n"
+        "Restore: python -m qcl_negf_results.archive reassemble --destination recovered ARCHIVE\n"
+        "The same receiver accepts science, diagnostics and legacy multipart sets.\n"
     ).encode()}
 
 
 def export_diagnostics(destination: Path, capture: Callable[[ArchiveSink], dict[str, Any]], *,
-                       label: str, maximum_bytes: int = SCIENCE_MAX_BYTES,
+                       label: str,
                        maximum_source_bytes: int | None = None,
                        progress: Callable[..., None] = _quiet) -> dict[str, Any]:
-    """Publish a new directory only after every captured object and page verifies.
+    """Publish a new directory only after every captured object verifies.
 
     Temporary data belongs to the caller, never the queue. An incomplete capture
     is removed on every failure. Compression uses one worker and XZ preset 1.
@@ -133,24 +134,31 @@ def export_diagnostics(destination: Path, capture: Callable[[ArchiveSink], dict[
         # Exact source inventory is now stable. Reserve space for compression
         # and bounded metadata before making any public result visible.
         if shutil.disk_usage(spool).free < sink.source_bytes + 64 * 1024**2:
-            raise ContractError("insufficient temporary disk space for diagnostic parts", "storage_failure")
-        finalized, index = build_parts(spool, sink.files, metadata, records=manifest["records"],
-            identity=manifest["snapshot_identity"], profile="diagnostic", maximum=maximum_bytes,
-            preset=1, report=progress)
-        verify_parts(finalized, index, metadata, progress)
+            raise ContractError("insufficient temporary disk space for diagnostic archive", "storage_failure")
+        path, archive_info, index = build_archive(spool, sink.files, metadata,
+            identity=manifest["snapshot_identity"], profile="diagnostic", preset=1, report=progress)
+        if verify_archive(path, report=progress) != index:
+            raise ContractError("final diagnostic archive inventory changed", "corrupt_result")
         publication = spool / "published"
         publication.mkdir()
-        parts = []
-        for path, part in finalized:
-            filename = f"{label}.part-{part['index']:04d}-of-{len(finalized):04d}.tar.xz"
-            os.chmod(path, 0o640)
-            os.replace(path, publication / filename)
-            parts.append({**part, "filename": filename})
+        filename = f"{label}.tar.xz"
+        os.chmod(path, 0o640)
+        os.replace(path, publication / filename)
         receipt = {"schema": DIAGNOSTIC_SCHEMA, "contract_set": CONTRACT_SET,
                    "profile": "diagnostic", "snapshot_identity": manifest["snapshot_identity"],
-                   "parts": parts, "part_count": len(parts), "maximum_part_bytes": maximum_bytes,
-                   "total_archive_bytes": sum(part["bytes"] for part in parts),
+                   **archive_info, "filename": filename, "archive": filename,
+                   "transport_schema": index["schema"], "total_archive_bytes": archive_info["bytes"],
                    "source_payload_bytes": sink.source_bytes, "context": context}
-        (publication / "receipt.json").write_bytes(json_bytes(receipt))
+        validate_export_receipt(receipt)
+        with (publication / "receipt.json").open("wb") as stream:
+            stream.write(json_bytes(receipt))
+            stream.flush()
+            os.fsync(stream.fileno())
+        fsync_directory(publication)
         os.rename(publication, destination)
+        try:
+            fsync_directory(destination.parent)
+        except BaseException:
+            shutil.rmtree(destination)
+            raise
     return receipt

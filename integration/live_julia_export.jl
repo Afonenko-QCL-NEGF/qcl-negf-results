@@ -82,7 +82,9 @@ function observe(state)
             history_paths = [
                 joinpath(recorder.directory, row["path"]) for row in recorder.segments
             ],
-            analysis = iteration == 1,
+            # A selected recovery generation does not inherit stale analysis
+            # from an earlier state. Publish an analysis of the selected cut.
+            analysis = iteration in (1, 6),
         )
         commit=QCLNEGFRunner.YAML.load_file(joinpath(root, "artifacts/current.json"))
         model=joinpath(

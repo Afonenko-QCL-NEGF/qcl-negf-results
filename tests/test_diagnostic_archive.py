@@ -1,4 +1,4 @@
-"""Diagnostic and scientific snapshots share the verified multipart transport."""
+"""Diagnostic and scientific snapshots share the verified single-archive transport."""
 from __future__ import annotations
 
 import hashlib
@@ -12,7 +12,7 @@ import pytest
 
 from qcl_negf_contracts.messages import ContractError
 from qcl_negf_results.diagnostic_archive import export_diagnostics
-from qcl_negf_results.multipart import receive
+from qcl_negf_results.archive import receive
 
 
 def capture_payload(payload: bytes):
@@ -25,14 +25,15 @@ def capture_payload(payload: bytes):
     return capture
 
 
-def test_diagnostics_paginate_restore_and_deduplicate_with_shared_receiver(tmp_path: Path) -> None:
+def test_diagnostics_restore_and_deduplicate_with_shared_receiver(tmp_path: Path) -> None:
     payload = random.Random(82).randbytes(36_000)
     output = tmp_path / "diagnostics"
-    receipt = export_diagnostics(output, capture_payload(payload), label="test-evidence", maximum_bytes=10_000)
-    parts = [output / part["filename"] for part in receipt["parts"]]
-    assert len(parts) >= 4
-    assert all(path.stat().st_size <= 10_000 for path in parts)
-    assert receive(list(reversed(parts)), tmp_path / "restored", receipt=receipt)["verified"] is True
+    receipt = export_diagnostics(output, capture_payload(payload), label="test-evidence")
+    assert receipt["schema"] == "qcl-negf.operational-evidence.v2"
+    assert "parts" not in receipt
+    paths = [output / receipt["archive"]]
+    assert list(output.glob("*.tar.xz")) == paths
+    assert receive(paths, tmp_path / "restored", receipt=receipt)["verified"] is True
     manifest = json.loads((tmp_path / "restored/manifest.json").read_bytes())
     assert manifest["profile"] == "diagnostic"
     assert len(manifest["files"]) == 1
@@ -47,14 +48,6 @@ def test_diagnostic_quota_failure_never_publishes_partial_capture(tmp_path: Path
     with pytest.raises(ContractError, match="storage budget"):
         export_diagnostics(tmp_path / "diagnostics", capture_payload(b"0123456789"),
                            label="test", maximum_source_bytes=15)
-    assert list(tmp_path.iterdir()) == []
-
-
-@pytest.mark.parametrize("maximum", [True, 0, 200_000_001])
-def test_shared_writer_rejects_invalid_diagnostic_part_limit(tmp_path: Path, maximum) -> None:
-    with pytest.raises(ContractError, match="200000000"):
-        export_diagnostics(tmp_path / "diagnostics", capture_payload(b"small"), label="test",
-                           maximum_bytes=maximum)
     assert list(tmp_path.iterdir()) == []
 
 
