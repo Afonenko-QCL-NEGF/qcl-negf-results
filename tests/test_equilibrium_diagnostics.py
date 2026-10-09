@@ -205,6 +205,24 @@ def test_R01_known_mu_nonunit_weights(archive):
     assert r['domain']['energy_nodes'] == 5
     assert r['spectral']['represented_capacity_dimensionless'] == pytest.approx(number(archive[2]['A']), abs=2e-15)
     assert r['budgets']['workspace_forecast_bytes'] <= 32 * 1024 * 1024
+    # Donor neutrality constrains occupied electrons only. The independent
+    # complementary number is generally different from that donor target.
+    occupied = number(-1j * archive[2]['GL'])
+    empty = number(1j * archive[2]['GG'])
+    capacity = number(archive[2]['A'])
+    assert empty == pytest.approx(capacity - occupied, abs=2e-15)
+    assert abs(empty - occupied) > 0.001
+    for name in ['raw', 'normalized']:
+        assert r['numbers'][name]['absolute_target_residual_dimensionless'] < 2e-15
+    for name in ['raw_empty', 'normalized_empty']:
+        row = r['numbers'][name]
+        assert row['status'] == 'measured'
+        assert row['value_dimensionless'] == pytest.approx(empty, abs=2e-15)
+        assert row['value_per_m2'] == pytest.approx(empty / 1e-16)
+        assert row['absolute_target_residual_dimensionless'] is None
+        assert row['relative_target_residual'] is None
+        assert row['target_residual_status'] == 'not_applicable'
+        assert row['target_residual_reason'] == 'donor_target_applies_to_occupied_number'
 
 
 def test_R02_offdiagonal_normalized_defect(archive):
@@ -259,6 +277,23 @@ def test_R06_weights_changed_target_retained(archive):
     assert r['numbers']['raw']['absolute_target_residual_dimensionless'] > 0.001
     assert abs(r['mu']['value_relative_eV'] - MU) > 0.001
     assert r['fdr']['raw']['value'] > 0.01
+    # Deliberately changed measure with retained donor target: occupied
+    # residual remains meaningful, empty measurement must not acquire it.
+    occupied_target = number(-1j * archive[2]['GL'])
+    occupied_changed = number(-1j * archive[2]['GL'], WE * 1.7)
+    empty_changed = number(1j * archive[2]['GG'], WE * 1.7)
+    for name in ['raw', 'normalized']:
+        row = r['numbers'][name]
+        assert row['absolute_target_residual_dimensionless'] == pytest.approx(abs(occupied_changed - occupied_target), abs=2e-15)
+        assert row['relative_target_residual'] == pytest.approx(abs(occupied_changed - occupied_target) / occupied_target, abs=2e-14)
+    for name in ['raw_empty', 'normalized_empty']:
+        row = r['numbers'][name]
+        assert row['value_dimensionless'] == pytest.approx(empty_changed, abs=2e-15)
+        assert row['value_per_m2'] == pytest.approx(empty_changed / 1e-16)
+        assert row['absolute_target_residual_dimensionless'] is None
+        assert row['relative_target_residual'] is None
+        assert row['target_residual_status'] == 'not_applicable'
+        assert row['target_residual_reason'] == 'donor_target_applies_to_occupied_number'
 
 
 def test_R07_energy_edge_truncated(archive):

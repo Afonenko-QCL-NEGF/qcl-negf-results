@@ -502,10 +502,13 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         number_report = dict(target_dimensionless=target, target_per_m2=target/l02)
         for name, accumulator in numbers.items():
             value = accumulator.value()
-            difference = abs(value-target)
+            occupied = name in ('raw', 'normalized')
+            difference = abs(value-target) if occupied else None
             number_report[name] = dict(status='measured', value_dimensionless=value, value_per_m2=value/l02,
                 units='m^-2', absolute_target_residual_dimensionless=difference,
-                relative_target_residual=difference/target if target > 0 else None,
+                relative_target_residual=difference/target if occupied and target > 0 else None,
+                target_residual_status='measured' if occupied else 'not_applicable',
+                target_residual_reason=None if occupied else 'donor_target_applies_to_occupied_number',
                 imaginary_trace_dimensionless=number_imag[name].value(), issues=['negative_charge'] if value < 0 else [])
         currents = {}
         for side in ('plus', 'minus'):

@@ -196,9 +196,11 @@ Raw correlations reconstruct the saved self-energies (enabled dictionary plus
 
 The JSON report separates applicability and measurement availability. It includes
 raw/normalized occupied and empty numbers, matrix FDR norms, independent occupied
-and empty normalization corrections, source hashes and read budgets. Negative
-charges are retained. Nonnegative quadrature weights are required; negative
-spectral number weights prevent a chemical-potential fit. Unavailable values are
+and empty normalization corrections, source hashes and read budgets. Donor-target
+residuals apply only to occupied numbers. Empty numbers remain measured; their
+donor residuals are `null` with `not_applicable` and the reason
+`donor_target_applies_to_occupied_number`. Negative charges are retained.
+Nonnegative quadrature weights are required; negative spectral number weights prevent a chemical-potential fit. Unavailable values are
 `null` with reasons. Zero norm ratios use explicit zero/undefined branches without
 an additive floor. No convergence, discretization or experimental acceptance is
 inferred, and outside-window tails remain undetermined.
