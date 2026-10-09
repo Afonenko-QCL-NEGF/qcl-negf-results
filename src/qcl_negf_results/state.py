@@ -9,22 +9,123 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+import io
 import json
 import math
 from pathlib import Path
 from typing import Any, Mapping
+from types import MappingProxyType
 
 import h5py
 
 from qcl_negf_contracts.artifacts import Artifact, validate_commit, validate_execution_progress
 from qcl_negf_contracts.messages import ContractError
-from .commits import read_json, safe_path
+from .commits import decode_json, read_json, safe_path
 from .native import validate_native_handle
 from .provenance import _identity_fields, _json_scalar, _state_identity
 
 
 def _fail(message: str) -> None:
     raise ContractError(message, "corrupt_result")
+
+
+class _IOBudget:
+    """Physical stream delivery, including integrity and native validation.
+
+    This counts delivered bytes, not disk traffic or logical dataset bytes.
+    Checking an EOF-clipped request before the callback prevents overshoot.
+    """
+    def __init__(self, maximum: int | None):
+        if maximum is not None and (type(maximum) is not int or maximum < 1):
+            raise ValueError("maximum_io_bytes must be a positive integer")
+        self.maximum = maximum
+        self.phase = "metadata"
+        self.bytes_read_total = 0
+        self.sha_bytes = 0
+        self.hdf_bytes = 0
+        self.metadata_bytes = 0
+        self.logical_selected_bytes = 0
+
+    def require(self, count: int) -> None:
+        if self.maximum is not None and count > self.maximum - self.bytes_read_total:
+            raise ContractError("total physical stream I/O budget exceeded", "budget_exceeded")
+
+    def account(self, count: int) -> None:
+        self.bytes_read_total += count
+        if self.phase == "sha":
+            self.sha_bytes += count
+        elif self.phase == "hdf":
+            self.hdf_bytes += count
+        else:
+            self.metadata_bytes += count
+
+    def counters(self) -> dict[str, int | None]:
+        return {name: getattr(self, name) for name in (
+            "bytes_read_total", "sha_bytes", "hdf_bytes", "metadata_bytes", "logical_selected_bytes")} | {
+                "maximum_io_bytes": self.maximum}
+
+
+class _BudgetStream(io.RawIOBase):
+    """A single read-only file object used by SHA and the HDF5 fileobj driver."""
+    def __init__(self, raw: Any, budget: _IOBudget):
+        super().__init__()
+        self._raw, self._budget = raw, budget
+
+    @property
+    def name(self) -> str:
+        return self._raw.name
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._raw.tell()
+
+    def seek(self, offset: int, whence: int = 0) -> int:
+        return self._raw.seek(offset, whence)
+
+    def effective_request(self, size: int) -> int:
+        position = self._raw.tell()
+        end = self._raw.seek(0, 2)
+        self._raw.seek(position)
+        remaining = max(0, end - position)
+        return remaining if size < 0 else min(size, remaining)
+
+    def read(self, size: int = -1) -> bytes:
+        self._budget.require(self.effective_request(size))
+        data = self._raw.read(size)
+        self._budget.account(len(data))
+        return data
+
+    def readinto(self, target: Any) -> int:
+        self._budget.require(self.effective_request(len(target)))
+        count = self._raw.readinto(target)
+        self._budget.account(count)
+        return count
+
+    def close(self) -> None:
+        if not self.closed:
+            self._raw.close()
+        super().close()
+
+
+def _budget_json(path: Path, maximum: int, budget: _IOBudget) -> tuple[dict[str, Any], bytes]:
+    with _BudgetStream(path.open("rb", buffering=0), budget) as stream:
+        payload = stream.read(maximum + 1)
+    if len(payload) > maximum:
+        _fail("JSON exceeds its declared budget")
+    return decode_json(payload, str(path)), payload
+
+
+def _immutable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return MappingProxyType({key: _immutable(item) for key, item in value.items()})
+    if isinstance(value, list):
+        return tuple(_immutable(item) for item in value)
+    return value
 
 
 def _verify_stream(stream: Any, size: int, digest: str) -> None:
@@ -37,8 +138,11 @@ def _verify_stream(stream: Any, size: int, digest: str) -> None:
     stream.seek(0)
 
 
-def _receipt(root: Path, commit: Mapping[str, Any], payload: bytes) -> dict[str, Any]:
-    receipt, _ = read_json(safe_path(root, "receipt.json"), maximum=1024 * 1024)
+def _receipt(root: Path, commit: Mapping[str, Any], payload: bytes,
+             budget: _IOBudget | None = None) -> dict[str, Any]:
+    path = safe_path(root, "receipt.json")
+    receipt, _ = (read_json(path, maximum=1024 * 1024) if budget is None
+                  else _budget_json(path, 1024 * 1024, budget))
     if (receipt.get("schema") != "qcl-negf-recovery-receipt-v1"
             or receipt.get("status") != "verified"
             or receipt.get("publication_scope") != "local_filesystem"):
@@ -164,27 +268,59 @@ class StateBlock:
     source_identity: Mapping[str, Any]
 
 
+@dataclass(frozen=True)
+class StateDescription:
+    object_kind: str
+    shape: tuple[int, ...] = ()
+    dtype: Any = None
+    itemsize: int = 0
+    chunks: tuple[int, ...] | None = None
+    compression: str | None = None
+    axes: tuple[str, ...] = ()
+    units: str = ""
+    coordinate_paths: tuple[str | None, ...] | None = None
+    child_names: tuple[str, ...] = ()
+    filters: tuple[int, ...] = ()
+
+
+@dataclass(frozen=True)
+class StateScalar:
+    value: Any
+    units: str
+    source_identity: Mapping[str, Any]
+
+
 class StateReader:
     """Read one committed physics.full owner in its external HDF5 axis order."""
 
     def __init__(self, commit_path: str | Path, *,
-                 expected_identity: Mapping[str, Any] | None = None):
-        path = Path(commit_path)
-        self.commit, payload = read_json(path, maximum=16 * 1024 * 1024)
+                 expected_identity: Mapping[str, Any] | None = None,
+                 maximum_io_bytes: int | None = None):
+        path = Path(commit_path).resolve()
+        self._budget = _IOBudget(maximum_io_bytes)
+        self.commit, payload = _budget_json(path, 16 * 1024 * 1024, self._budget)
         artifacts = validate_commit(self.commit)
         if expected_identity is not None and any(
-                self.commit["identity"].get(key) != value for key, value in expected_identity.items()):
+                not _same_json_value(self.commit["identity"].get(key), value)
+                for key, value in expected_identity.items()):
             _fail("state identity differs from the selected attempt")
         owners = [item for item in artifacts if item.role == "physics.full"]
         if len(owners) != 1:
             _fail("state must have exactly one physics.full owner")
+        receipt_verified = False
         if "state_id" in self.commit:
-            _receipt(path.parent, self.commit, payload)
+            _receipt(path.parent, self.commit, payload, self._budget)
+            receipt_verified = True
         owner = owners[0]
-        self._stream = safe_path(path.parent, owner.path).open("rb")
+        # The entire owner is mandatory for SHA; fail before opening physics if
+        # the remaining cap cannot even cover that irreducible obligation.
+        self._budget.require(owner.size)
+        self._stream = _BudgetStream(safe_path(path.parent, owner.path).open("rb", buffering=0), self._budget)
         self._handle = None
         try:
+            self._budget.phase = "sha"
             _verify_stream(self._stream, owner.size, owner.sha256)
+            self._budget.phase = "hdf"
             self._handle = h5py.File(self._stream, "r")
             _internal_storage(self._handle)
             validate_native_handle(self._handle, owner.role, owner.schema)
@@ -195,6 +331,17 @@ class StateReader:
                     identity = _json_scalar(self._handle, name)
                     _state_identity(identity, self.commit["identity"])
                     _identity_fields(identity, self.commit["identity"])
+            metadata = self._handle["metadata"]
+            self._source = _immutable({
+                "commit_path": str(path), "commit_sha256": hashlib.sha256(payload).hexdigest(),
+                "identity": dict(self.commit["identity"]), "expected_identity": dict(expected_identity or {}),
+                "state_id": self.commit.get("state_id"), "state_sequence": self.commit.get("state_sequence"),
+                "storage_class": self.commit.get("storage_class"),
+                "owner": {"path": owner.path, "bytes": owner.size, "sha256": owner.sha256,
+                          "role": owner.role, "schema": owner.schema},
+                "producer_format": _text(metadata.attrs["schema_version"]),
+                "contract_set": _text(metadata.attrs["contract_set"]),
+                "native_verified": True, "receipt_verified": receipt_verified})
         except Exception:
             self.close()
             raise
@@ -210,6 +357,77 @@ class StateReader:
             self._handle.close()
             self._handle = None
         self._stream.close()
+
+    @property
+    def source(self) -> Mapping[str, Any]:
+        """Immutable certificate from the exact constructor verification passes."""
+        return _immutable({**self._source, "budgets": self._budget.counters()})
+
+    @property
+    def io_counters(self) -> Mapping[str, int | None]:
+        return MappingProxyType(self._budget.counters())
+
+    def _object(self, path: str) -> Any:
+        if self._handle is None:
+            raise ValueError("state reader is closed")
+        if not isinstance(path, str) or not path or ".." in path.split("/"):
+            raise ValueError("dataset path must be a native HDF5 path")
+        try:
+            return self._handle[path]
+        except KeyError as error:
+            raise ContractError(f"missing native object: {path}", "invalid_data") from error
+
+    def describe(self, path: str, *, maximum_children: int = 128) -> StateDescription:
+        """Immutable metadata; no numerical payload or raw HDF handle escapes."""
+        if type(maximum_children) is not int or maximum_children < 1:
+            raise ValueError("maximum_children must be positive")
+        obj = self._object(path)
+        if isinstance(obj, h5py.Group):
+            if len(obj) > maximum_children:
+                raise ContractError("group inventory exceeds its budget", "budget_exceeded")
+            return StateDescription("group", child_names=tuple(obj))
+        if not isinstance(obj, h5py.Dataset):
+            _fail("unsupported native object")
+        coordinate = obj.attrs.get("axis_coordinate_paths_json")
+        try:
+            paths = None if coordinate is None else json.loads(_text(coordinate))
+        except (ValueError, UnicodeError) as error:
+            raise ContractError("invalid coordinate inventory", "unsupported_layout") from error
+        if paths is not None and (not isinstance(paths, list) or any(
+                item is not None and not isinstance(item, str) for item in paths)):
+            raise ContractError("invalid coordinate inventory", "unsupported_layout")
+        plist = obj.id.get_create_plist()
+        return StateDescription("dataset", tuple(obj.shape), obj.dtype, obj.dtype.itemsize,
+            obj.chunks, obj.compression, tuple(_text(obj.attrs.get("logical_axis_order", "")).split(",")),
+            _text(obj.attrs.get("units", "")), None if paths is None else tuple(paths),
+            filters=tuple(plist.get_filter(i)[0] for i in range(plist.get_nfilters())))
+
+    def _numeric(self, path: str, rank: int, maximum_bytes: int) -> Any:
+        if type(maximum_bytes) is not int or maximum_bytes < 1:
+            raise ValueError("maximum_bytes must be positive")
+        dataset = self._object(path)
+        if (not isinstance(dataset, h5py.Dataset) or dataset.ndim != rank
+                or dataset.dtype.hasobject or dataset.dtype.kind not in "biufc"):
+            raise ContractError("requires a fixed-width numeric dataset of the declared rank", "unsupported_layout")
+        if not _text(dataset.attrs.get("units", "")):
+            raise ContractError("numeric dataset units missing", "invalid_data")
+        count = math.prod(dataset.shape) * dataset.dtype.itemsize
+        if count > maximum_bytes:
+            raise ContractError("numeric read exceeds its byte budget", "budget_exceeded")
+        return dataset
+
+    def read_scalar(self, path: str, *, maximum_bytes: int = 64) -> StateScalar:
+        dataset = self._numeric(path, 0, maximum_bytes)
+        value = dataset[()]
+        self._budget.logical_selected_bytes += dataset.dtype.itemsize
+        return StateScalar(value.item(), _text(dataset.attrs["units"]), _immutable(self.commit["identity"]))
+
+    def read_vector(self, path: str, *, maximum_bytes: int) -> StateBlock:
+        dataset = self._numeric(path, 1, maximum_bytes)
+        values = dataset[:]
+        self._budget.logical_selected_bytes += values.nbytes
+        return StateBlock(values, tuple(_text(dataset.attrs.get("logical_axis_order", "")).split(",")),
+            _text(dataset.attrs["units"]), {}, {}, _immutable(self.commit["identity"]))
 
     def read(self, dataset_path: str, selection: tuple[int | slice, ...], *,
              maximum_bytes: int = 1024 * 1024) -> StateBlock:
@@ -275,7 +493,9 @@ class StateReader:
         weights: dict[str, Any] = dict.fromkeys(axes)
         for kind, axis, vector, item in vectors:
             (coordinates if kind == "coordinate" else weights)[axis] = vector[item]
-        return StateBlock(dataset[tuple(normalized)], axes, units, coordinates, weights,
+        values = dataset[tuple(normalized)]
+        self._budget.logical_selected_bytes += required
+        return StateBlock(values, axes, units, coordinates, weights,
                           dict(self.commit["identity"]))
 
 

@@ -173,3 +173,53 @@ Use the superproject's prepared Julia environment, containing `QCLNEGF`,
 artifacts while the core performs numerical iterations. Missing Julia is a
 failure in this explicit suite. Unit tests use clearly synthetic native fixtures;
 they do not certify physical predictions. MIT licensed; see [LICENSE](LICENSE).
+
+## Stored-final equilibrium measurements
+
+```python
+from qcl_negf_results.equilibrium import EquilibriumReadLimits, diagnose_stored_equilibrium
+
+report = diagnose_stored_equilibrium(
+    "/data/archive/execution/point/final/commit.json",
+    expected_identity={"execution_id": "execution", "point_id": "point", "attempt": 1},
+    limits=EquilibriumReadLimits(maximum_io_bytes=512 * 1024 * 1024),
+)
+```
+
+This independent reducer verifies the exact final `physics.full` owner and local
+receipt, then streams two passes in stored `E,k,a,b` order. It uses hash-bound
+explicit model context, the declared quadratures/scales and full matrices. One
+common chemical potential is fitted in the finite represented spectrum using a
+bounded bisection; its algorithm width is not a scientific acceptance tolerance.
+Raw correlations reconstruct the saved self-energies (enabled dictionary plus
+`embedding_total` exactly once); they are not a fresh candidate SCBA map.
+
+The JSON report separates applicability and measurement availability. It includes
+raw/normalized occupied and empty numbers, matrix FDR norms, independent occupied
+and empty normalization corrections, source hashes and read budgets. Negative
+charges are retained. Nonnegative quadrature weights are required; negative
+spectral number weights prevent a chemical-potential fit. Unavailable values are
+`null` with reasons. Zero norm ratios use explicit zero/undefined branches without
+an additive floor. No convergence, discretization or experimental acceptance is
+inferred, and outside-window tails remain undetermined.
+
+Boundary currents use **outward electron flow**, `A/m^2`: positive `plus` leaves
+toward +z; positive `minus` leaves toward −z. Common-axis values are reported
+separately (`Jz,minus = -Jout,minus`); outward balance is their outward sum. These
+are not conventional signed charge currents.
+
+`maximum_io_bytes` is mandatory and includes exact commit/receipt bytes, the full
+owner SHA and actual EOF-aware HDF5 file-object read/readinto callbacks, including
+native validation and repeated coordinates/weights. Physical counters measure
+stream-delivered bytes; OS cache does not make them free. Logical selected bytes
+and two-pass forecasts are separate. Default numeric workspace is 32 MiB;
+energy/momentum/basis/channel, single-read, uncompressed-chunk and report caps are
+also explicit. A complete basis plane must fit. Workspace does not bound process
+RSS, Python overhead or native HDF caches. No solver/runtime is loaded.
+
+`StateReader.describe` returns immutable dataset/group metadata;
+`read_scalar` supports producer rank-0 numeric scalars, and `read_vector` supports
+bounded fixed-width grid/weight vectors without requiring their absent coordinate
+JSON. Matrix `read` retains its explicit coordinate/weight contract. Optional
+`StateReader(maximum_io_bytes=...)` enables the same physical I/O guard for other
+callers, while `source` is an immutable certificate built from constructor proofs.
