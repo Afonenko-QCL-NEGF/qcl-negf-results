@@ -237,3 +237,261 @@ def test_state_reader_rejects_unowned_external_or_virtual_values(tmp_path, stora
     with pytest.raises(ContractError, match="external|virtual|unowned"):
         with StateReader(root / "commit.json") as reader:
             reader.read("state_dimensionless/GR/real", (slice(5, 7), 0, 1))
+
+
+# R09: declaration normalization must not eliminate later byte obligations.
+def _rewrite_progress(root, edit):
+    path = root / "execution_progress.json"
+    progress = json.loads(path.read_text())
+    edit(progress["completed_points"][0]["files"])
+    path.write_bytes(json_bytes(progress))
+    commit = json.loads((root / "commit.json").read_text())
+    commit["artifacts"][-1] = artifact_row(path, relative=path.name,
+        role="execution.progress", media_type="application/json", profile="full-state",
+        schema="qcl-negf-execution-progress-v1")
+    payload = json_bytes(commit)
+    (root / "commit.json").write_bytes(payload)
+    receipt = json.loads((root / "receipt.json").read_text())
+    receipt["commit_sha256"] = hashlib.sha256(payload).hexdigest()
+    (root / "receipt.json").write_bytes(json_bytes(receipt))
+
+
+def test_prior_declaration_union_retains_both_origins_and_owner_only_paths():
+    from qcl_negf_results import state
+    from qcl_negf_contracts.artifacts import Artifact
+    digest = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+    owner = Artifact("physics.h5", "physics.full", 3, digest,
+                     "application/x-hdf5", "full-state", (), "qcl-negf-physics-v4")
+    only = Artifact("history.h5", "science.history", 3, digest,
+                    "application/x-hdf5", "full-state", (), "qcl-negf-scientific-history-v4")
+    rows = [{"path": "extra.txt", "bytes": 3, "sha256": digest},
+            {"path": "physics.h5", "bytes": 3, "sha256": digest}]
+    result = state._prior_declarations(rows, (owner, only), IDENTITY, "point/final/commit.json")
+    assert [row["path"] for row in result] == ["extra.txt", "physics.h5", "history.h5"]
+    assert [row["origins"] for row in result] == [("index",), ("index", "owner"), ("owner",)]
+    assert result[1]["owner"] == owner
+
+
+@pytest.mark.parametrize("field,value", [("bytes", 4), ("sha256", "f" * 64),
+    ("role", "science.history"), ("schema", "wrong"), ("media_type", "text/plain"),
+    ("identity", {**IDENTITY, "point_id": "other"})])
+def test_prior_conflicts_fail_before_dependency_hash_or_native(tmp_path, monkeypatch, field, value):
+    from qcl_negf_results import state
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    final = attach_progress(root, bundle(root), archive)
+    def conflict(rows):
+        next(row for row in rows if row["path"] == "physics.h5")[field] = value
+    _rewrite_progress(root, conflict)
+    original = state._verify_stream
+    seen = []
+    def verify(stream, size, digest):
+        if str(final) in str(stream.name):
+            seen.append(stream.name)
+        return original(stream, size, digest)
+    monkeypatch.setattr(state, "_verify_stream", verify)
+    with pytest.raises(ContractError, match="prior.*physics.h5.*conflict") as error:
+        verify_recovery_bundle(root, archive_directory=archive)
+    assert error.value.code == "corrupt_result"
+    assert seen == []
+
+
+@pytest.mark.parametrize("omit_history", [False, True])
+def test_prior_hash_order_and_native_closure_survive_normalization(tmp_path, monkeypatch, omit_history):
+    from qcl_negf_results import state
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    final = attach_progress(root, bundle(root), archive)
+    (final / "extra.txt").write_bytes(b"abc")
+    order = ["commit.json", "receipt.json", "physics.h5", "history.h5",
+             "resolved_configuration.json", "extra.txt"]
+    if omit_history:
+        order.remove("history.h5")
+    def inventory(rows):
+        rows[:] = [{"path": name, "bytes": (final / name).stat().st_size,
+                    "sha256": hashlib.sha256((final / name).read_bytes()).hexdigest()} for name in order]
+    _rewrite_progress(root, inventory)
+    original_hash, original_native = state._verify_stream, state.validate_native_handle
+    events = []
+    def verify(stream, size, digest):
+        if str(final) in str(stream.name):
+            events.append(("sha", str(stream.name).split("/")[-1]))
+        return original_hash(stream, size, digest)
+    def native(handle, role, schema):
+        if str(final) in str(handle.filename):
+            events.append(("native", role))
+        return original_native(handle, role, schema)
+    monkeypatch.setattr(state, "_verify_stream", verify)
+    monkeypatch.setattr(state, "validate_native_handle", native)
+    expected = [("sha", name) for name in order +
+                ["physics.h5", "history.h5", "resolved_configuration.json"]]
+    expected += [("native", "physics.full"), ("native", "science.history")]
+    for _ in range(2):
+        events.clear()
+        assert verify_recovery_bundle(root, archive_directory=archive)["verified_prior_finals"] == 1
+        assert events == expected
+
+
+def test_prior_later_actual_sha_rejects_same_size_mutation_with_stale_stat(tmp_path, monkeypatch):
+    from pathlib import Path
+    from qcl_negf_results import state
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    final = attach_progress(root, bundle(root), archive)
+    target = final / "physics.h5"
+    stale, original_stat, original_hash = target.stat(), Path.stat, state._verify_stream
+    calls = []
+    def stat(path, *args, **kwargs):
+        return stale if path == target else original_stat(path, *args, **kwargs)
+    def verify(stream, size, digest):
+        if Path(stream.name) == target:
+            calls.append("physics-sha")
+        result = original_hash(stream, size, digest)
+        if Path(stream.name) == target and len(calls) == 1:
+            with h5py.File(target, "r+") as handle:
+                handle["state_dimensionless/GR/real"][5, 0, 1] = 9.0
+            assert original_stat(target).st_size == stale.st_size
+            assert target.stat() == stale
+            assert hashlib.sha256(target.read_bytes()).hexdigest() != digest
+        return result
+    monkeypatch.setattr(Path, "stat", stat)
+    monkeypatch.setattr(state, "_verify_stream", verify)
+    with pytest.raises(ContractError, match="checksum") as error:
+        verify_recovery_bundle(root, archive_directory=archive)
+    assert error.value.code == "corrupt_result"
+    assert calls == ["physics-sha", "physics-sha"]
+
+
+@pytest.mark.parametrize("change", ["duplicate", "escape", "absolute", "boolean-size"])
+def test_prior_invalid_index_rows_keep_contract_rejection(tmp_path, change):
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    attach_progress(root, bundle(root), archive)
+    def invalid(rows):
+        if change == "duplicate":
+            rows.append(dict(rows[0]))
+        elif change == "boolean-size":
+            rows[0]["bytes"] = True
+        else:
+            rows[0]["path"] = "../escape" if change == "escape" else "/absolute"
+    _rewrite_progress(root, invalid)
+    with pytest.raises(ContractError) as error:
+        verify_recovery_bundle(root, archive_directory=archive)
+    assert error.value.code == "corrupt_result"
+
+
+@pytest.mark.parametrize("name", ["commit.json", "receipt.json"])
+def test_prior_metadata_read_does_not_cache_external_bytes(tmp_path, monkeypatch, name):
+    from qcl_negf_results import state
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    final = attach_progress(root, bundle(root), archive)
+    original = state._receipt
+    def receipt(directory, commit, payload):
+        result = original(directory, commit, payload)
+        if directory == final:
+            with (directory / name).open("ab") as stream:
+                stream.write(b" ")
+        return result
+    monkeypatch.setattr(state, "_receipt", receipt)
+    with pytest.raises(ContractError, match="byte length"):
+        verify_recovery_bundle(root, archive_directory=archive)
+
+
+def test_prior_same_names_in_separate_finals_do_not_share_hash_proof(tmp_path, monkeypatch):
+    from qcl_negf_results import state
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    first = attach_progress(root, bundle(root), archive)
+    second = first.parent.parent / "point-2/final"
+    second.parent.mkdir()
+    bundle(second, {**IDENTITY, "point_id": "point-2"}, storage_class="archive")
+    path = root / "execution_progress.json"
+    progress = json.loads(path.read_text())
+    entry = json.loads(json.dumps(progress["completed_points"][0]))
+    entry["point"]["id"] = "point-2"
+    entry["point"]["coordinates"]["order"] = 2
+    entry["final_commit"] = "execution-1/point-2/final/commit.json"
+    entry["point"]["data"]["result_commit"] = "archive/" + entry["final_commit"]
+    entry["receipt"] = json.loads((second / "receipt.json").read_text())
+    entry["files"] = [{"path": name, "bytes": (second / name).stat().st_size,
+        "sha256": hashlib.sha256((second / name).read_bytes()).hexdigest()}
+        for name in ["commit.json", "receipt.json", "physics.h5", "history.h5",
+                     "resolved_configuration.json"]]
+    progress["completed_points"].append(entry)
+    path.write_bytes(json_bytes(progress))
+    _rewrite_progress(root, lambda rows: None)
+    original = state._verify_stream
+    seen = []
+    def verify(stream, size, digest):
+        if str(first) in str(stream.name) or str(second) in str(stream.name):
+            seen.append(str(stream.name))
+        return original(stream, size, digest)
+    monkeypatch.setattr(state, "_verify_stream", verify)
+    assert verify_recovery_bundle(root, archive_directory=archive)["verified_prior_finals"] == 2
+    for directory in (first, second):
+        for name in ["physics.h5", "history.h5", "resolved_configuration.json"]:
+            assert seen.count(str(directory / name)) == 2
+        for name in ["commit.json", "receipt.json"]:
+            assert seen.count(str(directory / name)) == 1
+
+
+def _tiny_identity_fixture(tmp_path):
+    """Reuse contract fixture metadata but truncate large sparse state datasets."""
+    root, archive = tmp_path / "bundle", tmp_path / "archive"
+    final = attach_progress(root, bundle(root), archive)
+    for directory in (root, final):
+        commit = json.loads((directory / "commit.json").read_text())
+        with h5py.File(directory / "physics.h5", "w") as handle:
+            declare_native(handle, "qcl-negf-physics-v4", "physics.full", scba_rows=0)
+            handle["metadata/point_identity_json"] = json.dumps(commit["identity"])
+            handle["state_dimensionless/value"] = [3.0]
+        commit["artifacts"][0] = artifact_row(directory / "physics.h5", relative="physics.h5",
+            role="physics.full", media_type="application/x-hdf5", profile="full-state",
+            schema="qcl-negf-physics-v4")
+        payload = json_bytes(commit)
+        (directory / "commit.json").write_bytes(payload)
+        receipt = json.loads((directory / "receipt.json").read_text())
+        receipt["commit_sha256"] = hashlib.sha256(payload).hexdigest()
+        (directory / "receipt.json").write_bytes(json_bytes(receipt))
+    path = root / "execution_progress.json"
+    progress = json.loads(path.read_text())
+    entry = progress["completed_points"][0]
+    entry["receipt"] = json.loads((final / "receipt.json").read_text())
+    entry["files"] = [{"path": name, "bytes": (final / name).stat().st_size,
+        "sha256": hashlib.sha256((final / name).read_bytes()).hexdigest()}
+        for name in ["commit.json", "receipt.json", "physics.h5", "history.h5",
+                     "resolved_configuration.json"]]
+    path.write_bytes(json_bytes(progress))
+    _rewrite_progress(root, lambda rows: None)
+    return root, archive, final
+
+
+@pytest.mark.parametrize("field,value", [("attempt", True), ("state_sequence", True),
+                                         ("attempt", 1.0), ("state_sequence", 1.0),
+                                         (None, None)])
+def test_prior_optional_identity_uses_exact_json_types(tmp_path, monkeypatch, field, value):
+    from qcl_negf_results import state
+    root, archive, final = _tiny_identity_fixture(tmp_path)
+    identity = json.loads((final / "commit.json").read_text())["identity"]
+    if field is not None:
+        identity[field] = value
+    def claim(rows):
+        next(row for row in rows if row["path"] == "physics.h5")["identity"] = identity
+    _rewrite_progress(root, claim)
+    original_hash, original_native = state._verify_stream, state.validate_native_handle
+    events = []
+    def verify(stream, size, digest):
+        if str(final) in str(stream.name):
+            events.append(("sha", str(stream.name).split("/")[-1]))
+        return original_hash(stream, size, digest)
+    def native(handle, role, schema):
+        if str(final) in str(handle.filename):
+            events.append(("native", role))
+        return original_native(handle, role, schema)
+    monkeypatch.setattr(state, "_verify_stream", verify)
+    monkeypatch.setattr(state, "validate_native_handle", native)
+    if field is not None:
+        with pytest.raises(ContractError, match="prior.*physics.h5.*identity.*conflict") as error:
+            verify_recovery_bundle(root, archive_directory=archive)
+        assert error.value.code == "corrupt_result"
+        assert events == []
+    else:
+        assert verify_recovery_bundle(root, archive_directory=archive)["verified_prior_finals"] == 1
+        assert events == [("sha", name) for name in ["commit.json", "receipt.json", "physics.h5",
+            "history.h5", "resolved_configuration.json", "physics.h5", "history.h5",
+            "resolved_configuration.json"]] + [("native", "physics.full"), ("native", "science.history")]

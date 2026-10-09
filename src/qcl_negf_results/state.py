@@ -16,7 +16,7 @@ from typing import Any, Mapping
 
 import h5py
 
-from qcl_negf_contracts.artifacts import validate_commit, validate_execution_progress
+from qcl_negf_contracts.artifacts import Artifact, validate_commit, validate_execution_progress
 from qcl_negf_contracts.messages import ContractError
 from .commits import read_json, safe_path
 from .native import validate_native_handle
@@ -49,6 +49,49 @@ def _receipt(root: Path, commit: Mapping[str, Any], payload: bytes) -> dict[str,
         if field not in commit or receipt.get(field) != commit[field]:
             _fail(f"recovery receipt {field} differs from its commit")
     return receipt
+
+
+def _same_json_value(left: Any, right: Any) -> bool:
+    """Compare decoded JSON values without Python's bool/int/float coercion."""
+    if type(left) is not type(right):
+        return False
+    if isinstance(left, dict):
+        return left.keys() == right.keys() and all(
+            _same_json_value(left[key], right[key]) for key in left)
+    if isinstance(left, list):
+        return len(left) == len(right) and all(
+            _same_json_value(a, b) for a, b in zip(left, right))
+    return left == right
+
+
+def _prior_declarations(files: list[Mapping[str, Any]], owned: tuple[Artifact, ...],
+                        identity: Mapping[str, Any], locator: str) -> tuple[dict[str, Any], ...]:
+    """Normalize one validated final's declarations, preserving both SHA obligations.
+
+    This metadata preflight grants no byte lifetime or reusable verification proof.
+    The caller must still run the original index, owner and native passes.
+    """
+    declarations = {row["path"]: {**row, "origins": ("index",)} for row in files}
+    for owner in owned:
+        row = declarations.get(owner.path)
+        if row is None:
+            row = {"path": owner.path, "bytes": owner.size, "sha256": owner.sha256,
+                   "origins": ("owner",)}
+            declarations[owner.path] = row
+        else:
+            claims = {"bytes": owner.size, "sha256": owner.sha256, "role": owner.role,
+                      "schema": owner.schema, "media_type": owner.media_type,
+                      "identity": identity}
+            for field, expected in claims.items():
+                if field not in row:
+                    continue
+                matches = (_same_json_value(row[field], expected) if field == "identity"
+                           else row[field] == expected)
+                if not matches:
+                    _fail(f"prior final {locator}: {owner.path} {field} declaration conflict")
+            row["origins"] += ("owner",)
+        row["owner"] = owner
+    return tuple(declarations.values())
 
 
 def verify_recovery_bundle(directory: str | Path,
@@ -96,6 +139,7 @@ def verify_recovery_bundle(directory: str | Path,
                 if final.get(field) != proof.get(field):
                     _fail("prior archive identity differs from progress")
             _receipt(final_path.parent, final, final_bytes)
+            _prior_declarations(entry["files"], owned, final["identity"], entry["final_commit"])
             for dependency in (*entry["files"], *({"path": item.path, "bytes": item.size,
                     "sha256": item.sha256} for item in owned)):
                 with safe_path(final_path.parent, dependency["path"]).open("rb") as stream:
