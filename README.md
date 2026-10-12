@@ -9,7 +9,7 @@ Python 3.14 is supported. Install the `qcl-negf-contracts` 0.2.0 wheel from the 
 ```console
 uv venv
 uv pip install /path/to/qcl_negf_contracts-0.2.0-py3-none-any.whl
-uv pip install '.[test]'
+uv pip install -e '.[test]'
 .venv/bin/python -m pytest
 uv build
 ```
@@ -158,6 +158,13 @@ The package uses no scheduler queue or deployment service. Artifact file replace
 ```console
 .venv/bin/python -m pytest
 ```
+
+The manufactured equilibrium tests verify that Results comes from this checkout.
+In the superproject they also require the sibling Contracts checkout. Standalone
+wheel installations use the declared Contracts 0.2.0 distribution's file metadata
+as the independent owner. For a standalone editable Contracts dependency, set
+`QCL_NEGF_TEST_CONTRACTS_SOURCE` to its absolute `src` directory when running tests.
+This selects an expected source location; it does not change scientific criteria.
 
 The integration suite runs an actual Julia SCBA producer concurrently with export.
 The superproject includes it in `deno task test --julia` and its full test pipeline.

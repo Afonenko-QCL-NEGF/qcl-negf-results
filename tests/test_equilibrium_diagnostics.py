@@ -19,6 +19,7 @@ from qcl_negf_results.commits import artifact_row, json_bytes
 from qcl_negf_results.model import canonical_bytes
 from qcl_negf_results.state import StateReader
 from native_result_fixtures import declare_native
+from source_ownership import assert_source_ownership
 
 IDENTITY = {"execution_id": "manufactured", "point_id": "analytic", "attempt": 1,
             "plan_fingerprint": "a" * 64, "state_id": "manufactured-state", "state_sequence": 1}
@@ -33,9 +34,6 @@ D = np.array([[0, 1j], [-1j, 0]])
 MU = 0.012
 KT = 1.380649e-23 / 1.602176634e-19 * 70
 DELTA = 0.03
-# Both cached native dependencies and owning sources are asserted inside the packet.
-EXPECTED_RESULTS = Path('/home/tolya/.codex/worktrees/r09-results-integrity/qcl-negf/components/qcl-negf-results/src')
-EXPECTED_CONTRACTS = Path('/home/tolya/Загрузки/qcl-negf/components/qcl-negf-contracts/src')
 
 
 def api():
@@ -109,8 +107,7 @@ def matrix(handle, path, value):
 def archive(tmp_path):
     import qcl_negf_results.state as state
     import qcl_negf_contracts.artifacts as contracts
-    assert Path(state.__file__).resolve().is_relative_to(EXPECTED_RESULTS)
-    assert Path(contracts.__file__).resolve().is_relative_to(EXPECTED_CONTRACTS)
+    assert_source_ownership(state.__file__, contracts.__file__)
     root = tmp_path / 'manufactured'
     root.mkdir()
     data = analytic()
