@@ -21,7 +21,7 @@ import h5py
 from qcl_negf_contracts.artifacts import Artifact, validate_commit, validate_execution_progress
 from qcl_negf_contracts.messages import ContractError
 from .commits import decode_json, read_json, safe_path
-from .native import validate_native_handle
+from .native import validate_native_handle, _read_final_fixed_point_audit
 from .provenance import _identity_fields, _json_scalar, _state_identity
 
 
@@ -168,6 +168,74 @@ def _same_json_value(left: Any, right: Any) -> bool:
     return left == right
 
 
+def _commit_final_audit(commit: Mapping[str, Any]) -> dict[str, Any] | None:
+    assessment = commit.get("stationary_assessment")
+    if assessment is None:
+        return None
+    if not isinstance(assessment, dict):
+        _fail("stationary_assessment must be an object")
+    if "final_fixed_point_audit" not in assessment:
+        return None
+    record = assessment["final_fixed_point_audit"]
+    if not isinstance(record, dict):
+        _fail("present final_fixed_point_audit must be an object")
+    return record
+
+
+def _validated_final_fixed_point_audit(handle: Any, commit: Mapping[str, Any], *,
+                                      final_state: bool) -> dict[str, Any]:
+    """Bind the two stored copies; never evaluate a fresh physical map."""
+    from qcl_negf_contracts.final_audit import validate_final_audit_pair
+    raw = _read_final_fixed_point_audit(handle)
+    result = validate_final_audit_pair(raw, _commit_final_audit(commit),
+        expected_identity=commit["identity"], final_state=final_state)
+    if raw is not None:
+        if "metadata/point_identity_json" not in handle:
+            _fail("final audit requires native point identity")
+        identity = _json_scalar(handle, "metadata/point_identity_json")
+        if not _same_json_value(identity, commit["identity"]):
+            _fail("final audit native point identity differs from its commit")
+    return result
+
+
+def _validate_final_audit_sidecar(handle: Any, role: str,
+                                 commit: Mapping[str, Any]) -> None:
+    """Optional analysis copies agree; checkpoint payloads never carry finals."""
+    raw = _read_final_fixed_point_audit(handle)
+    if commit.get("storage_class") == "recovery" and _commit_final_audit(commit) is not None:
+        _fail("recovery commit must not publish a final audit")
+    if raw is None:
+        return
+    if role == "recovery" or commit.get("storage_class") == "recovery":
+        _fail("recovery payload must not publish a final audit")
+    from qcl_negf_contracts.final_audit import validate_final_audit_pair
+    validate_final_audit_pair(raw, _commit_final_audit(commit),
+        expected_identity=commit["identity"], final_state=True)
+    if "metadata/identity_json" not in handle:
+        _fail("analysis final audit requires native identity_json")
+    identity = _json_scalar(handle, "metadata/identity_json")
+    if not _same_json_value(identity, commit["identity"]):
+        _fail("analysis final audit native identity_json differs from its commit")
+
+
+def _verify_final_audit_sidecars(root: Path, artifacts: tuple[Artifact, ...],
+                                commit: Mapping[str, Any], budget: _IOBudget) -> None:
+    """Use the same physical cap for each declared analysis/checkpoint owner."""
+    for owner in artifacts:
+        if (owner.role not in {"physics.analysis", "recovery"}
+                or owner.media_type != "application/x-hdf5"):
+            continue
+        budget.require(owner.size)
+        with _BudgetStream(safe_path(root, owner.path).open("rb", buffering=0), budget) as stream:
+            budget.phase = "sha"
+            _verify_stream(stream, owner.size, owner.sha256)
+            budget.phase = "hdf"
+            with h5py.File(stream, "r") as handle:
+                _internal_storage(handle)
+                validate_native_handle(handle, owner.role, owner.schema)
+                _validate_final_audit_sidecar(handle, owner.role, commit)
+
+
 def _prior_declarations(files: list[Mapping[str, Any]], owned: tuple[Artifact, ...],
                         identity: Mapping[str, Any], locator: str) -> tuple[dict[str, Any], ...]:
     """Normalize one validated final's declarations, preserving both SHA obligations.
@@ -209,6 +277,8 @@ def verify_recovery_bundle(directory: str | Path,
     root = Path(directory)
     commit, payload = read_json(safe_path(root, "commit.json"), maximum=16 * 1024 * 1024)
     artifacts = validate_commit(commit)
+    if commit.get("storage_class") == "recovery" and _commit_final_audit(commit) is not None:
+        _fail("recovery commit must not publish a final audit")
     if expected_identity is not None and any(
             commit["identity"].get(key) != value for key, value in expected_identity.items()):
         _fail("recovery bundle identity differs from the selected attempt")
@@ -220,6 +290,11 @@ def verify_recovery_bundle(directory: str | Path,
                 with h5py.File(stream, "r") as handle:
                     _internal_storage(handle)
                     validate_native_handle(handle, artifact.role, artifact.schema)
+                    if artifact.role == "physics.full":
+                        _validated_final_fixed_point_audit(handle, commit,
+                            final_state=commit.get("storage_class") != "recovery")
+                    elif artifact.role in {"physics.analysis", "recovery"}:
+                        _validate_final_audit_sidecar(handle, artifact.role, commit)
     prior_finals = 0
     for artifact in artifacts:
         if artifact.role != "execution.progress":
@@ -253,6 +328,10 @@ def verify_recovery_bundle(directory: str | Path,
                     with h5py.File(safe_path(final_path.parent, item.path), "r") as handle:
                         _internal_storage(handle)
                         validate_native_handle(handle, item.role, item.schema)
+                        if item.role == "physics.full":
+                            _validated_final_fixed_point_audit(handle, final, final_state=True)
+                        elif item.role in {"physics.analysis", "recovery"}:
+                            _validate_final_audit_sidecar(handle, item.role, final)
             prior_finals += 1
     return {"commit": commit, "receipt": receipt, "verified_artifacts": len(artifacts),
             "verified_prior_finals": prior_finals}
@@ -331,6 +410,9 @@ class StateReader:
                     identity = _json_scalar(self._handle, name)
                     _state_identity(identity, self.commit["identity"])
                     _identity_fields(identity, self.commit["identity"])
+            self._final_fixed_point_audit = _immutable(_validated_final_fixed_point_audit(
+                self._handle, self.commit, final_state=self.commit.get("storage_class") != "recovery"))
+            _verify_final_audit_sidecars(path.parent, artifacts, self.commit, self._budget)
             metadata = self._handle["metadata"]
             self._source = _immutable({
                 "commit_path": str(path), "commit_sha256": hashlib.sha256(payload).hexdigest(),
