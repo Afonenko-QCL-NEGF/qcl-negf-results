@@ -591,3 +591,327 @@ def test_R36_receipt_commit_hash_mismatch(archive):
     receipt['commit_sha256'] = '0' * 64
     (archive[0] / 'receipt.json').write_bytes(json_bytes(receipt))
     error(archive, 'corrupt_result')
+
+
+# SCI03-M1: manufactured measurement controls, not a solver equilibrium claim.
+# This append-only section uses the existing encoder/provenance plumbing only.
+# Expected arithmetic below never calls product reducers, FD, or mu-fit helpers.
+M1_M = 3 / (8 * math.pi)
+M1_EPSILON = 1 / 128
+M1_L = 7 * M1_M / 512
+M1_R = 13 * M1_M / 65536
+M1_ROUNDOFF = 512 * 2 ** -53
+
+
+def m1_close(actual, expected):
+    # Conservative <=512-operation binary64 fixture regression policy at these
+    # fixed scales; not a rigorous libm enclosure or a scientific tolerance.
+    assert math.isfinite(actual)
+    assert abs(actual - expected) <= M1_ROUNDOFF * max(1, abs(expected))
+
+
+def m1_bound_namespace(report):
+    assert 'represented_current_bound' in report, 'missing SCI03-5.3 measured current-bound instrumentation'
+    result = report['represented_current_bound']
+    assert result['contract'] == 'SCI03-5.3-represented-current-v1'
+    assert result['norm'] == 'absolute weighted full complex Frobenius'
+    assert result['weight'] == 'gs*wE*wk/(2*pi)'
+    assert result['normalization'] == 'none'
+    assert result['reference_mu'] == 'mu.value_relative_eV'
+    assert result['arithmetic_error_status'] == 'not_measured'
+    assert result['arithmetic_error_bound'] is None
+    assert result['scope'] == 'represented exact-arithmetic complex trace; no acceptance'
+    return result
+
+
+def m1_row(row, expected, units='1'):
+    assert row['status'] == 'measured' and row['reason'] is None
+    assert row['units'] == units
+    m1_close(row['value'], expected)
+
+
+def m1_archive(archive, *, quarter_capacity=False, zero_boundary=False, imaginary=False):
+    """Literal D §7.1 entries; existing HDF encoder is format plumbing only."""
+    identity = np.eye(2, dtype=complex)
+    x = np.array([[0, 1], [1, 0]], dtype=complex)
+    y = np.array([[0, 1j], [-1j, 0]], dtype=complex)
+    plus = np.array([[1/2, 1j/8], [-1j/8, 1/4]])
+    minus = np.array([[1/4, (1+1j)/16], [(1-1j)/16, 1/2]])
+    if zero_boundary:
+        plus, minus = np.zeros((2, 2), complex), np.zeros((2, 2), complex)
+    internal = 2 * identity - plus - minus
+    state = {name: np.empty((1, 2, 2, 2), complex) for name in ('A', 'GR', 'GL', 'GG')}
+    sides = {side: {part: np.empty((1, 2, 2, 2), complex) for part in ('SL', 'SG')}
+             for side in ('embedding_plus', 'embedding_minus')}
+    for k, epsilon in enumerate((1/128, 1/64)):
+        state['A'][0, k] = 2 * identity
+        state['GR'][0, k] = -1j * identity
+        state['GL'][0, k] = 1j * (identity + epsilon * (2*x+y) + (1j/32 * identity if imaginary else 0))
+        state['GG'][0, k] = -1j * (identity + epsilon * (-x+2*y))
+        for side, gamma, defect in [('embedding_plus', plus, x), ('embedding_minus', minus, y)]:
+            delta = np.zeros((2, 2), complex) if zero_boundary else epsilon * defect
+            sides[side]['SL'][0, k] = 1j * (gamma/2 + delta)
+            sides[side]['SG'][0, k] = -1j * (gamma/2 - delta)
+    def install(handle):
+        for name, values in [('energy', np.array([0.])), ('wE', np.array([3/8])),
+                             ('k', np.array([.2, .7])), ('wk', np.array([1/4, 3/4]))]:
+            path = 'grids_dimensionless/' + name
+            attrs = dict(handle[path].attrs)
+            del handle[path]
+            handle[path] = values
+            handle[path].attrs.update(attrs)
+        handle['numerical_inputs/NE'][()] = 1
+        handle['inputs/E_ref_eV'][()] = 0
+        handle['inputs/N_dop_2D_per_m2'][()] = (M1_M if quarter_capacity else 2*M1_M) / 1e-16
+        for name, values in state.items():
+            del handle['state_dimensionless/' + name]
+            matrix(handle, 'state_dimensionless/' + name, values)
+        for name, fraction in zip(FAMILIES, (1/8, 1/8, 1/8, 1/8, 1/2)):
+            for part, sign in [('SL', 1j), ('SG', -1j)]:
+                path = f'selfenergy_dimensionless/{name}/{part}'
+                del handle[path]
+                matrix(handle, path, np.broadcast_to(sign * fraction * internal/2, (1, 2, 2, 2)))
+        for side in BOUNDARIES:
+            for part in ('SL', 'SG'):
+                values = (sides['embedding_plus'][part] + sides['embedding_minus'][part]
+                          if side == 'embedding_total' else sides[side][part])
+                path = f'selfenergy_dimensionless/{side}/{part}'
+                del handle[path]
+                matrix(handle, path, values)
+    mutate(archive, install)
+    return archive
+
+
+def m1_expected(report, *, imaginary=False):
+    # Independent closed literal finite-t table from D §7.1. One PUBLIC mu is
+    # used for both variants and sides. No product norm/FD/bound builder oracle.
+    t = 1 / (1 + math.exp(-report['mu']['value_relative_eV'] / KT)) - 1/2
+    rho2 = 1/1024 if imaginary else 0
+    return t, {
+        'raw': (4*M1_R + 8*t*t*M1_M, 4*M1_R + 8*t*t*M1_M, 0),
+        'normalized': (10*M1_R + 8*t*t*M1_M + 2*rho2*M1_M,
+                       10*M1_R + 8*t*t*M1_M, 20*M1_R + 2*rho2*M1_M)}
+
+
+def m1_check_literal_report(report, *, imaginary=False):
+    bound = m1_bound_namespace(report)
+    t, states = m1_expected(report, imaginary=imaginary)
+    m1_row(bound['spectral_norm'], math.sqrt(8*M1_M))
+    for part, squared in [('occupied', 2*M1_R + (2*M1_M/1024 if imaginary else 0)), ('empty', 18*M1_R)]:
+        m1_row(bound['normalization_correction_norms'][part], math.sqrt(squared))
+        # Existing ratio and numerator/denominator semantics stay independent.
+        old = report['corrections'][part]
+        assert old['status'] == 'measured'
+        m1_close(old['numerator_squared'], squared)
+        m1_close(old['denominator_squared'], 2*M1_M + 4*M1_R)
+        m1_close(old['value'], math.sqrt(squared / (2*M1_M + 4*M1_R)))
+    for variant, squared in states.items():
+        row = bound['state_defects'][variant]
+        assert row['status'] == 'measured' and row['reason'] is None and row['units'] == '1'
+        for name, value in zip(('occupied_norm', 'empty_norm', 'sum_norm'), squared):
+            m1_close(row[name], math.sqrt(value))
+        m1_close(report['fdr'][variant]['numerator_squared'], squared[0] + squared[1])
+        m1_close(report['fdr'][variant]['denominator_squared'], 8*M1_M)
+    # Literal zero cannot be replaced by n+p, and normalized closure is false.
+    m1_close(bound['state_defects']['raw']['sum_norm'], 0)
+    assert bound['state_defects']['raw']['occupied_norm'] > 0
+    assert bound['state_defects']['normalized']['sum_norm'] > 0
+    for side, gamma2, d2, signed in [
+            ('plus', 11/32, 2*M1_R+t*t*(11/32)*M1_M, -69/32768),
+            ('minus', 21/64, 2*M1_R-t*M1_L/4+t*t*(21/64)*M1_M, 17/32768)]:
+        gm = (1/2-t)*math.sqrt(gamma2*M1_M)
+        gp = (1/2+t)*math.sqrt(gamma2*M1_M)
+        d = math.sqrt(d2)
+        row = bound['boundary_coefficients'][side]
+        assert row['status'] == 'measured' and row['reason'] is None and row['units'] == '1'
+        for key, expected in [('one_minus_f_gamma_norm', gm), ('f_gamma_norm', gp), ('sigma_fdr_defect_norm', d)]:
+            m1_close(row[key], expected)
+        for variant, (n2, p2, c2) in states.items():
+            terms = (13*gm*math.sqrt(n2), 13*gp*math.sqrt(p2), 13*d*(math.sqrt(8*M1_M)+math.sqrt(c2)))
+            result = bound['bounds'][side][variant]
+            m1_row(result, math.fsum(terms), 'A/m^2')
+            for key, expected in zip(('occupied_term', 'empty_term', 'selfenergy_term'), terms):
+                m1_close(result[key], expected)
+            assert result['selfenergy_term'] > 0
+            current = report['currents'][side]
+            real = 13*M1_M*(7/2048 if variant == 'raw' else signed)
+            imag = 13*3*M1_M/256 if imaginary and variant == 'normalized' else 0
+            m1_close(current[variant+'_outward_A_per_m2'], real)
+            m1_close(current[variant+'_imaginary_A_per_m2'], imag)
+            m1_close(current[variant+'_common_z_A_per_m2'], real if side == 'plus' else -real)
+            assert math.hypot(real, imag) <= result['value'] + M1_ROUNDOFF
+    for key in ('raw', 'normalized'):
+        m1_close(report['numbers'][key]['value_dimensionless'], 2*M1_M)
+        m1_close(report['numbers'][key+'_empty']['value_dimensionless'], 2*M1_M)
+    assert report['schema'] == 'qcl-negf-stored-equilibrium-diagnostics-v1'
+    assert len(json.dumps(bound, separators=(',', ':')).encode()) <= 8*1024
+    assert len(json.dumps(report, ensure_ascii=False, separators=(',', ':')).encode()) <= 64*1024
+
+
+@pytest.mark.parametrize('quarter_capacity', [False, True])
+def test_M1_01_literal_noncommuting_norms_terms_signs_and_weights(archive, quarter_capacity):
+    # Catches missing instrumentation; dropped Im/offdiagonal; missing deltaS;
+    # wrong W/gs/radial factor; n+p closure; side reuse; total double counting.
+    m1_archive(archive, quarter_capacity=quarter_capacity)
+    report = diagnose(archive, mu_algorithm_abs_tol_eV=1e-12)
+    mu = report['mu']
+    known = -KT*math.log(3) if quarter_capacity else 0
+    assert mu['status'] == 'measured' and mu['reason'] is None
+    assert mu['lower_eV'] <= known <= mu['upper_eV']
+    assert mu['stop_reason'] in ('absolute_mu_width', 'adjacent_binary64_endpoints')
+    assert (mu['bracket_width_eV'] <= mu['algorithm_abs_tol_eV'] or
+            math.nextafter(mu['lower_eV'], mu['upper_eV']) == mu['upper_eV'])
+    assert abs(mu['value_relative_eV']-known) <= mu['uncertainty_eV'] + M1_ROUNDOFF
+    m1_check_literal_report(report)
+    if quarter_capacity:
+        # Centered f=1/2 alone cannot distinguish swapped f and (1-f).
+        for row in report['represented_current_bound']['boundary_coefficients'].values():
+            assert row['one_minus_f_gamma_norm'] > 2*row['f_gamma_norm']
+
+
+def test_M1_02_full_complex_current_bound(archive):
+    # Catches abs(ReJ)-only validation and discarded imaginary norm components.
+    m1_archive(archive, imaginary=True)
+    report = diagnose(archive, mu_algorithm_abs_tol_eV=1e-12)
+    m1_check_literal_report(report, imaginary=True)
+    assert report['currents']['plus']['normalized_imaginary_A_per_m2'] > 0
+
+
+def test_M1_03_zero_boundary_is_measured_zero_with_defined_mu(archive):
+    m1_archive(archive, zero_boundary=True)
+    report = diagnose(archive)
+    assert report['mu']['status'] == 'measured'
+    bound = m1_bound_namespace(report)
+    assert bound['state_defects']['normalized']['sum_norm'] > 0
+    for side in ('plus', 'minus'):
+        row = bound['boundary_coefficients'][side]
+        assert row['status'] == 'measured' and row['reason'] is None
+        for name in ('one_minus_f_gamma_norm', 'f_gamma_norm', 'sigma_fdr_defect_norm'):
+            assert row[name] == 0
+        for variant in ('raw', 'normalized'):
+            result = bound['bounds'][side][variant]
+            m1_row(result, 0, 'A/m^2')
+            for key in ('value', 'occupied_term', 'empty_term', 'selfenergy_term'):
+                assert result[key] == 0
+            assert report['currents'][side][variant+'_outward_A_per_m2'] == 0
+
+
+@pytest.mark.parametrize('unavailable,status,reason', [
+    ('missing_context', 'not_measured', 'missing_model_context'),
+    ('finite_drive', 'not_applicable', 'finite_drive'),
+    ('unequal_lo', 'not_applicable', 'unequal_LO_temperature'),
+    ('ee', 'unsupported_context', 'unsupported_electron_electron_closure'),
+    ('empty', 'not_measured', 'empty_represented_spectrum'),
+    ('iteration_limit', 'algorithm_limit', 'algorithm_limit')])
+def test_M1_04_missing_mu_precedes_zero_boundary(archive, unavailable, status, reason):
+    m1_archive(archive, zero_boundary=True)
+    options = {}
+    if unavailable == 'missing_context':
+        del archive[1]['stationary_assessment']['model_context']
+        publish(archive[0], archive[1])
+    elif unavailable == 'finite_drive':
+        mutate(archive, lambda h: h['inputs/F_bias_V_per_m'].__setitem__((), 1))
+    elif unavailable == 'unequal_lo':
+        mutate(archive, lambda h: h['inputs/T_LO_K'].__setitem__((), 71))
+    elif unavailable == 'ee':
+        archive[1]['stationary_assessment']['model_context']['physical_models']['electron_electron']['mode'] = 'closure'
+        publish(archive[0], archive[1])
+    elif unavailable == 'empty':
+        mutate(archive, lambda h: replace_complex(h, 'state_dimensionless/A', np.zeros((1, 2, 2, 2), complex)))
+    else:
+        options['mu_max_iterations'] = 1
+    report = diagnose(archive, **options)
+    assert report['mu']['status'] == status and report['mu']['reason'] == reason
+    assert report['mu']['value_relative_eV'] is None
+    bound = m1_bound_namespace(report)
+    assert bound['spectral_norm']['status'] == 'measured'
+    for row in bound['normalization_correction_norms'].values():
+        assert row['status'] == 'measured'
+    groups = [(bound['state_defects'][v], ('occupied_norm', 'empty_norm', 'sum_norm')) for v in ('raw', 'normalized')]
+    groups += [(bound['boundary_coefficients'][s], ('one_minus_f_gamma_norm', 'f_gamma_norm', 'sigma_fdr_defect_norm')) for s in ('plus', 'minus')]
+    groups += [(bound['bounds'][s][v], ('value', 'occupied_term', 'empty_term', 'selfenergy_term'))
+               for s in ('plus', 'minus') for v in ('raw', 'normalized')]
+    for row, keys in groups:
+        assert row['status'] == status and row['reason'] == reason
+        for key in keys:
+            assert row[key] is None
+
+
+def test_M1_05_additive_healthy_compatibility_and_no_extra_matrix_reads(archive, monkeypatch):
+    # Existing nonuniform 5E fixture and its helper arithmetic are unchanged.
+    reads = []
+    original = StateReader.read
+    def read(reader, path, *args, **kwargs):
+        if path.startswith(('state_dimensionless/', 'selfenergy_dimensionless/')):
+            reads.append(path)
+        return original(reader, path, *args, **kwargs)
+    monkeypatch.setattr(StateReader, 'read', read)
+    report = diagnose(archive, mu_algorithm_abs_tol_eV=1e-12)
+    bound = m1_bound_namespace(report)
+    assert bound['spectral_norm']['status'] == 'measured'
+    assert report['fdr']['raw']['value'] < 2e-10
+    assert report['fdr']['normalized']['value'] < 2e-10
+    # Two k planes, one tile; A in both passes, all other matrices once.
+    expected = {f'state_dimensionless/{name}/{part}': (4 if name == 'A' else 2)
+                for name in ('A', 'GR', 'GL', 'GG') for part in ('real', 'imag')}
+    expected.update({f'selfenergy_dimensionless/{family}/{component}/{part}': 2
+                     for family in FAMILIES+BOUNDARIES for component in ('SL', 'SG') for part in ('real', 'imag')})
+    assert set(reads) == set(expected)
+    for path, count in expected.items():
+        assert reads.count(path) == count
+
+
+def test_M1_06_bound_scalar_overflow_rejected(archive):
+    # Finite arrays/norms and small signed currents can coexist with an
+    # overflowing absolute bound term. Never publish measured Inf or null.
+    m1_archive(archive)
+    def enlarge(h):
+        for name in ('GL', 'GG'):
+            for part in ('real', 'imag'):
+                ds = h[f'state_dimensionless/{name}/{part}']
+                ds[...] = 64*ds[...]
+        h['scales/J0_A_per_m2'][()] = 1e308
+    mutate(archive, enlarge)
+    error(archive, 'invalid_data')
+
+
+def test_M1_07_bound_report_cap_is_not_truncated(archive):
+    m1_archive(archive)
+    report = diagnose(archive)
+    m1_bound_namespace(report)
+    old = {key: value for key, value in report.items() if key != 'represented_current_bound'}
+    old_size = len(json.dumps(old, ensure_ascii=False, separators=(',', ':')).encode('utf-8'))
+    limits = api().EquilibriumReadLimits(maximum_io_bytes=32*1024*1024, maximum_report_bytes=old_size)
+    error(archive, 'budget_exceeded', limits=limits)
+
+
+def test_M1_08_missing_boundary_dataset_is_not_zero(archive):
+    m1_archive(archive, zero_boundary=True)
+    mutate(archive, lambda h: h.__delitem__('selfenergy_dimensionless/embedding_plus'))
+    assert 'incomplete embedding inventory' in error(archive, 'invalid_data')
+
+
+def test_M1_09_literal_f0_table_from_scalar_entries():
+    # Independent exact dyadic entry identities underpin the runtime oracle.
+    # This checks the manufactured table, not a second copy of product kernels.
+    gamma_plus = ((1/2, 1j/8), (-1j/8, 1/4))
+    gamma_minus = ((1/4, (1+1j)/16), ((1-1j)/16, 1/2))
+    x = ((0, 1), (1, 0))
+    y = ((0, 1j), (-1j, 0))
+    for gamma, norm_squared in ((gamma_plus, 11/32), (gamma_minus, 21/64)):
+        assert math.fsum(z.real*z.real + z.imag*z.imag for row in gamma for z in row) == norm_squared
+    # Both commutators are nonzero at a literal diagonal entry; no matrix
+    # multiplication or product arithmetic helper enters these expectations.
+    assert gamma_plus[0][1]*x[1][0] - x[0][1]*gamma_plus[1][0] == 1j/4
+    assert gamma_minus[0][1]*y[1][0] - y[0][1]*gamma_minus[1][0] == -1j/8
+    assert math.fsum((1/4, 3/4)) == 1
+    m1_close(math.fsum((1/4*(1/128), 3/4*(1/64)))*M1_M, M1_L)
+    m1_close(math.fsum((1/4*(1/128)**2, 3/4*(1/64)**2))*M1_M, M1_R)
+    # Full complex offdiagonal n,p,c norms at exactly f0=1/2.
+    for nxy, pxy, literal in [((1, 1), (-1, -1), (4, 4, 0)),
+                               ((2, 1), (-1, 2), (10, 10, 20))]:
+        assert 2*(nxy[0]**2+nxy[1]**2) == literal[0]
+        assert 2*(pxy[0]**2+pxy[1]**2) == literal[1]
+        assert 2*((nxy[0]+pxy[0])**2+(nxy[1]+pxy[1])**2) == literal[2]
+    m1_close(-M1_L/8-2*M1_R, -69*M1_M/32768)
+    m1_close(M1_L/8-6*M1_R, 17*M1_M/32768)
