@@ -135,6 +135,59 @@ def _ratio(numerator: _Norm, denominator: _Norm) -> dict[str, Any]:
     return dict(result, status='undefined_ratio', reason='undefined_zero_denominator', value=None)
 
 
+def _represented_current_bound(norms: Mapping[str, _Norm],
+        state_norms: Mapping[str, Mapping[str, _Norm]],
+        side_norms: Mapping[str, Mapping[str, _Norm]],
+        mu: Mapping[str, Any], j0: float) -> dict[str, Any]:
+    """SCI03-5.3 exact-arithmetic represented trace RHS, not acceptance.
+
+    Norms use the existing common fitted mu and complete stored matrices.
+    The Float64 evaluation is not an outward-rounded arithmetic enclosure.
+    """
+    defined = mu['value_relative_eV'] is not None
+    status, reason = ('measured', None) if defined else (mu['status'], mu['reason'])
+    spectral = norms['A'].magnitude()
+    corrections = {name: dict(status='measured', reason=None, units='1', value=norms[key].magnitude())
+                   for name, key in (('occupied', 'corr_n'), ('empty', 'corr_p'))}
+    states = {variant: dict(status=status, reason=reason, units='1',
+        **{key: value.magnitude() if defined else None for key, value in values.items()})
+        for variant, values in state_norms.items()}
+    sides = {side: dict(status=status, reason=reason, units='1',
+        **{key: value.magnitude() if defined else None for key, value in values.items()})
+        for side, values in side_norms.items()}
+    bounds = {}
+    for side, coefficients in sides.items():
+        bounds[side] = {}
+        for variant, defects in states.items():
+            row = dict(status=status, reason=reason, units='A/m^2', value=None,
+                       occupied_term=None, empty_term=None, selfenergy_term=None)
+            # Inherit missing-mu status before any literal-zero shortcut.
+            if defined:
+                occupied = _finite(coefficients['one_minus_f_gamma_norm'] * defects['occupied_norm'],
+                                   'represented current occupied product')
+                empty = _finite(coefficients['f_gamma_norm'] * defects['empty_norm'],
+                                'represented current empty product')
+                spectral_sum = _finite(spectral + defects['sum_norm'], 'represented current spectral/defect sum')
+                selfenergy = _finite(coefficients['sigma_fdr_defect_norm'] * spectral_sum,
+                                     'represented current selfenergy product')
+                total = _Sum()
+                for key, term in (('occupied_term', occupied), ('empty_term', empty),
+                                  ('selfenergy_term', selfenergy)):
+                    value = _finite(j0 * term, 'represented current SI term')
+                    row[key] = value
+                    total.add(value)
+                row['value'] = total.value()
+            bounds[side][variant] = row
+    return dict(contract='SCI03-5.3-represented-current-v1',
+        norm='absolute weighted full complex Frobenius', weight='gs*wE*wk/(2*pi)',
+        normalization='none', reference_mu='mu.value_relative_eV',
+        spectral_norm=dict(status='measured', reason=None, units='1', value=spectral),
+        normalization_correction_norms=corrections, state_defects=states,
+        boundary_coefficients=sides, bounds=bounds,
+        arithmetic_error_status='not_measured', arithmetic_error_bound=None,
+        scope='represented exact-arithmetic complex trace; no acceptance')
+
+
 def _plain(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {key: _plain(item) for key, item in value.items()}
@@ -383,8 +436,15 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         # Conservative live-array/scratch forecast. Adaptive tiles retain a
         # complete basis plane; no diagonal-only fallback is permitted.
         vector_scratch = 4096 + 32 * nk + 16 * nb + 512 * len(descriptions)
-        fixed_workspace = 10 * 8 * ne + vector_scratch
-        per_energy_workspace = 24 * 16 * nb * nb
+        # Add fixed scalar-accumulator/report reserve (4 KiB + 8 KiB). This
+        # accounting covers numeric scratch, not Python/HDF caches or total RSS.
+        bound_scratch = 4096 + 8 * 1024
+        fixed_workspace = 10 * 8 * ne + vector_scratch + bound_scratch
+        # Eight extra complex tile slots cover at most three live state-defect
+        # buffers, or four side-coefficient buffers, plus O(tile) f/1-f and
+        # finite-check scratch. State defects are released before side reads;
+        # side coefficients before existing flux matrix products. No new GEMM.
+        per_energy_workspace = 32 * 16 * nb * nb
         if fixed_workspace + per_energy_workspace > limits.maximum_workspace_bytes:
             _error('complete matrix plane and scratch exceed workspace cap', 'budget_exceeded')
         available_tile = (limits.maximum_workspace_bytes-fixed_workspace) // per_energy_workspace
@@ -463,6 +523,10 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         fitted = mu['value_relative_eV']
         fermi = None if fitted is None else _fd(eev, fitted, kt)
         norms = {name: _Norm() for name in ('A', 'raw_fdr', 'norm_fdr', 'corr_n', 'corr_p', 'raw_n', 'raw_p')}
+        state_norms = {variant: {key: _Norm() for key in ('occupied_norm', 'empty_norm', 'sum_norm')}
+                       for variant in ('raw', 'normalized')}
+        side_norms = {side: {key: _Norm() for key in ('one_minus_f_gamma_norm', 'f_gamma_norm', 'sigma_fdr_defect_norm')}
+                      for side in ('plus', 'minus')}
         numbers = {name: _Sum() for name in ('raw', 'raw_empty', 'normalized', 'normalized_empty')}
         number_imag = {name: _Sum() for name in numbers}
         flux = {side: {kind: (_Sum(), _Sum()) for kind in ('raw', 'normalized')} for side in ('plus', 'minus')}
@@ -488,12 +552,27 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
                     number_imag[name].add(float(w) * float(value.imag))
             if fermi is not None:
                 f = fermi[start:stop, None, None]
-                for accumulator, occupied, empty in [('raw_fdr', gn, gp), ('norm_fdr', normalized_n, normalized_p)]:
-                    norms[accumulator].add(occupied-f*a, weight)
-                    norms[accumulator].add(empty-(1-f)*a, weight)
+                one_minus_f = 1-f
+                for variant, accumulator, occupied, empty in [('raw', 'raw_fdr', gn, gp), ('normalized', 'norm_fdr', normalized_n, normalized_p)]:
+                    delta_n = occupied-f*a
+                    delta_p = empty-one_minus_f*a
+                    norms[accumulator].add(delta_n, weight)
+                    norms[accumulator].add(delta_p, weight)
+                    state_norms[variant]['occupied_norm'].add(delta_n, weight)
+                    state_norms[variant]['empty_norm'].add(delta_p, weight)
+                    # Sum the complete defects; never assume N+P=A or use n+p.
+                    state_norms[variant]['sum_norm'].add(delta_n+delta_p, weight)
+                    del delta_n, delta_p
             for side, family in [('plus', 'embedding_plus'), ('minus', 'embedding_minus')]:
                 sl = read_complex(f'selfenergy_dimensionless/{family}/SL', selection)
                 sg = read_complex(f'selfenergy_dimensionless/{family}/SG', selection)
+                if fermi is not None:
+                    sn = -1j*sl
+                    gamma = sn+1j*sg
+                    side_norms[side]['one_minus_f_gamma_norm'].add(one_minus_f*gamma, weight)
+                    side_norms[side]['f_gamma_norm'].add(f*gamma, weight)
+                    side_norms[side]['sigma_fdr_defect_norm'].add(sn-f*gamma, weight)
+                    del sn, gamma
                 for kind, lesser, greater in [('normalized', gl, gg), ('raw', 1j*gn, -1j*gp)]:
                     trace = _finite(np.trace(sg @ lesser - sl @ greater, axis1=-2, axis2=-1), 'boundary flux')
                     for w, value in zip(weight, trace):
@@ -529,6 +608,7 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
                              numerator_squared=None, denominator_squared=norms['A'].squared()) for name in ('raw', 'normalized')}
         else:
             fdr = dict(raw=_ratio(norms['raw_fdr'], norms['A']), normalized=_ratio(norms['norm_fdr'], norms['A']))
+        represented_bound = _represented_current_bound(norms, state_norms, side_norms, mu, scales['J0_A_per_m2'])
         budgets = dict(reader.io_counters)
         budgets.update(workspace_forecast_bytes=workspace_forecast, logical_two_pass_forecast_bytes=logical_forecast,
                        energy_tile_nodes=tile_nodes, workspace_scope='numeric arrays and scratch; not total process RSS')
@@ -537,6 +617,7 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
                 'iterative_converged', 'fixed_hartree_converged', 'outer_confirmation_count', 'fixture_solver_status'
                 ) if isinstance(assessment, Mapping) and name in assessment},
             applicability=applicability, mu=mu, fdr=fdr, numbers=number_report, currents=currents,
+            represented_current_bound=represented_bound,
             corrections=dict(occupied=_ratio(norms['corr_n'], norms['raw_n']), empty=_ratio(norms['corr_p'], norms['raw_p'])),
             spectral=dict(represented_capacity_dimensionless=capacity, represented_capacity_per_m2=capacity/l02,
                           minimum_number_weight=float(np.min(q)), imaginary_trace_dimensionless=spectral_imag.value()),
