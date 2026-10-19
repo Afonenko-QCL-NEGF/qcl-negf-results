@@ -166,6 +166,10 @@ as the independent owner. For a standalone editable Contracts dependency, set
 `QCL_NEGF_TEST_CONTRACTS_SOURCE` to its absolute `src` directory when running tests.
 This selects an expected source location; it does not change scientific criteria.
 
+Standalone distribution ownership and wrong-version unit tests use synthetic
+`dist-info` metadata. They verify the metadata selection and rejection branches;
+they do not establish an actual wheel installation or import from that wheel.
+
 The integration suite runs an actual Julia SCBA producer concurrently with export.
 The superproject includes it in `deno task test --julia` and its full test pipeline.
 To run it directly from this repository:
