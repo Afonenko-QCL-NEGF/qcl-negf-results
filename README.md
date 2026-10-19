@@ -236,3 +236,41 @@ bounded fixed-width grid/weight vectors without requiring their absent coordinat
 JSON. Matrix `read` retains its explicit coordinate/weight contract. Optional
 `StateReader(maximum_io_bytes=...)` enables the same physical I/O guard for other
 callers, while `source` is an immutable certificate built from constructor proofs.
+
+### Чтение `represented_current_bound`
+
+Тот же `diagnose_stored_equilibrium` добавляет optional namespace
+`represented_current_bound` с `contract='SCI03-5.3-represented-current-v1'`.
+Аргументы вызова и два прохода чтения сохраняются. Формулы и область их
+применимости заданы в [Research §5.3](https://github.com/Afonenko-QCL-NEGF/qcl-negf-research/blob/3ed8a9fe5f16f51bbcb7547ff2d677e8d3608731/docs/equilibrium-measurement-contract.md#53-абсолютный-represented-current-без-divisionj),
+а точные поля — в приложении A.3 того же контракта.
+
+Сначала проверьте `applicability` и `mu`: обе версии состояния и обе стороны
+используют одну `mu.value_relative_eV`. Если она недоступна, `state_defects`,
+`boundary_coefficients` и строки `bounds` наследуют её `status`/`reason`, а все
+зависимые значения и слагаемые равны `null`, даже при нулевых граничных матрицах.
+Независимые от μ `spectral_norm` и `normalization_correction_norms` могут
+оставаться измеренными.
+
+| Поля внутри namespace | Как читать |
+| --- | --- |
+| `spectral_norm.value` | Абсолютная норма сохранённой спектральной матрицы A. |
+| `normalization_correction_norms.occupied` / `.empty` | Абсолютные нормы изменения occupied/empty матриц при нормализации; это не FDR defects и не прежние относительные `corrections`. |
+| `state_defects.raw` / `.normalized` | `occupied_norm` и `empty_norm` — нормы отклонений от общей FDR; `sum_norm` — норма суммы самих матричных отклонений, а не сумма двух норм. |
+| `boundary_coefficients.plus` / `.minus` | `one_minus_f_gamma_norm` и `f_gamma_norm` — нормы Γ данной стороны с весами незаполнения и заполнения; `sigma_fdr_defect_norm` — норма её self-energy FDR defect. |
+| `bounds.plus` / `.minus`, затем `.raw` / `.normalized` | `value` — сумма `occupied_term`, `empty_term`, `selfenergy_term`: RHS абсолютной оценки для каждой стороны и версии отдельно. Баланс сторон её не заменяет. |
+
+Все нормы — абсолютные взвешенные нормы Фробениуса полных комплексных матриц,
+включая внедиагональные и мнимые элементы, в сохранённом домене `E,k,a,b`.
+Они используют те же веса квадратур и спиновый множитель, что и токи; их
+`units='1'`, `normalization='none'`. Слагаемые и `bounds` имеют `units='A/m^2'`
+и относятся к модулю комплексного граничного тока. Деления на ток или
+нормировочного floor нет.
+
+В строке `bounds` статус `measured` означает измеренный Float64 RHS
+алгебраической оценки в точной арифметике для представленного состояния.
+Он не является вычисленной с округлением наружу гарантированной границей:
+`arithmetic_error_status` остаётся
+`not_measured`, `arithmetic_error_bound=null`. Даже нулевой RHS не доказывает
+точный нулевой ток. Сходимость, ошибки дискретизации, точность относительно
+эксперимента и научная приёмка из этих полей не следуют.
