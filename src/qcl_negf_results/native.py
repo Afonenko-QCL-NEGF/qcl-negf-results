@@ -197,3 +197,121 @@ def validate_native_handle(handle: Any, role: str | None = None,
         parent = handle[path] if path else handle
         validate_scba_diagnostics(parent, _scba_count(parent))
     return schema
+
+
+_FINAL_AUDIT_SCHEMA = "qcl-negf-final-fixed-point-audit-v1"
+_FINAL_AUDIT_PATH = "diagnostics/final_fixed_point_audit"
+
+
+def _audit_error(message: str) -> None:
+    from qcl_negf_contracts.messages import ContractError
+    raise ContractError(f"final audit native layout: {message}", "corrupt_result")
+
+
+def _audit_attribute(parent: Any, name: str, expected: str) -> None:
+    """Profile A for the four new constants, on the caller's budgeted handle."""
+    from contextlib import ExitStack
+    import h5py
+    with ExitStack() as ids:
+        try:
+            attribute = parent.attrs.get_id(name)
+        except KeyError:
+            _audit_error(f"missing {name} attribute")
+        ids.callback(attribute.close)
+        datatype = attribute.get_type()
+        ids.callback(datatype.close)
+        space = attribute.get_space()
+        ids.callback(space.close)
+        # Do not ask an arbitrary file type for a NumPy dtype before these
+        # checks: a vlen pointer size is not a bound on its heap payload.
+        if (datatype.get_class() != h5py.h5t.STRING or datatype.is_variable_str()
+                or space.get_simple_extent_type() != h5py.h5s.SCALAR
+                or space.get_simple_extent_dims() != ()):
+            _audit_error(f"{name} requires an atomic fixed-string scalar")
+        width = datatype.get_size()
+        charset, padding = datatype.get_cset(), datatype.get_strpad()
+        if (not len(expected.encode("utf-8")) <= width <= 65536
+                or charset not in (h5py.h5t.CSET_ASCII, h5py.h5t.CSET_UTF8)
+                or padding not in (h5py.h5t.STR_NULLTERM, h5py.h5t.STR_NULLPAD,
+                                   h5py.h5t.STR_SPACEPAD)):
+            _audit_error(f"{name} has unsupported width, charset or padding")
+        raw = _read_audit_attribute_bytes(attribute, datatype, width)
+        raw = raw.rstrip(b" " if padding == h5py.h5t.STR_SPACEPAD else b"\0")
+        if b"\0" in raw:
+            _audit_error(f"{name} has an embedded NUL or hidden suffix")
+        try:
+            value = raw.decode("ascii" if charset == h5py.h5t.CSET_ASCII else "utf-8", "strict")
+        except UnicodeError:
+            _audit_error(f"{name} has invalid string bytes")
+        if value != expected:
+            _audit_error(f"{name} attribute differs from the D2 contract")
+
+
+def _read_audit_attribute_bytes(attribute: Any, datatype: Any, width: int) -> bytes:
+    import numpy as np
+    target = np.empty((), dtype=np.dtype(f"S{width}"))
+    attribute.read(target, mtype=datatype)
+    return target.tobytes()
+
+
+def _read_audit_scalar_bytes(dataset: Any, datatype: Any) -> bytes:
+    import h5py
+    import numpy as np
+    target = np.empty((), dtype=dataset.dtype)
+    # The identical memory datatype prevents HDF5 string conversion from
+    # truncating an embedded NUL or hiding invalid bytes behind NULLTERM.
+    dataset.id.read(h5py.h5s.ALL, h5py.h5s.ALL, target, mtype=datatype)
+    return target.tobytes()
+
+
+def _read_final_fixed_point_audit(handle: Any) -> bytes | None:
+    """Private fixed-width scalar read; caller owns hashes and stream budget.
+
+    This performs no numerical measurement or scientific acceptance evaluation.
+    The supplied handle must use the caller's existing physical-I/O stream.
+    """
+    import h5py
+    from qcl_negf_contracts.final_audit import MAX_FINAL_AUDIT_BYTES
+    parent = handle
+    for name in _FINAL_AUDIT_PATH.split("/"):
+        if name not in parent:
+            return None
+        if not isinstance(parent.get(name, getlink=True), h5py.HardLink):
+            _audit_error("record path must use internal hard links")
+        parent = parent[name]
+        if not isinstance(parent, h5py.Group):
+            _audit_error("record path must contain groups")
+    if len(parent) != 1 or "record_json" not in parent:
+        _audit_error("record group requires exactly record_json")
+    if not isinstance(parent.get("record_json", getlink=True), h5py.HardLink):
+        _audit_error("record dataset must use an internal hard link")
+    dataset = parent["record_json"]
+    if (not isinstance(dataset, h5py.Dataset) or dataset.shape != ()
+            or dataset.dtype.kind != "S" or dataset.dtype.hasobject
+            or not 1 <= dataset.dtype.itemsize <= MAX_FINAL_AUDIT_BYTES):
+        _audit_error("record_json must be a fixed string scalar of 1..65536 bytes")
+    datatype = dataset.id.get_type()
+    creation = dataset.id.get_create_plist()
+    if (datatype.get_class() != h5py.h5t.STRING or datatype.is_variable_str()
+            or datatype.get_cset() != h5py.h5t.CSET_UTF8
+            or dataset.chunks is not None or dataset.compression is not None
+            or creation.get_nfilters() or dataset.external or dataset.is_virtual):
+        _audit_error("record_json requires fixed UTF-8 without chunks, filters or external storage")
+    _audit_attribute(parent, "schema", _FINAL_AUDIT_SCHEMA)
+    for name, expected in (
+            ("units", "1"), ("logical_axis_order", "scalar"),
+            ("description", "Versioned final fixed-point raw measurement record")):
+        _audit_attribute(dataset, name, expected)
+    # Preserve every storage byte. NumPy's scalar bytes conversion otherwise
+    # drops trailing NULs; reading into the declared dtype keeps padding explicit.
+    raw = _read_audit_scalar_bytes(dataset, datatype)
+    padding = datatype.get_strpad()
+    if padding == h5py.h5t.STR_SPACEPAD:
+        raw = raw.rstrip(b" ")
+    elif padding in (h5py.h5t.STR_NULLPAD, h5py.h5t.STR_NULLTERM):
+        raw = raw.rstrip(b"\0")
+    else:
+        _audit_error("unsupported fixed-string padding")
+    if not raw or b"\0" in raw:
+        _audit_error("empty record or embedded NUL")
+    return raw
