@@ -915,3 +915,65 @@ def test_M1_09_literal_f0_table_from_scalar_entries():
         assert 2*((nxy[0]+pxy[0])**2+(nxy[1]+pxy[1])**2) == literal[2]
     m1_close(-M1_L/8-2*M1_R, -69*M1_M/32768)
     m1_close(M1_L/8-6*M1_R, 17*M1_M/32768)
+
+
+def test_arithmetic_opt_in_off_hash_and_caps(archive):
+    """Manufactured native-v4 integration; legacy M1 remains not_measured."""
+    import struct
+    m1_archive(archive, zero_boundary=True)
+    a = api()
+    plain = diagnose(archive)
+    assert 'represented_current_arithmetic_enclosure' not in plain
+    cap = a.EquilibriumArithmeticLimits(16, 4, 20_000_000, 65536, 8*1024*1024, 180.)
+    report = diagnose(archive, arithmetic_limits=cap)
+    enclosure = report['represented_current_arithmetic_enclosure']
+    assert enclosure['status'] == 'enclosed'
+    assert report['represented_current_bound']['arithmetic_error_status'] == 'not_measured'
+    # Hash identifies the existing represented f values, not true FD accuracy.
+    f = a._fd(np.array([0.])*report['scales']['E0_eV'], report['mu']['value_relative_eV'], KT)
+    assert enclosure['f_count'] == 1
+    assert enclosure['f_binary64_sha256'] == hashlib.sha256(b''.join(struct.pack('<d', float(x)) for x in f)).hexdigest()
+    for rows in enclosure['rows'].values():
+        for row in rows.values():
+            assert row['current_real'] == {'lower': 0., 'upper': 0.}
+            assert row['rhs'] == {'lower': 0., 'upper': 0.}
+    rejected = a.EquilibriumArithmeticLimits(1, 1, 1, 64, 1024, 1.)
+    result = diagnose(archive, arithmetic_limits=rejected)['represented_current_arithmetic_enclosure']
+    assert result['status'] == 'budget_exceeded'
+    assert all(row['rhs'] is None for rows in result['rows'].values() for row in rows.values())
+
+
+def test_arithmetic_public_minimum_subnormal_not_false_zero(archive):
+    m1_archive(archive, zero_boundary=True)
+    t = math.ulp(0.)
+    z = np.zeros((1, 2, 2, 2), complex)
+    spectral = z.copy()
+    spectral[0, 1] = 2*np.eye(2)  # Distinct spectral cell makes μ defined.
+    gr, gl = z.copy(), z.copy()
+    gr[0, 0] = np.eye(2)
+    gl[0, 0, 0, 0] = 1j*t
+    plus_sg, internal_sl, internal_sg = z.copy(), z.copy(), z.copy()
+    plus_sg[0, 0, 0, 0] = -1j*t
+    internal_sl[0, 0, 0, 0] = 1j*t
+    internal_sg[0, 0, 0, 0] = 1j*t  # Cancels embedding_total SG exactly.
+    def install(h):
+        for name, values in [('A', spectral), ('GR', gr), ('GL', gl), ('GG', z)]:
+            replace_complex(h, 'state_dimensionless/'+name, values)
+        for family in FAMILIES+BOUNDARIES:
+            for part in ('SL', 'SG'):
+                values = z
+                if family == 'LO':
+                    values = internal_sl if part == 'SL' else internal_sg
+                elif family in ('embedding_total', 'embedding_plus') and part == 'SG':
+                    values = plus_sg
+                replace_complex(h, f'selfenergy_dimensionless/{family}/{part}', values)
+    mutate(archive, install)
+    cap = api().EquilibriumArithmeticLimits(16, 4, 20_000_000, 65536, 8*1024*1024, 180.)
+    report = diagnose(archive, arithmetic_limits=cap)
+    assert report['mu']['value_relative_eV'] is not None
+    result = report['represented_current_arithmetic_enclosure']
+    assert result['status'] == 'enclosed'
+    # Exact target J0*(2/(2π))*(3/8)*(1/4)*2^-2148 is strictly positive.
+    for variant in ('raw', 'normalized'):
+        row = result['rows']['plus'][variant]
+        assert row['current_real']['upper'] > 0 and row['rhs']['upper'] > 0
