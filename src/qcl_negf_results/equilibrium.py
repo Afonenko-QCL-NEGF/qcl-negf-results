@@ -17,6 +17,9 @@ import numpy as np
 
 from qcl_negf_contracts.messages import ContractError
 from .state import StateReader
+from ._equilibrium_arithmetic import (
+    EquilibriumArithmeticLimits, _Enclosure, _Budget, _Invalid, _report as _arithmetic_report,
+)
 
 _SCATTERING = ('LO', 'acoustic', 'impurity', 'IFR', 'alloy')
 _EMBEDDING = ('embedding_total', 'embedding_plus', 'embedding_minus')
@@ -340,7 +343,8 @@ def _fit_mu(q: np.ndarray, energies: np.ndarray, target: float, kt: float, e0: f
 
 def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: Mapping[str, Any],
         limits: EquilibriumReadLimits, mu_algorithm_abs_tol_eV: float | None = None,
-        mu_max_iterations: int = 128) -> dict[str, Any]:
+        mu_max_iterations: int = 128,
+        arithmetic_limits: EquilibriumArithmeticLimits | None = None) -> dict[str, Any]:
     """Two bounded passes over stored full matrices; no acceptance inference.
 
     Raw correlations use exactly the stored dictionary plus embedding_total.
@@ -450,10 +454,31 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         available_tile = (limits.maximum_workspace_bytes-fixed_workspace) // per_energy_workspace
         single_fixed = 8 * (2 + 2 * nb)
         available_single = (limits.maximum_single_read_bytes-single_fixed) // (8 * (nb * nb+2))
-        tile_nodes = min(ne, limits.energy_tile_nodes, available_tile, available_single)
+        tile_nodes = min(ne, limits.energy_tile_nodes, available_tile, available_single,
+                         1 if arithmetic_limits is not None else ne)
         if tile_nodes < 1:
             _error('complete matrix plane and coordinates exceed single-read cap', 'budget_exceeded')
         workspace_forecast = fixed_workspace + tile_nodes * per_energy_workspace
+        arithmetic_engine = None
+        arithmetic_status, arithmetic_reason = 'enclosed', None
+        if arithmetic_limits is not None:
+            if not isinstance(arithmetic_limits, EquilibriumArithmeticLimits):
+                raise ValueError('arithmetic_limits must be EquilibriumArithmeticLimits or None')
+            try:
+                arithmetic_engine = _Enclosure(arithmetic_limits, ne*nk, nb, len(enabled),
+                    limits.maximum_workspace_bytes-workspace_forecast)
+            except _Budget as error:
+                arithmetic_status, arithmetic_reason = 'budget_exceeded', str(error)
+
+        def exact_call(method, *args):
+            nonlocal arithmetic_status, arithmetic_reason
+            if arithmetic_engine is None or arithmetic_status != 'enclosed':
+                return
+            try:
+                getattr(arithmetic_engine, method)(*args)
+            except (_Budget, _Invalid) as error:
+                arithmetic_status = 'budget_exceeded' if isinstance(error, _Budget) else 'invalid_data'
+                arithmetic_reason = str(error)
         # Logical forecast includes duplicate coordinates/weights for each real
         # and imaginary read, A twice, every other required matrix once.
         matrix_components = 2 * (5 + 2 * len(enabled) + 6)
@@ -522,6 +547,8 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         del qtotal, qcorrection
         fitted = mu['value_relative_eV']
         fermi = None if fitted is None else _fd(eev, fitted, kt)
+        if fermi is not None:
+            exact_call('set_fermi', fermi)
         norms = {name: _Norm() for name in ('A', 'raw_fdr', 'norm_fdr', 'corr_n', 'corr_p', 'raw_n', 'raw_p')}
         state_norms = {variant: {key: _Norm() for key in ('occupied_norm', 'empty_norm', 'sum_norm')}
                        for variant in ('raw', 'normalized')}
@@ -532,10 +559,20 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         flux = {side: {kind: (_Sum(), _Sum()) for kind in ('raw', 'normalized')} for side in ('plus', 'minus')}
         for start, stop, selection, weight in blocks():
             a, gr, gl, gg = (read_complex('state_dimensionless/' + name, selection) for name in ('A', 'GR', 'GL', 'GG'))
+            if fermi is not None and arithmetic_limits is not None:
+                k_index = selection[1].start
+                exact_call('begin', a[0], gr[0], gl[0], gg[0], we[start], wk[k_index], start)
             sl_total, sg_total = np.zeros_like(gr), np.zeros_like(gr)
             for family in (*enabled, 'embedding_total'):
-                sl_total += read_complex(f'selfenergy_dimensionless/{family}/SL', selection)
-                sg_total += read_complex(f'selfenergy_dimensionless/{family}/SG', selection)
+                family_sl = read_complex(f'selfenergy_dimensionless/{family}/SL', selection)
+                family_sg = read_complex(f'selfenergy_dimensionless/{family}/SG', selection)
+                if fermi is not None and arithmetic_limits is not None:
+                    exact_call('total', family_sl[0], family_sg[0])
+                sl_total += family_sl
+                sg_total += family_sg
+                del family_sl, family_sg
+            if fermi is not None:
+                exact_call('raw')
             ga = gr.conj().swapaxes(-1, -2)
             gn = _finite(-1j * (gr @ sl_total @ ga), 'raw occupied Keldysh')
             gp = _finite(1j * (gr @ sg_total @ ga), 'raw empty Keldysh')
@@ -566,6 +603,8 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
             for side, family in [('plus', 'embedding_plus'), ('minus', 'embedding_minus')]:
                 sl = read_complex(f'selfenergy_dimensionless/{family}/SL', selection)
                 sg = read_complex(f'selfenergy_dimensionless/{family}/SG', selection)
+                if fermi is not None and arithmetic_limits is not None:
+                    exact_call('side', side, sl[0], sg[0])
                 if fermi is not None:
                     sn = -1j*sl
                     gamma = sn+1j*sg
@@ -626,6 +665,12 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
                 outside_window='not_determined', basis_contract='finite represented basis'),
             scales=scales, budgets=budgets,
             interpretation='stored-state measurements; no fresh SCBA, convergence, discretization or experimental acceptance')
+        if arithmetic_limits is not None:
+            namespace = _arithmetic_report(arithmetic_engine, arithmetic_status, arithmetic_reason,
+                mu, gs, scales['J0_A_per_m2'], currents, represented_bound)
+            if len(json.dumps(namespace, allow_nan=False, separators=(',', ':')).encode('utf-8')) > 8192:
+                _error('arithmetic namespace exceeds byte budget', 'budget_exceeded')
+            report['represented_current_arithmetic_enclosure'] = namespace
         try:
             encoded = json.dumps(report, ensure_ascii=False, allow_nan=False, separators=(',', ':')).encode('utf-8')
         except (ValueError, OverflowError) as error:

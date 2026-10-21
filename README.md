@@ -274,3 +274,16 @@ callers, while `source` is an immutable certificate built from constructor proof
 `not_measured`, `arithmetic_error_bound=null`. Даже нулевой RHS не доказывает
 точный нулевой ток. Сходимость, ошибки дискретизации, точность относительно
 эксперимента и научная приёмка из этих полей не следуют.
+
+The stored-equilibrium diagnostic accepts opt-in `arithmetic_limits=` with
+`EquilibriumArithmeticLimits` (from `qcl_negf_results.equilibrium`). Its additive
+`represented_current_arithmetic_enclosure` namespace encloses the exact stored
+binary64 formula at the existing represented Float64 Fermi vector, using exact
+raw reconstruction, rational Machin pi and scaled integer square roots. The
+Fermi vector has a canonical little-endian binary64 SHA256. True FD/libm,
+chemical-potential uncertainty, physical scales, discretization and scientific
+acceptance are outside this claim. `enclosed` means containment; legacy M1
+`arithmetic_error_status='not_measured'` is unchanged. Engineering caps reject
+complete enclosure with null rows (`budget_exceeded`), without sampling or
+partial certificates. Integer-bit/operation/object forecasts are conservative
+scratch accounting; an external process RSS and wall-time limit is still needed.
