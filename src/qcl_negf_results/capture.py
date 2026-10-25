@@ -682,10 +682,12 @@ def _final_points(actual, selection, known, *, budget=None):
 
 def observe(spec_path, pid, start_ticks, control_fd):
     """Only this disposable process imports Arrow or touches job/scratch/NFS files."""
-    from .telemetry import TelemetryWriter
-
     budget = ObserverIO(16384)
-    root, spec, known = _spec(spec_path, budget=budget)
+    try:
+        root, spec, known = _spec(spec_path, budget=budget)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        os.close(control_fd)
+        return 2 # No traceback/inherited-log write before capture credit.
     selection = spec["selection"]
     credits = spec["credits"]
     began = time.monotonic()
@@ -784,6 +786,17 @@ def observe(spec_path, pid, start_ticks, control_fd):
         )
 
     try:
+        # Runner publishes this existing token/fullFP locator only after charging
+        # its fixed operational capture reserve. A valid spec alone is not credit.
+        # Waiting/remote I/O is confined to this disposable observer, never reaper.
+        while not (root / "capture-source.json").exists():
+            try:
+                os.read(control_fd, 64)
+                raise ValueError("capture unavailable: no credit locator before terminal")
+            except BlockingIOError:
+                time.sleep(2)
+        _locator(root, spec, budget=budget)  # Refuse corrupt/foreign before ANY output.
+        from .telemetry import TelemetryWriter
         admit()
         writer = writer_call(TelemetryWriter,
             root / "performance",
