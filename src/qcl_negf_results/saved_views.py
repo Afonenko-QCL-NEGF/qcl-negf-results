@@ -9,6 +9,8 @@ from dataclasses import dataclass
 import hashlib
 import json
 import math
+import os
+import stat
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -19,7 +21,7 @@ from qcl_negf_contracts.artifacts import validate_commit
 from qcl_negf_contracts.messages import ContractError, scientific_plan
 from .commits import decode_json, safe_path
 from .provenance import _state_identity
-from .state import _BudgetStream, _IOBudget, _budget_json, _same_json_value, _verify_stream
+from .state import _BudgetStream, _IOBudget, _same_json_value, _verify_stream
 
 
 @dataclass(frozen=True)
@@ -183,19 +185,54 @@ def brief_result(metadata, *, selection, maximum_bytes=1024*1024):
     return _bounded(result, maximum_bytes)
 
 
+def _open_regular(path, *, expected_size=None):
+    """Own one final-component nofollow descriptor until transfer to FileIO."""
+    required = ("O_RDONLY", "O_NOFOLLOW", "O_CLOEXEC", "O_NONBLOCK")
+    if (not all(hasattr(os, name) for name in required) or
+            not all(callable(getattr(os, name, None)) for name in ("open", "fstat", "fdopen"))):
+        _error("unsupported_contract", "saved reads require POSIX nofollow regular-file opens")
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC | os.O_NONBLOCK
+    try:
+        descriptor = os.open(path, flags)
+    except OSError as error:
+        raise ContractError("saved artifact cannot be opened without following links", "corrupt_result") from error
+    try:
+        opened = os.fstat(descriptor)
+        if not stat.S_ISREG(opened.st_mode):
+            _error("corrupt_result", "saved artifact must be an ordinary regular file")
+        if expected_size is not None and opened.st_size != expected_size:
+            _error("corrupt_result", "opened saved artifact length differs from its commit")
+        return os.fdopen(descriptor, "rb", buffering=0)
+    except BaseException as error:
+        os.close(descriptor)
+        if isinstance(error, OSError):
+            raise ContractError("saved artifact descriptor cannot be inspected", "corrupt_result") from error
+        raise
+
+
+def _saved_budget_json(path, maximum, budget):
+    # Keep state._budget_json's exact max+1 delivery/decode contract locally.
+    with _open_regular(path) as raw:
+        with _BudgetStream(raw, budget) as stream:
+            payload = stream.read(maximum + 1)
+    if len(payload) > maximum:
+        _error("corrupt_result", "JSON exceeds its declared budget")
+    return decode_json(payload, str(path)), payload
+
+
 class AnalysisReader:
     """One declared analysis owner, metadata-only description and verified reads."""
     def __init__(self, commit_path, *, expected_identity, limits=None):
         self.limits = limits or SavedViewLimits()
         self._budget = _IOBudget(self.limits.maximum_io_bytes)
-        self._handle = self._stream = None
+        self._handle = self._stream = self._raw = None
         self._metadata_bytes = 0
         self._verified = False
         path = Path(commit_path)
         if path.is_symlink() or any(p.is_symlink() for p in path.parents):
             _error("corrupt_result", "commit path traverses symlink")
         try:
-            self.commit, payload = _budget_json(path, self.limits.maximum_metadata_bytes, self._budget)
+            self.commit, payload = _saved_budget_json(path, self.limits.maximum_metadata_bytes, self._budget)
         except ContractError as error:
             raise ContractError("invalid saved commit metadata", error.code) from error
         self._charge_metadata(len(payload))
@@ -228,16 +265,16 @@ class AnalysisReader:
                 _error("unsupported_contract", "analysis dependency is outside bounded metadata closure")
             self._charge_metadata(dependency.size)
             dependency_path = safe_path(path.parent, dependency.path)
-            with _BudgetStream(dependency_path.open("rb", buffering=0), self._budget) as stream:
-                self._budget.phase = "sha"
-                _verify_stream(stream, dependency.size, dependency.sha256)
+            with _open_regular(dependency_path, expected_size=dependency.size) as raw:
+                with _BudgetStream(raw, self._budget) as stream:
+                    self._budget.phase = "sha"
+                    _verify_stream(stream, dependency.size, dependency.sha256)
             self._budget.phase = "metadata"
             pending.extend(dependency.dependencies)
         self.path = safe_path(path.parent, self.owner.path)
-        if self.path.stat().st_size != self.owner.size:
-            _error("corrupt_result", "analysis owner length differs")
         try:
-            self._stream = _BudgetStream(self.path.open("rb", buffering=0), self._budget)
+            self._raw = _open_regular(self.path, expected_size=self.owner.size)
+            self._stream = _BudgetStream(self._raw, self._budget)
             self._budget.phase = "hdf"
             self._handle = h5py.File(self._stream, "r")
             self._storage()
@@ -270,10 +307,18 @@ class AnalysisReader:
     def __enter__(self): return self
     def __exit__(self, *args): self.close()
     def close(self):
-        if self._handle is not None:
-            self._handle.close(); self._handle = None
-        if self._stream is not None:
-            self._stream.close(); self._stream = None
+        handle, stream, raw = self._handle, self._stream, self._raw
+        self._handle = self._stream = self._raw = None
+        try:
+            if handle is not None:
+                handle.close()
+        finally:
+            try:
+                if stream is not None:
+                    stream.close()
+            finally:
+                if raw is not None:
+                    raw.close()
 
     def _charge_metadata(self, count):
         self._metadata_bytes += count

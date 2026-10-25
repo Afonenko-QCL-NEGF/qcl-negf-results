@@ -337,3 +337,275 @@ def test_genuinely_absent_legacy_extra_identity_remains_unknown(tmp_path):
     assert view["selection"]["calcjob_uuid"] == "provider-job"
     assert view["identity_binding"]["native_recorded_fields"] == sorted(IDENTITY)
     assert view["identity_binding"]["provider_only_fields"] == ["calcjob_uuid", "run_uuid"]
+
+
+def _with_json_dependency(commit):
+    from qcl_negf_results.model import canonical_bytes
+    dependency = commit.parent / "model.json"
+    configuration = {"fixture_only": True}
+    dependency.write_bytes(json_bytes({"schema": "qcl-negf-resolved-configuration-v3",
+        "contract_set": "qcl-negf.results.v1", "configuration": configuration,
+        "hash_encoding": "qcl-negf-canonical-bytes-v1",
+        "configuration_hash": hashlib.sha256(canonical_bytes(configuration)).hexdigest()}))
+    declaration = json.loads(commit.read_bytes())
+    declaration["artifacts"][0]["dependencies"] = ["model.json"]
+    declaration["artifacts"].append(artifact_row(dependency, relative="model.json",
+        role="model", media_type="application/json", schema="qcl-negf-resolved-configuration-v3"))
+    commit.write_bytes(json_bytes(declaration))
+    return dependency
+
+
+@pytest.mark.parametrize("target", ["commit", "owner", "dependency"])
+def test_final_symlink_swap_after_ancestry_check_is_rejected(tmp_path, monkeypatch, target):
+    import os
+    import qcl_negf_results.saved_views as saved
+    commit = fixture(tmp_path / "record")
+    dependency = _with_json_dependency(commit)
+    selected = {"commit": commit, "owner": commit.parent / "analysis.h5",
+                "dependency": dependency}[target]
+    original_open = os.open
+    swapped = []
+    def swap_then_open(path, flags, *args, **kwargs):
+        if os.fspath(path) == str(selected) and not swapped:
+            held = selected.with_name(selected.name + ".held")
+            selected.rename(held)
+            selected.symlink_to(held.name)
+            swapped.append(True)
+        return original_open(path, flags, *args, **kwargs)
+    monkeypatch.setattr(saved.os, "open", swap_then_open)
+    with pytest.raises(ContractError) as failure:
+        describe_saved_views(commit, expected_identity=IDENTITY)
+    assert failure.value.code == "corrupt_result"
+    assert swapped == [True]  # Rejection must reach the final-component open.
+
+
+@pytest.mark.parametrize("kind", ["fifo", "socket", "directory"])
+def test_regular_open_refuses_nonregular_without_blocking(tmp_path, monkeypatch, kind):
+    import os
+    import socket
+    import qcl_negf_results.saved_views as saved
+    path = tmp_path / "special"
+    original_open = os.open
+    descriptors = []
+    def capture(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+    monkeypatch.setattr(saved.os, "open", capture)
+    sock = None
+    try:
+        if kind == "fifo": os.mkfifo(path)
+        elif kind == "socket":
+            sock = socket.socket(socket.AF_UNIX)
+            sock.bind(str(path))
+        else: path.mkdir()
+        with pytest.raises(ContractError) as failure:
+            saved._open_regular(path)
+        assert failure.value.code == "corrupt_result"
+    finally:
+        if sock is not None: sock.close()
+    for descriptor in descriptors:
+        with pytest.raises(OSError): os.fstat(descriptor)
+
+
+def test_opened_inode_size_check_closes_fd_and_never_stats_path(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    import qcl_negf_results.saved_views as saved
+    path = tmp_path / "owner"
+    path.write_bytes(b"four")
+    original_open = os.open
+    descriptors = []
+    def capture(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+    monkeypatch.setattr(saved.os, "open", capture)
+    monkeypatch.setattr(Path, "stat", lambda *a, **k: pytest.fail("size checked by pathname"))
+    with pytest.raises(ContractError) as failure:
+        saved._open_regular(path, expected_size=3)
+    assert failure.value.code == "corrupt_result"
+    assert len(descriptors) == 1
+    with pytest.raises(OSError): os.fstat(descriptors[0])
+
+
+@pytest.mark.parametrize("stage", ["fstat", "fdopen"])
+def test_interruption_before_stream_transfer_closes_descriptor(tmp_path, monkeypatch, stage):
+    import os
+    import qcl_negf_results.saved_views as saved
+    path = tmp_path / "small"
+    path.write_bytes(b"tiny")
+    original_open, original_fstat = os.open, os.fstat
+    descriptors = []
+    def capture(*args, **kwargs):
+        descriptor = original_open(*args, **kwargs)
+        descriptors.append(descriptor)
+        return descriptor
+    def interrupted(*args, **kwargs): raise KeyboardInterrupt("literal interrupt")
+    monkeypatch.setattr(saved.os, "open", capture)
+    monkeypatch.setattr(saved.os, stage, interrupted)
+    with pytest.raises(KeyboardInterrupt, match="literal interrupt"):
+        saved._open_regular(path)
+    assert len(descriptors) == 1
+    with pytest.raises(OSError): original_fstat(descriptors[0])
+
+
+def test_missing_required_nofollow_primitive_has_no_follow_fallback(tmp_path, monkeypatch):
+    import qcl_negf_results.saved_views as saved
+    monkeypatch.delattr(saved.os, "O_NOFOLLOW")
+    monkeypatch.setattr(saved.os, "open", lambda *a, **k: pytest.fail("unsupported open attempted"))
+    with pytest.raises(ContractError) as failure:
+        saved._open_regular(tmp_path / "absent")
+    assert failure.value.code == "unsupported_contract"
+
+
+@pytest.mark.parametrize("failure_type", [ContractError, KeyboardInterrupt])
+def test_constructor_metadata_failure_closes_owned_inode(tmp_path, monkeypatch, failure_type):
+    import os
+    import qcl_negf_results.saved_views as saved
+    commit = fixture(tmp_path / "record")
+    original_open = saved._open_regular
+    owned = []
+    def capture(path, **kwargs):
+        raw = original_open(path, **kwargs)
+        if str(path).endswith("analysis.h5"): owned.append((raw, raw.fileno()))
+        return raw
+    def broken_metadata(self):
+        if failure_type is ContractError: raise ContractError("literal metadata error", "corrupt_result")
+        raise KeyboardInterrupt("literal metadata interruption")
+    monkeypatch.setattr(saved, "_open_regular", capture)
+    monkeypatch.setattr(AnalysisReader, "_storage", broken_metadata)
+    with pytest.raises(failure_type):
+        AnalysisReader(commit, expected_identity=IDENTITY)
+    assert len(owned) == 1 and owned[0][0].closed
+    with pytest.raises(OSError): os.fstat(owned[0][1])
+
+
+@pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
+def test_hdf_close_failure_still_closes_raw_and_repeated_close_is_safe(tmp_path, failure_type):
+    import os
+    commit = fixture(tmp_path / "record")
+    reader = AnalysisReader(commit, expected_identity=IDENTITY)
+    handle, stream = reader._handle, reader._stream
+    descriptor = stream._raw.fileno()
+    class InterruptedClose:
+        def close(self):
+            handle.close()
+            raise failure_type("literal close failure")
+    reader._handle = InterruptedClose()
+    with pytest.raises(failure_type, match="literal close failure"):
+        reader.close()
+    assert stream.closed
+    with pytest.raises(OSError): os.fstat(descriptor)
+    reader.close()
+    assert reader._handle is reader._stream is None
+
+
+def test_owner_hash_and_hdf_share_open_inode_after_path_replacement(tmp_path, monkeypatch):
+    import os
+    from pathlib import Path
+    import qcl_negf_results.saved_views as saved
+    commit = fixture(tmp_path / "original")
+    foreign_commit = fixture(tmp_path / "foreign")
+    foreign = foreign_commit.parent / "analysis.h5"
+    with h5py.File(foreign, "r+") as handle:
+        handle["observables/density_per_m3"][0] = 99.
+    owner = commit.parent / "analysis.h5"
+    original_hdf, original_verify = h5py.File, saved._verify_stream
+    streams, inodes, verified = [], [], []
+    original_path_open = Path.open
+    def no_owner_reopen(path, *args, **kwargs):
+        if path == owner: pytest.fail("owner pathname reopened")
+        return original_path_open(path, *args, **kwargs)
+    def capture_hdf(stream, *args, **kwargs):
+        assert isinstance(stream, saved._BudgetStream)
+        streams.append(stream)
+        info = os.fstat(stream._raw.fileno())
+        inodes.append((info.st_dev, info.st_ino))
+        handle = original_hdf(stream, *args, **kwargs)
+        os.replace(foreign, owner)  # Different healthy owner at the old pathname.
+        monkeypatch.setattr(Path, "open", no_owner_reopen)
+        return handle
+    def capture_verify(stream, size, digest):
+        assert stream is streams[0]
+        info = os.fstat(stream._raw.fileno())
+        assert (info.st_dev, info.st_ino) == inodes[0]
+        assert (owner.stat().st_dev, owner.stat().st_ino) != inodes[0]
+        verified.append(True)
+        return original_verify(stream, size, digest)
+    monkeypatch.setattr(saved.h5py, "File", capture_hdf)
+    monkeypatch.setattr(saved, "_verify_stream", capture_verify)
+    result = read_saved_view(commit, "density", [0], expected_identity=IDENTITY)
+    assert result["values"] == 0.  # Literal original, not replacement sentinel 99.
+    assert result["integrity"]["owner_sha_verified"] is True
+    assert verified == [True] and len(streams) == 1 and streams[0].closed
+
+
+@pytest.mark.parametrize("stage", ["hdf_constructor", "owner_hash"])
+def test_hdf_or_hash_error_closes_owner_descriptor(tmp_path, monkeypatch, stage):
+    import os
+    import qcl_negf_results.saved_views as saved
+    commit = fixture(tmp_path / "record")
+    original_open = saved._open_regular
+    owned = []
+    def capture(path, **kwargs):
+        raw = original_open(path, **kwargs)
+        if str(path).endswith("analysis.h5"): owned.append((raw, raw.fileno()))
+        return raw
+    native_error = ValueError("literal native read failure")
+    def broken(*args, **kwargs): raise native_error
+    monkeypatch.setattr(saved, "_open_regular", capture)
+    if stage == "hdf_constructor":
+        monkeypatch.setattr(saved.h5py, "File", broken)
+        with pytest.raises(ContractError, match="saved native metadata cannot be read") as failure:
+            describe_saved_views(commit, expected_identity=IDENTITY)
+    else:
+        monkeypatch.setattr(saved, "_verify_stream", broken)
+        with pytest.raises(ContractError, match="saved native selection cannot be read") as failure:
+            read_saved_view(commit, "density", [0], expected_identity=IDENTITY)
+    assert failure.value.code == "corrupt_result"
+    assert failure.value.__cause__ is native_error
+    assert len(owned) == 1 and owned[0][0].closed
+    with pytest.raises(OSError): os.fstat(owned[0][1])
+
+
+def test_raw_descriptor_closes_even_if_budget_stream_close_is_interrupted(tmp_path):
+    import os
+    commit = fixture(tmp_path / "record")
+    reader = AnalysisReader(commit, expected_identity=IDENTITY)
+    stream = reader._stream
+    raw = stream._raw
+    descriptor = raw.fileno()
+    original_close = stream.close
+    def interrupted(): raise KeyboardInterrupt("literal stream close interruption")
+    stream.close = interrupted
+    with pytest.raises(KeyboardInterrupt, match="literal stream close interruption"):
+        reader.close()
+    assert raw.closed
+    with pytest.raises(OSError): os.fstat(descriptor)
+    reader.close()
+    # Restore the injected method before destruction of the detached stream.
+    stream.close = original_close
+    stream.close()
+
+
+def test_regular_open_uses_readonly_nofollow_cloexec_nonblock(tmp_path, monkeypatch):
+    import os
+    import qcl_negf_results.saved_views as saved
+    path = tmp_path / "ordinary"
+    path.write_bytes(b"literal")
+    original_open = os.open
+    flags_seen = []
+    def capture(path, flags):
+        flags_seen.append(flags)
+        return original_open(path, flags)
+    monkeypatch.setattr(saved.os, "open", capture)
+    with saved._open_regular(path, expected_size=7) as raw:
+        descriptor = raw.fileno()
+        assert raw.read() == b"literal"
+        assert os.get_inheritable(descriptor) is False
+    assert len(flags_seen) == 1
+    assert flags_seen[0] & os.O_ACCMODE == os.O_RDONLY
+    for flag in (os.O_NOFOLLOW, os.O_CLOEXEC, os.O_NONBLOCK):
+        assert flags_seen[0] & flag == flag
+    with pytest.raises(OSError): os.fstat(descriptor)
