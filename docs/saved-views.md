@@ -108,3 +108,26 @@ Repository provider and future registered read-only NFS provider may call the sa
 local adapter. This source does not create NFS registration/access/retention or
 change ongoing retrieval. Tests are in `tests/test_saved_views.py`; only a prepared,
 budgeted focused run is appropriate, with no dependency installation or solver.
+
+Saved commits, declared JSON dependencies and the analysis owner are opened with
+`O_RDONLY|O_NOFOLLOW|O_CLOEXEC|O_NONBLOCK`, then checked with `fstat` to be regular
+files. Declared dependency/owner sizes are checked on that opened inode. Missing
+required POSIX primitives yield `unsupported_contract`; there is no follow-link
+fallback. `O_NONBLOCK` prevents a FIFO final component from blocking before its
+regular-file check. It does not promise a deadline for hard-NFS kernel I/O.
+Commit JSON keeps the existing bounded max+1 delivery, decode and common I/O cap.
+
+The analysis owner has one ordinary seekable file object, shared by the existing
+`_BudgetStream`, whole-owner SHA and `h5py.File(stream, "r")`. Metadata inspection,
+selection and numerical reads stay on that same open inode; there is no filename
+reopen between hash and HDF access. HDF closes before the budget stream, with raw
+file closure in `finally` even if construction, metadata or close is interrupted.
+Close errors remain visible, and repeating `close()` is safe.
+
+Existing root/ancestor symlink checks and HDF external/soft-link, external-storage
+and VDS fences still apply. Final-component nofollow does not protect against a
+hostile concurrent ancestor rename or in-place writer. Providers must admit a
+trusted quiescent retained tree, no writer/renamer/pruner/cleanup, and real
+read-only NFS alias before direct access. This is not a new reader, custom HDF
+driver or protection against every storage administrator. No change to identity,
+scientific statuses, native formats, limits or numerical conventions follows.
