@@ -55,6 +55,13 @@ attempt is replaced with the current provider selection.
 
 ## Observer and publication
 
+A valid input spec alone grants no output credit. Before constructing Writer or
+writing any observer output, the disposable observer waits for Runner's existing
+token/fullFP locator. Runner publishes it only after admitting the fixed104MiB
+operational partition inside the existing grant. Missing locator before terminal
+means unavailable with zero observer output; corrupt/foreign locator refuses
+before Writer. Startup samples can be missing. Waiting never belongs to reaper.
+
 The observer reuses `TelemetryWriter` defaults256rows,4MiB pending buffer,15s
 flush age. Every nominal2s opportunity records `/proc/<root Julia PID>/stat`
 utime+stime / clock ticks and status VmRSS/VmHWM KiB×1024, with captured PID
