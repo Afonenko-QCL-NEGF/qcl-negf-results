@@ -19,6 +19,15 @@ validation. Existing `StateReader` integrity and scientific semantics are unchan
   Missing assessment remains unknown; a top-level synthetic flag is not used.
   Raw statuses/assessments remain independent and unknown
   metadata stays null. Multi-execution series is filtered by exact execution.
+  The selected CalcJob attempt bounds recorded point attempts: positive exact
+  integers from 1 through the selected attempt are allowed, since recovery may
+  retain completed earlier rows unchanged. A recorded `data.checkpoint_source_attempt`
+  must likewise be a positive exact integer no greater than the row attempt
+  (or the selected attempt when legacy row attempt is absent). `source_attempt`
+  preserves this explicit checkpoint source, otherwise the recorded row attempt;
+  absent legacy provenance remains null. Selection never relabels a historical
+  payload, its commit SHA or its saved scientific assessment. These brief-only
+  bounds do not relax `AnalysisReader`'s exact native identity requirements.
 - `describe_saved_views(commit_path, *, expected_identity, limits=None)` opens
   only the declared single `physics.analysis` owner. Header, embedded identity,
   finite layout and selected dataset metadata are inspected; no numeric dataset
