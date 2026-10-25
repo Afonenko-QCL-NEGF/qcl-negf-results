@@ -120,8 +120,14 @@ def brief_result(metadata, *, selection, maximum_bytes=1024*1024):
         if row.get("execution_id") != selection["execution_id"]:
             # A multi-execution series is legal; foreign rows are never selected.
             continue
-        if "attempt" in row and not _same_json_value(row["attempt"], selection["attempt"]):
-            _error("identity_mismatch", "saved point attempt differs")
+        if "attempt" in row and (type(row["attempt"]) is not int or
+                                 not 1 <= row["attempt"] <= selection["attempt"]):
+            _error("identity_mismatch", "saved point attempt exceeds owning selection or is invalid")
+        data = row.get("data") or {}
+        if "checkpoint_source_attempt" in data:
+            source_attempt = data["checkpoint_source_attempt"]
+            if type(source_attempt) is not int or not 1 <= source_attempt <= row.get("attempt", selection["attempt"]):
+                _error("identity_mismatch", "checkpoint source attempt exceeds saved point or is invalid")
         by_id[row["id"]] = row
     frozen = [p for p in plan["points"] if p.get("execution_id") == selection["execution_id"]]
     if any(identifier not in {p["id"] for p in frozen} for identifier in by_id):

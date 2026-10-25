@@ -46,6 +46,60 @@ def test_brief_preserves_missing_middle_and_never_connects_endpoints(middle, mon
         ["current_unavailable"] if middle.get("observables", {}).get("current_density_A_per_m2") is None else [])
 
 
+def test_brief_preserves_retained_and_borrowed_attempts_in_frozen_order(monkeypatch):
+    monkeypatch.setattr(h5py, "File", lambda *a, **k: pytest.fail("brief opened HDF5"))
+    accepted = {"scientific_accepted": True, "stationary_candidate_accepted": True}
+    paused_assessment = {"scientific_accepted": False, "reason": "saved paused assessment"}
+    retained = {"id": "p0", "execution_id": "ex", "attempt": 1, "status": "completed",
+                "observables": {"current_density_A_per_m2": 7., "scientific_assessment": accepted},
+                "data": {"source_commit_sha256": "1" * 64}}
+    current = {"id": "p1", "execution_id": "ex", "attempt": 2, "status": "completed",
+               "observables": {"current_density_A_per_m2": 8., "scientific_assessment": accepted},
+               "data": {"source_commit_sha256": "2" * 64}}
+    paused = {"id": "p2", "execution_id": "ex", "attempt": 2, "status": "paused",
+              "observables": {"current_density_A_per_m2": 9., "scientific_assessment": paused_assessment},
+              "data": {"checkpoint_source_attempt": 1, "source_commit_sha256": "3" * 64,
+                       "pause_reason": "resource_pressure", "resume_kind": "checkpoint",
+                       "recovery_origin": "last_committed_before_resource_pause"}}
+    result = brief_result(metadata([paused, current, retained]), selection=SELECTION)
+    assert result["selection"] == SELECTION
+    assert [point["point_id"] for point in result["points"]] == ["p0", "p1", "p2"]
+    assert [point["source_attempt"] for point in result["points"]] == [1, 2, 1]
+    assert [point["source_commit_sha256"] for point in result["points"]] == ["1" * 64, "2" * 64, "3" * 64]
+    assert [point["recorded_statuses"]["scientific_assessment"] for point in result["points"]] == [accepted, accepted, paused_assessment]
+    assert result["current_segments"] == [["p0", "p1"]]
+    gap = brief_result(metadata([paused, retained]), selection=SELECTION)
+    assert [point["point_id"] for point in gap["points"]] == ["p0", "p1", "p2"]
+    assert gap["points"][1]["missing"] == ["planned_row_absent"]
+    assert gap["points"][1]["source_attempt"] is None
+    assert gap["current_segments"] == [["p0"]]
+
+
+@pytest.mark.parametrize("attempt", [3, 0, -1, True, False, 1.0, "1", None])
+def test_brief_rejects_recorded_invalid_or_future_row_attempt(attempt):
+    with pytest.raises(ContractError) as error:
+        brief_result(metadata([row(0, attempt=attempt)]), selection=SELECTION)
+    assert error.value.code == "identity_mismatch"
+
+
+@pytest.mark.parametrize("row_attempt,source_attempt", [(2, 3), (1, 2), (2, 0), (2, -1),
+                                                       (2, True), (2, False), (2, 1.0), (2, "1"), (2, None)])
+def test_brief_rejects_checkpoint_source_outside_real_row_bounds(row_attempt, source_attempt):
+    saved = row(0, attempt=row_attempt, status="paused", data={"checkpoint_source_attempt": source_attempt})
+    with pytest.raises(ContractError) as error:
+        brief_result(metadata([saved]), selection=SELECTION)
+    assert error.value.code == "identity_mismatch"
+
+
+def test_brief_legacy_absent_attempt_stays_unknown():
+    legacy = {"id": "p0", "execution_id": "ex", "status": "completed",
+              "observables": {"current_density_A_per_m2": 7.}}
+    result = brief_result(metadata([legacy]), selection=SELECTION)
+    assert result["points"][0]["source_attempt"] is None
+    assert result["points"][0]["recorded_statuses"]["scientific_accepted"] is None
+    assert result["current_segments"] == []
+
+
 def fixture(root, *, denominator=True):
     root.mkdir()
     path = root / "analysis.h5"
