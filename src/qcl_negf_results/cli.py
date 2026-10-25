@@ -6,11 +6,24 @@ import json
 from pathlib import Path
 
 from qcl_negf_contracts.messages import ContractError
-from .export import export_snapshot, preview
+
 from .export_budget import DEFAULT_BYTE_BUDGET, DEFAULT_RESERVE_BYTES
 
 
 def main() -> None:
+    # Dispatch before importing any capture observer runtime. This entrypoint is
+    # internal launcher plumbing, never a browser-chosen executable/path.
+    import sys
+    if len(sys.argv)>1 and sys.argv[1]=='capture-run':
+        capture=argparse.ArgumentParser(prog='qcl-negf-results capture-run')
+        capture.add_argument('--spec',type=Path,required=True)
+        capture.add_argument('--solver',required=True)
+        capture.add_argument('arguments',nargs=argparse.REMAINDER)
+        args=capture.parse_args(sys.argv[2:])
+        arguments=args.arguments[1:] if args.arguments[:1]==['--'] else args.arguments
+        from .capture import capture_run
+        raise SystemExit(capture_run(args.spec,args.solver,arguments))
+    from .export import export_snapshot, preview
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     for name in ("preview", "export"):
