@@ -105,12 +105,15 @@ class DiagnosticReader:
     def __exit__(self, *args):
         self.close()
 
-    def __init__(self, commit_path, *, expected_identity, limits=None):
+    def __init__(self, commit_path, *, expected_identity, limits=None, budget=None):
         self.limits = limits or DiagnosticViewLimits()
         if not isinstance(self.limits, DiagnosticViewLimits):
             raise ValueError('limits must be DiagnosticViewLimits')
         self.expected = _expected(expected_identity)
-        self._budget = _IOBudget(self.limits.maximum_io_bytes)
+        if budget is not None and (not isinstance(budget, _IOBudget) or budget.maximum is None
+                                   or budget.maximum > self.limits.maximum_io_bytes):
+            raise ValueError('shared diagnostic I/O budget may not enlarge the selected cap')
+        self._budget = budget if budget is not None else _IOBudget(self.limits.maximum_io_bytes)
         self._metadata_bytes = 0
         self._handle = self._stream = self._raw = None
         self._verified = False

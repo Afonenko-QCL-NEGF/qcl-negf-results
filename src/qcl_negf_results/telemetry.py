@@ -16,7 +16,7 @@ import uuid
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from qcl_negf_contracts.artifacts import COMMIT_SCHEMA, CONTRACT_SET
+from qcl_negf_contracts.artifacts import COMMIT_SCHEMA, CONTRACT_SET, POINTER_SCHEMA
 from qcl_negf_contracts.telemetry import TABLE_FIELDS, TELEMETRY_SCHEMA
 from .commits import (artifact_row, atomic_write, fsync_directory, json_bytes,
                       publish_pointer, read_json)
@@ -72,7 +72,7 @@ class CpuCoverage:
             row["last_sample_monotonic_ns"] = stamp
         previous = self.previous.pop(allocation, None)
         if (value.get("cpu_time_seconds") is None or stamp is None
-                or not value.get("cpu_count") or value.get("missing_reason")):
+                or value.get("missing_reason")):
             row["missing_samples"] += 1
             return
         self.previous[allocation] = dict(value)
@@ -92,10 +92,16 @@ class CpuCoverage:
         row["valid_intervals"] += 1
         row["covered_wall_seconds"] += wall
         row["cpu_seconds"] += cpu
-        row["allocated_cpu_seconds"] += wall * value["cpu_count"]
-        quota = value.get("cpu_quota_cores")
-        effective_width = min(value["cpu_count"], quota) if quota is not None else value["cpu_count"]
-        row["observed_capacity_cpu_seconds"] += wall * effective_width
+        width = value.get("cpu_count")
+        if width is None:
+            row["allocated_cpu_seconds"] = None
+            row["observed_capacity_cpu_seconds"] = None
+            row["capacity_unavailable_reason"] = "actual allocation width unavailable"
+        elif row["allocated_cpu_seconds"] is not None:
+            row["allocated_cpu_seconds"] += wall * width
+            quota = value.get("cpu_quota_cores")
+            effective_width = min(width, quota) if quota is not None else width
+            row["observed_capacity_cpu_seconds"] += wall * effective_width
         row["maximum_observed_interval_seconds"] = max(
             row["maximum_observed_interval_seconds"] or 0.0, wall)
         if wall > self.RESOLUTION_TARGET_SECONDS:
@@ -108,6 +114,11 @@ class CpuCoverage:
         allocations = []
         for value in self.rows.values():
             row = dict(value)
+            if not row["valid_intervals"]:
+                row["cpu_seconds"] = None
+                row["allocated_cpu_seconds"] = None
+                row["observed_capacity_cpu_seconds"] = None
+                row["cpu_unavailable_reason"] = "no stable measured CPU interval"
             wall = row["covered_wall_seconds"]
             capacity = row["allocated_cpu_seconds"]
             effective = row["observed_capacity_cpu_seconds"]
@@ -142,7 +153,7 @@ class TelemetryWriter:
     """
     def __init__(self, root: Path, identity: Mapping[str, Any], hardware: Mapping[str, Any],
                  *, batch_rows: int = 256, batch_bytes: int = 4 * 1024 * 1024,
-                 max_buffer_seconds: float = 15.0) -> None:
+                 max_buffer_seconds: float = 15.0, metadata_budget=None) -> None:
         if batch_rows < 1 or batch_rows > 65_536:
             raise ValueError("batch_rows must be in 1..65536")
         if not isinstance(batch_bytes, int) or batch_bytes < 1024:
@@ -150,6 +161,7 @@ class TelemetryWriter:
         if not math.isfinite(max_buffer_seconds) or not 0 < max_buffer_seconds <= 60:
             raise ValueError("max_buffer_seconds must be finite and in (0,60]")
         self.root = Path(root)
+        self.metadata_budget = metadata_budget
         self.session_id = uuid.uuid4().hex
         self.directory = self.root / "sessions" / self.session_id
         self.directory.mkdir(parents=True)
@@ -196,25 +208,41 @@ class TelemetryWriter:
                 "compile_target", "libraries"} - set(hardware)),
             "time_semantics": "monotonic nanoseconds; durations and CPU time in seconds",
             "sampling": "all received rows retained; absent measurements are null"}
-        atomic_write(self.directory / "hardware.json", json_bytes(passport), immutable=True)
-        self.artifacts.append(artifact_row(self.directory / "hardware.json",
+        self._metadata_write(self.directory / "hardware.json", json_bytes(passport), immutable=True)
+        self.artifacts.append(self._metadata_artifact(self.directory / "hardware.json",
             relative="hardware.json", role="performance.summary", media_type="application/json"))
         self._publish()
         self._register()
+
+    def _metadata_write(self, path, payload, *, immutable=False):
+        if self.metadata_budget is not None:
+            self.metadata_budget.write(len(payload))
+        atomic_write(path, payload, immutable=immutable)
+
+    def _metadata_artifact(self, path, **kwargs):
+        if self.metadata_budget is not None:
+            size = path.stat().st_size
+            self.metadata_budget.require(size)
+            self.metadata_budget.account(size)
+        return artifact_row(path, **kwargs)
 
     def _register(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / ".index.lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
             index_path = self.root / "index.json"
-            index: dict[str, Any] = read_json(index_path)[0] if index_path.exists() else {
-                "schema": "qcl-negf.performance-index.v2", "contract_set": CONTRACT_SET, "sessions": []}
+            if self.metadata_budget is not None and index_path.exists():
+                from ._capture_io import small_json
+                index = small_json(index_path, 1024 * 1024, budget=self.metadata_budget)[0]
+            else:
+                index = read_json(index_path)[0] if index_path.exists() else {
+                    "schema": "qcl-negf.performance-index.v2", "contract_set": CONTRACT_SET, "sessions": []}
             if (index.get("schema") != "qcl-negf.performance-index.v2"
                     or index.get("contract_set") != CONTRACT_SET):
                 raise ValueError("incompatible_contract: performance index")
             index["sessions"].append({"id": self.session_id,
                 "pointer": f"sessions/{self.session_id}/current.json"})
-            atomic_write(index_path, json_bytes(index))
+            self._metadata_write(index_path, json_bytes(index))
 
     def _normalise(self, table: str, row: Mapping[str, Any]) -> dict[str, Any]:
         fields = dict(TABLE_FIELDS[table])
@@ -493,7 +521,7 @@ class TelemetryWriter:
                        "previous": self.catalog_watermark, "artifacts": self.artifacts}
             catalog_name = f"catalog-{self.generation:09d}.json"
             catalog_payload = json_bytes(catalog)
-            atomic_write(self.directory / catalog_name, catalog_payload, immutable=True)
+            self._metadata_write(self.directory / catalog_name, catalog_payload, immutable=True)
             self.artifact_count = next_count
             self.catalog_watermark = {"path": catalog_name, "entries": self.artifact_count,
                 "sha256": hashlib.sha256(catalog_payload).hexdigest()}
@@ -549,8 +577,8 @@ class TelemetryWriter:
                 "scope": "selected actual rows; not a complete profile"},
             "closed": self.closed, "uncommitted_resource_batch_at_risk": not self.closed,
             "recorded_until_monotonic_ns": time.monotonic_ns()}
-        atomic_write(self.directory / summary_name, json_bytes(summary), immutable=True)
-        summary_row = artifact_row(self.directory / summary_name, relative=summary_name,
+        self._metadata_write(self.directory / summary_name, json_bytes(summary), immutable=True)
+        summary_row = self._metadata_artifact(self.directory / summary_name, relative=summary_name,
             role="performance.summary", media_type="application/json")
         commit = {"schema": COMMIT_SCHEMA, "contract_set": CONTRACT_SET, "identity": {**self.identity, "session_id": self.session_id},
             "generation": self.generation, "closed": self.closed,
@@ -560,7 +588,12 @@ class TelemetryWriter:
             "artifacts": [summary_row]}
         payload = json_bytes(commit)
         name = f"commit-{self.generation:06d}.json"
-        atomic_write(self.directory / name, payload, immutable=True)
+        self._metadata_write(self.directory / name, payload, immutable=True)
+        if self.metadata_budget is not None:
+            pointer = {"schema": POINTER_SCHEMA, "contract_set": CONTRACT_SET,
+                "commit_path": name, "generation": self.generation,
+                "sha256": hashlib.sha256(payload).hexdigest()}
+            self.metadata_budget.write(len(json_bytes(pointer)))
         publish_pointer(self.directory / "current.json", name, payload, self.generation)
         self.source_cursors = deepcopy(committed_cursors)
         self.staged_source_cursors.clear()
