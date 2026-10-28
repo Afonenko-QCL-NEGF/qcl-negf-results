@@ -171,10 +171,10 @@ def _scba_count(parent: Any) -> int:
     raise ValueError("native SCBA history has no row count")
 
 
-def _native_header(group, maximum_bytes):
+def _native_header(group, maximum_bytes, *, with_size=False):
     import h5py
     from qcl_negf_contracts.messages import ContractError
-    result = {}
+    result, consumed = {}, 0
     for name in ('schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'):
         if name not in group.attrs:
             raise ContractError('required native5 metadata attribute missing', 'corrupt_result')
@@ -184,12 +184,15 @@ def _native_header(group, maximum_bytes):
             if (datatype.get_class() != h5py.h5t.STRING or datatype.is_variable_str()
                     or datatype.get_size() > maximum_bytes or space.get_simple_extent_type() != h5py.h5s.SCALAR):
                 raise ContractError('native5 header requires bounded fixed-width scalar strings', 'corrupt_result')
+            consumed += datatype.get_size()
+            if consumed > maximum_bytes:
+                raise ContractError('aggregate native header exceeds metadata limit', 'budget_exceeded')
             result[name] = _text(group.attrs[name])
         finally:
             space.close()
             datatype.close()
             attribute.close()
-    return result
+    return (result, consumed) if with_size else result
 
 
 def validate_native_handle(handle: Any, role: str | None = None,
@@ -208,7 +211,8 @@ def validate_native_handle(handle: Any, role: str | None = None,
         raise ContractError("only result-v2/native5 is supported", "unsupported_format")
     actual_role, schema = _text(attrs.get("artifact_role", "")), _text(attrs.get("schema", ""))
     allowed = {"science.history": "qcl-negf-scientific-history-v5",
-               "recovery": "qcl-negf-checkpoint-v5", "physics.full": "qcl-negf-physics-v5"}
+               "recovery": "qcl-negf-checkpoint-v5", "physics.full": "qcl-negf-physics-v5",
+               "physics.analysis": "qcl-negf-physics-analysis-v5"}
     if allowed.get(actual_role) != schema or role is not None and role != actual_role:
         fail("native schema/role differs from owning declaration")
     if declared_schema is not None and schema != declared_schema:
@@ -228,6 +232,11 @@ def native_metadata(handle, *, identity=None, invocation=None, representation=No
         raise ContractError(message, "corrupt_result")
     group = handle["metadata"]
     attrs = _native_header(group, maximum_bytes)
+    if attrs['artifact_role'] == 'physics.analysis' and attrs['schema'] == 'qcl-negf-physics-analysis-v5':
+        if representation not in (None, 'final_diagnostics'):
+            fail('native representation differs from owning declaration')
+        return final_diagnostics_metadata(handle, identity=identity, invocation=invocation,
+                                          maximum_bytes=maximum_bytes)
     layout = json.loads(files("qcl_negf_contracts").joinpath("core_layout.json").read_text())["layout_sha256"]
     if attrs['core_layout_sha256'] != layout:
         raise ContractError("unsupported Core layout", "unsupported_format")
@@ -248,6 +257,110 @@ def native_metadata(handle, *, identity=None, invocation=None, representation=No
             fail("native source identity/epoch differs from selected reference")
         result[name] = value
     return result
+
+
+def final_diagnostics_metadata(handle, *, identity, invocation, maximum_bytes):
+    """Bound fixed UTF8 scalar metadata before any high-level string read."""
+    import h5py
+    import json
+    from importlib.resources import files
+    from qcl_negf_contracts.messages import ContractError
+    from .commits import decode_json
+    def fail(message, code='corrupt_result'):
+        raise ContractError(message, code)
+    attrs, consumed = _native_header(handle['metadata'], maximum_bytes, with_size=True)
+    layout = json.loads(files('qcl_negf_contracts').joinpath('core_layout.json').read_text())['layout_sha256']
+    if (attrs['schema'] != 'qcl-negf-physics-analysis-v5' or attrs['artifact_role'] != 'physics.analysis'
+            or attrs['schema_version'] != '5.0' or attrs['contract_set'] != CONTRACT_SET
+            or attrs['representation'] != 'final_diagnostics' or attrs['core_layout_sha256'] != layout):
+        fail('analysis native5 schema/role/layout/representation differs')
+    result = dict(representation='final_diagnostics')
+    for path, key, expected in (('metadata/identity_json','identity_json',identity),
+            ('metadata/invocation_json','invocation_json',invocation),
+            ('final_diagnostics/declaration_json','declaration',None)):
+        if path not in handle or not isinstance(handle[path], h5py.Dataset):
+            fail('analysis fixed UTF8 metadata missing')
+        dataset = handle[path]
+        datatype, space = dataset.id.get_type(), dataset.id.get_space()
+        try:
+            if (space.get_simple_extent_type() != h5py.h5s.SCALAR
+                    or space.get_simple_extent_npoints() != 1 or datatype.get_class() != h5py.h5t.STRING
+                    or datatype.is_variable_str() or datatype.get_cset() != h5py.h5t.CSET_UTF8
+                    or datatype.get_size() < 1):
+                fail('analysis metadata requires fixed UTF8 scalar strings')
+            consumed += datatype.get_size()
+            if consumed > maximum_bytes:
+                fail('aggregate analysis metadata exceeds limit', 'budget_exceeded')
+        finally:
+            space.close(); datatype.close()
+        value = decode_json(bytes(dataset[()]), path)
+        if expected is not None and value != expected:
+            fail('native source identity/epoch differs from selected reference')
+        result[key] = value
+    result['metadata_bytes'] = consumed
+    return result
+
+
+_FINAL_ARRAYS = {
+    'spectral_integral': ('ComplexF64', ('k','a','b'), '1'),
+    'spectral_integral_eigenvalues': ('Float64', ('k','state'), '1'),
+    'spectral_trace_cumulative': ('Float64', ('E','k'), '1'),
+    'negative_energy_integral_scaled': ('Float64', ('matrix_kind','k'),
+        'scaled solver units; broadening carries energy squared'),
+}
+
+
+def validate_final_diagnostics_array(handle, declaration):
+    """Four local analysis arrays; never broadens the reflected Core graph."""
+    import h5py
+    import numpy as np
+    from qcl_negf_contracts.messages import ContractError
+    def fail(message):
+        raise ContractError(message, 'corrupt_result')
+    path = declaration.get('dataset')
+    name = path.removeprefix('/final_diagnostics/arrays/') if isinstance(path,str) else None
+    expected = _FINAL_ARRAYS.get(name)
+    if (expected is None or path != '/final_diagnostics/arrays/'+name
+            or set(declaration) != {'dataset','eltype','shape','order','axes','units'}
+            or (declaration['eltype'],tuple(declaration['axes']),declaration['units']) != expected
+            or declaration['order'] != 'F' or len(declaration['shape']) != len(expected[1])):
+        fail('unsupported final diagnostics array descriptor')
+    if any(not isinstance(n,str) or not n.isascii() or not n.isdecimal() or n.startswith('0')
+           or int(n)>2**63-1 for n in declaration['shape']):
+        fail('analysis array shape requires positive actual Int64 dimensions')
+    if path not in handle or not isinstance(handle[path],h5py.Dataset):
+        fail('analysis array dataset missing')
+    dataset = handle[path]
+    if dataset.shape != tuple(map(int,declaration['shape'])):
+        fail('analysis array logical shape differs from descriptor')
+    kind = dataset.id.get_type()
+    try:
+        if expected[0] == 'ComplexF64':
+            if (kind.get_class()!=h5py.h5t.COMPOUND or kind.get_nmembers()!=2 or kind.get_size()!=16
+                    or [kind.get_member_name(i) for i in range(2)] != [b'r',b'i']
+                    or [kind.get_member_offset(i) for i in range(2)] != [0,8]
+                    or dataset.dtype != np.dtype('<c16')):
+                fail('analysis complex requires exact consecutive LE float64 r/i compound')
+            for i in range(2):
+                member = kind.get_member_type(i)
+                try:
+                    if (member.get_class()!=h5py.h5t.FLOAT or member.get_size()!=8
+                            or member.get_order()!=h5py.h5t.ORDER_LE):
+                        fail('analysis complex component precision/endian differs')
+                finally:
+                    member.close()
+        elif (kind.get_class()!=h5py.h5t.FLOAT or kind.get_size()!=8
+                or kind.get_order()!=h5py.h5t.ORDER_LE or dataset.dtype!=np.dtype('<f8')):
+            fail('analysis array requires exact LE Float64')
+    finally:
+        kind.close()
+    plist = dataset.id.get_create_plist()
+    try:
+        if any(plist.get_filter(i)[0] not in (1,2,3) for i in range(plist.get_nfilters())):
+            fail('analysis array uses unsupported/lossy storage filter')
+    finally:
+        plist.close()
+    return dataset
 
 
 def record_table(handle, *, maximum_block_bytes=1024*1024):

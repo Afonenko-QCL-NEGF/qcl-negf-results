@@ -1,6 +1,7 @@
 """Read-only comparison of embedded native metadata with its owning commit."""
 from __future__ import annotations
 
+import copy
 import math
 from pathlib import Path
 from typing import Any, Mapping
@@ -16,6 +17,18 @@ COORDINATE_PATHS = {
     "temperature_K": ("/metadata/temperature_K", "/inputs/T_L_K"),
     "voltage_per_period_V": ("/metadata/voltage_per_period_V", "/inputs/V_period_V"),
 }
+
+
+def _selected_source_provenance(reader):
+    """Canonical manifest proof only; no path reopen or coordinate inference."""
+    source = reader.source
+    return dict(source=source.state,invocation=source.invocation,lineage=source.lineage,
+        git_graph=copy.deepcopy(reader._manifest['provenance']),
+        identity=dict(status='matched',scope='verified_selected_manifest',
+            fields={name:'matched' for name in source.state['identity']}),
+        native_verified_references=source.integrity['selected_payloads_verified'],
+        coordinates=dict(status='not_available',reason='bound_physical_context_not_published'),
+        transport_provenance=dict(status='not_recorded',reason='not_scientific_identity'))
 
 
 def _json_scalar(handle: Any, path: str) -> Any:

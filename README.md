@@ -90,6 +90,44 @@ from logical selected bytes. Metadata/catalog verification and selected payload 
 separate. Symlink escapes, path rebinding, external/virtual HDF storage and changed source identity
 fail explicitly.
 
+## Stored final diagnostics and scalar views
+
+```python
+from qcl_negf_results.final_diagnostics import FinalDiagnosticsReader
+from qcl_negf_results.diagnostic_views import DiagnosticReader, HistoryViewRequest
+
+# analysis_ref is the exact five-field FileRef from this selected manifest.
+with FinalDiagnosticsReader(reader, artifact_ref=analysis_ref) as final:
+    observations = final.describe()
+    integral = final.read_integral("spectral_integral",
+                                   (0, slice(None), slice(None)))
+
+reader.import_history()
+view = DiagnosticReader(reader)
+batch = view.read(HistoryViewRequest("scba", ("r_K", "J"), maximum_records=128))
+# batch.records retains complete typed events; rows is a finite scalar projection.
+```
+
+Final diagnostics reads `qcl-negf.final-diagnostics.v1` in the explicit analysis-v5
+`final_diagnostics` representation. All three pure validation contexts come from the same reader:
+checkpoint, manifest and selected analysis FileRef. The API preserves every metric, witness, count,
+limit, status and IEEE bit. It does not recompute observations or infer scientific acceptance. The
+four local integral arrays have explicit ranks, axes, units and LE storage; their guard is separate
+from the reflected Core array graph. A description reads bounded fixed UTF8 metadata and array
+storage metadata, including a physical owner SHA pass, but no numerical integral payload or full
+checkpoint tensor. Python constructor tests do not establish JuliaHDF5 producer interoperability.
+Science-export selection of this newly supported analysis artifact still needs the owning export
+policy followup; current science export selects history. Full-state preserves its declared source
+graph. Reading final diagnostics alone does not change either profile's selection policy.
+
+`DiagnosticReader.describe()` opens no HDF5 owner. `read()` consumes one bounded canonical event
+batch using the original cursor; filtering a stage can return no displayed rows while advancing the
+event cursor. IEEE cells retain their original tag plus a finite value or an explicit invalid
+reason. Units and missing reasons come from each stored record. Witness updates remain separate
+events; vectors and matrices stay lazy. Numeric source attempts, transport UUID aliases and
+full-history consolidation are not alternative source selectors. See
+[diagnostic APIs](docs/saved-diagnostics.md).
+
 ## Explicit reduction and export
 
 ```python
@@ -144,22 +182,22 @@ qcl-negf-results export /data/result /data/exports --identity identity.json --po
 
 ## Staged research capabilities
 
-This P06 stage provides raw native5 records, slices, reductions and selected exports. Independent
-native5 saved analysis, diagnostic presentation and stored equilibrium views are not yet published.
-Their older entrypoints return `capability_unavailable`; the source description reports exact
-reasons, including `independent_analysis_not_published`. This is a staged migration, **not permanent
-removal of research functionality**. Required owning Runner/Results view and analysis followup must
-pass before final Portal/research release acceptance. Scientific statuses are copied as separate
-process/convergence/physics/ discretization/experimental evidence; `recorded` does not mean pass and
-`not_measured` never becomes zero or success. Existing technical capture lifecycle and telemetry
-migration are owned separately by P29/P30.
+This P06 stage provides native5 records, slices, scalar diagnostic projections, stored final
+diagnostics, reductions and selected exports. Full saved physical views and stored equilibrium views
+still require the actual-grid/scales/basis/model context carrier. Their older entrypoints return
+`capability_unavailable`; the source description reports exact reasons. This is a staged migration,
+**not permanent removal of research functionality**. Required owning Runner/Results context, view
+and export followup must pass before final Portal/research release acceptance. Scientific statuses
+are copied as separate process/convergence/physics/ discretization/experimental evidence; `recorded`
+does not mean pass and `not_measured` never becomes zero or success. Existing technical capture
+lifecycle and telemetry migration are owned separately by P29/P30.
 
 ## Verification
 
 Use a prepared environment, without bootstrap inside checks:
 
 ```console
-python -m pytest -q tests/test_result_v2_reader.py tests/test_result_v2_cursor.py tests/test_result_v2_export.py
+python -m pytest -q tests/test_result_v2_reader.py tests/test_result_v2_cursor.py tests/test_result_v2_export.py tests/test_final_diagnostics_reader.py tests/test_diagnostic_views.py
 ```
 
 Portable tests manufacture tiny transport sources. To additionally check actual constructor-only

@@ -46,10 +46,12 @@ def test_native5_domain_views_report_capability_without_opening_old_layout(tmp_p
     from qcl_negf_results.diagnostic_views import DiagnosticReader
     from qcl_negf_results.equilibrium import diagnose_stored_equilibrium, EquilibriumReadLimits
     equilibrium = lambda path, **kw: diagnose_stored_equilibrium(path, limits=EquilibriumReadLimits(maximum_io_bytes=1024*1024), **kw)
-    for create in (AnalysisReader, DiagnosticReader, equilibrium):
+    for create in (AnalysisReader, equilibrium):
         with pytest.raises(ContractError) as error:
             create(tmp_path / 'not-a-native4-layout', expected_identity=IDENTITY)
         assert error.value.code == 'capability_unavailable'
+    with pytest.raises(TypeError,match='StateReader'):
+        DiagnosticReader(tmp_path / 'not-a-native4-layout')
 
 
 def test_cli_requires_explicit_identity_and_state_ref(tmp_path, monkeypatch, capsys):

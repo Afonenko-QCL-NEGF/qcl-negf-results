@@ -6,7 +6,7 @@ solver or converts process completion into scientific acceptance.
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, fields
 import copy
 import hashlib
@@ -339,6 +339,28 @@ class StateReader:
         for item in getattr(self, '_handles', {}).values():
             item['stream']._budget = self._budget
 
+    @contextmanager
+    def _consumer_operation(self, maximum_io_bytes=None, *, maximum_owner_bytes=None):
+        """One allowance through nested checkpoint/catalog/ancestor operations."""
+        self._operation()
+        budget, prior = self._budget, self._shared_budget
+        prior_owner = getattr(self, '_consumer_owner_limit', None)
+        self._consumer_owner_limit = (maximum_owner_bytes if prior_owner is None else prior_owner
+            if maximum_owner_bytes is None else min(prior_owner,maximum_owner_bytes))
+        maximum = budget.maximum
+        if maximum_io_bytes is not None:
+            if type(maximum_io_bytes) is not int or maximum_io_bytes < 1:
+                raise ValueError('positive consumer I/O allowance required')
+            bound = budget.bytes_read_total + maximum_io_bytes
+            budget.maximum = bound if maximum is None else min(maximum, bound)
+        self._shared_budget = budget
+        try:
+            yield budget
+        finally:
+            self._shared_budget = prior
+            self._consumer_owner_limit = prior_owner
+            budget.maximum = maximum
+
     @classmethod
     def from_pointer(cls, artifact_root, *, expected_identity, pointer, limits=None):
         if pointer not in ('live', 'recovery'):
@@ -393,7 +415,11 @@ class StateReader:
         with regular(beneath(self.root, reference['path']), size=int(reference['bytes'])) as raw:
             before = stamp(raw)
             stream = _BudgetStream(raw, self._budget)
-            payload = stream.read(int(reference['bytes']))
+            phase, self._budget.phase = self._budget.phase, 'metadata'
+            try:
+                payload = stream.read(int(reference['bytes']))
+            finally:
+                self._budget.phase = phase
             if stamp(raw) != before or hashlib.sha256(payload).hexdigest() != reference['sha256']:
                 _fail('metadata differs from immutable reference')
         return decode_json(payload, reference['path'])
@@ -447,6 +473,9 @@ class StateReader:
             exact_checkpoint=cap(checkpoint, 'checkpoint_verification_required' if self._manifest['checkpoint'] else 'selected_state_has_no_checkpoint'),
             exact_restore=cap(False, 'core_owned'), saved_views=cap(False, 'native5_view_not_implemented'),
             stored_observables=cap(False, 'independent_analysis_not_published'),
+            stored_final_diagnostics=cap(any(row['role'] == 'physics.analysis' and
+                row['schema'] == 'qcl-negf-physics-analysis-v5' for row in self._manifest['artifacts']),
+                'selected_state_has_no_final_diagnostics'),
             streaming_export=cap(history or self._manifest['checkpoint'], 'no_selected_scientific_data'),
             science_export=cap(history, 'independent_analysis_not_published'),
             full_state_export=cap(self._manifest['checkpoint'] is not None, 'selected_state_has_no_checkpoint'),
@@ -556,21 +585,33 @@ class StateReader:
         self._published_paths.update(new_paths_published)
         self._catalog_size, self._catalog_ready = size, True
 
+    def _check_hdf_owner(self, key, item):
+        """Check the actual retained FD and its immutable root-relative binding."""
+        from ._capture_io import stamp
+        from .commits import safe_path
+        try:
+            if self._root_identity() != self._root_stamp:
+                _fail('artifact root replaced', 'source_changed')
+            current = safe_path(self.root, key[0]).stat(follow_symlinks=False)
+            value = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+            opened = stamp(item['raw'], include_change=True)
+        except (OSError, ValueError, ContractError) as error:
+            raise ContractError('trusted payload binding changed', 'source_changed') from error
+        if value != item['stamp'] or opened != item['stamp']:
+            _fail('trusted payload source changed', 'source_changed')
+
     def _open_hdf(self, reference, *, identity=None, invocation=None, representation=None):
         from ._capture_io import regular, stamp
         from .native import validate_native_handle
+        owner_limit = getattr(self, '_consumer_owner_limit', None)
+        if owner_limit is not None and int(reference['bytes']) > owner_limit:
+            _fail('selected native owner exceeds consumer byte limit', 'budget_exceeded')
         key = (reference['path'], reference['sha256'])
         from .commits import safe_path
         path = safe_path(self.root, reference['path'])
         if key in self._handles:
             item = self._handles[key]
-            try:
-                current = path.stat(follow_symlinks=False)
-                value = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
-            except OSError:
-                _fail('trusted payload path disappeared', 'source_changed')
-            if value != item['stamp'] or stamp(item['raw'], include_change=True) != item['stamp']:
-                _fail('trusted payload source changed', 'source_changed')
+            self._check_hdf_owner(key, item)
             self._handles.move_to_end(key)
         else:
             stack = ExitStack()
@@ -589,6 +630,7 @@ class StateReader:
                 if stamp(raw, include_change=True) != before:
                     _fail('payload changed while being verified')
                 item = dict(stack=stack, raw=raw, stream=stream, handle=handle, stamp=before)
+                self._check_hdf_owner(key, item)
                 self._handles[key] = item
                 self._verified_refs[reference['path']] = _ref(reference)
                 while len(self._handles) > self.limits.maximum_open_files:
@@ -596,11 +638,19 @@ class StateReader:
                     old['stack'].close()
                     self._verified_refs = {path: value for path, value in self._verified_refs.items()
                         if any(key[0] == path for key in self._handles)}
-            except Exception:
-                stack.close()
+            except BaseException as error:
+                self._handles.pop(key, None)
+                self._verified_refs.pop(reference['path'], None)
+                try:
+                    stack.close()
+                except BaseException as cleanup_error:
+                    error.add_note('temporary native owner cleanup also raised ' + type(cleanup_error).__name__)
                 raise
         self._budget.phase = 'hdf'
         handle = item['handle']
+        if owner_limit is not None:
+            _internal_storage(handle, maximum_objects=self.limits.maximum_hdf_objects,
+                              maximum_depth=self.limits.maximum_hdf_depth)
         from .native import native_metadata
         native_metadata(handle, identity=identity, invocation=invocation,
                         representation=representation, maximum_bytes=self.limits.maximum_metadata_bytes)
@@ -627,6 +677,12 @@ class StateReader:
         from .native import record_table
         for item in self._handles.values():
             if item['handle'] is handle:
+                # A warm coordinate proof authenticates content, not admission
+                # under a later consumer's tighter decoded-chunk allowance.
+                for name in ('offsets','json_utf8','stream_ordinal'):
+                    dataset = handle['records/'+name]
+                    if dataset.chunks and math.prod(dataset.chunks)*dataset.dtype.itemsize > self.limits.maximum_record_bytes:
+                        _fail('native record chunk decode buffer exceeds limit', 'budget_exceeded')
                 if 'record_count' not in item:
                     item['record_count'] = record_table(handle,
                         maximum_block_bytes=self.limits.maximum_record_bytes)
@@ -837,6 +893,7 @@ class StateReader:
         parent = StateReader.__new__(StateReader)
         parent._initialize(self.root, state_ref=reference, expected_identity=reference['identity'],
             limits=self.limits, budget=self._budget, lineage_depth=self._lineage_depth + 1)
+        parent._consumer_owner_limit = getattr(self, '_consumer_owner_limit', None)
         return parent
 
     def _parent_anchors(self):
@@ -886,6 +943,10 @@ class StateReader:
     def read_array(self, declaration, selection, *, maximum_bytes=1024*1024):
         self._operation()
         wire, dataset = self._array(declaration)
+        return self._read_selected_array(wire, dataset, selection, maximum_bytes=maximum_bytes)
+
+    def _read_selected_array(self, wire, dataset, selection, *, maximum_bytes):
+        """Shared bounded selection; caller authenticates the descriptor owner."""
         if type(maximum_bytes) is not int or not 0 < maximum_bytes <= self.limits.maximum_array_bytes:
             raise ValueError('maximum_bytes exceeds configured array read limit')
         if not isinstance(selection, tuple) or len(selection) != dataset.ndim:
@@ -909,8 +970,16 @@ class StateReader:
             _fail('selected array buffer exceeds limit', 'budget_exceeded')
         if dataset.chunks and math.prod(dataset.chunks)*dataset.dtype.itemsize > self.limits.maximum_array_bytes:
             _fail('native array chunk decode buffer exceeds limit', 'budget_exceeded')
+        # Local analysis descriptors have no FileRef: bind to the real opened
+        # HDF owner, shared with Core arrays, rather than infer a filename.
+        owner = next(((key, item) for key, item in self._handles.items()
+                      if item['handle'].id == dataset.file.id), None)
+        if owner is None:
+            _fail('selected array has no retained verified owner', 'source_changed')
+        self._check_hdf_owner(*owner)
         values = np.asarray(dataset[tuple(normalized)])
         values.flags.writeable = False
+        self._check_hdf_owner(*owner)
         self._budget.logical_selected_bytes += values.nbytes
         return ArrayBlock(values, tuple(normalized), copy.deepcopy(wire), copy.deepcopy(self._state_ref), self.io_counters)
 
