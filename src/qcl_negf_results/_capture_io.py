@@ -63,9 +63,12 @@ class ObserverIO:
         self.forecast_bytes += forecast
 
 
-def stamp(stream):
+def stamp(stream, *, include_change=False):
     value = os.fstat(stream.fileno())
-    return value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+    result = value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns
+    # An unlink changes ctime while the already opened copied bytes stay valid.
+    # A retained native reader additionally guards changes between operations.
+    return result + (value.st_ctime_ns,) if include_change else result
 
 
 @contextmanager

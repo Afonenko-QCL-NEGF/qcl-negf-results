@@ -1,45 +1,29 @@
-# Intermediate export storage budget
+# Export storage and selected-source integrity
 
-`export_snapshot(..., byte_budget=64 * 1024**3, reserve_bytes=64 * 1024**2)`
-limits the simultaneous **logical file bytes** of one export's private spool.
-The CLI exposes the same policy as `--byte-budget` and `--reserve-bytes`, in
-bytes. Both parameters have finite defaults; the budget must be a positive
-integer and the reserve a nonnegative integer.
+`export_snapshot(reader, destination, profile=..., byte_budget=..., reserve_bytes=...)` requires one
+explicitly selected result-v2 reader. The existing private spool accounts simultaneous intermediate
+file bytes and observes free-space headroom. `byte_budget` is a storage admission limit for that
+operation, not a scientific history cutoff or campaign credit. A failure preserves source files and
+publishes no successful receipt for an incomplete snapshot. Filesystem allocation/metadata and
+concurrent writers need additional administrative reserves; observations are not an OS space
+reservation.
 
-The budget includes captured source objects, cumulative-history proof copies,
-telemetry compaction, witness selection and HDF5 repacking, superseded captures
-that still exist, the compressed archive, and the temporary receipt. Published
-archives and source results remain separate owners. An export never omits
-scientific objects to fit this operational budget: it publishes the complete
-selected archive or refuses publication. There is no fixed scientific archive
-size ceiling.
+Science selects actual published scientific artifacts and their own required closure. Optional
+checkpoint tensors are listed as omitted, unless a selected science artifact actually depends on
+them. Original source manifests can remain byte-identical provenance declarations with explicit
+omissions; such a subset must never claim complete canonical or exact-restorable source capability.
+Missing independent native5 stored analysis is reported explicitly.
 
-Preflight checks the known captured prefix and proof copies before copying any
-payload. Each controlled write checks projected file growth and observed free
-space, including the publication reserve. Seeked writes, truncation, typed
-buffers, Parquet writes and compressed XZ output use the same accounting.
-HDF5 uses its file-object driver. After a refusal it discards subsequent writes
-to the private temporary file and reports the original error after HDF5 closes;
-raising inside the C callbacks would leave unsafe pending exception state.
-Independent readback and a complete spool size reconciliation precede any final
-archive or receipt replacement. Refusal cleans only that export's own staging;
-existing archives, receipts and source results remain untouched.
+Full-state requires a checkpoint and complete selected canonical dependency graph. It includes
+immutable history pages, complete record/array owners and exact parent/append dependencies. Each
+original root-relative path maps to a verified content-addressed transport object. Receive
+reconstructs those paths under a fresh owned `source/` directory, validates them with `StateReader`,
+and returns the original StateRef. Shared archive objects use the same immutable bytes; a second
+full tensor copy is unnecessary. Science receive exposes selected objects and capabilities without a
+full canonical source root.
 
-A verified receipt and matching archive for the same pinned source are returned
-before spool preflight because reuse writes no new payload. The current budget
-is an operational policy and does not change scientific snapshot identity.
-An invalid or missing cached archive requires a fresh export and the current
-budget applies to that work.
-
-This library guard is **not a filesystem quota**. File allocation rounding,
-directory metadata, sparse-file accounting and other simultaneous exports or
-processes are outside its logical-byte counter. Free-space observations do not
-reserve space against concurrent writers. Enforce a hard physical disk limit
-with the deployment's existing filesystem quota or a dedicated bounded volume.
-The helper does not install, configure or replace that OS facility.
-
-The exporter refuses with `budget_exceeded` for logical budget exhaustion and
-`storage_failure` for insufficient observed free space. Ordinary write failures
-remain errors and do not acknowledge publication. Export success establishes
-transport consistency; it does not establish solver convergence, physical
-acceptance, discretization sufficiency or experimental validation.
+One tar/XZ archive preserves original native5 bytes; multipart fallback, implicit compaction and
+array re-encoding are unsupported. Hashing, compression and readback stream buffers rather than
+materializing scientific tensors. Full-file SHA bytes can substantially exceed a small selected
+array slice; physical and logical read counters are separate. Export consistency and integrity are
+engineering evidence, not convergence, physics, discretization or experimental acceptance.

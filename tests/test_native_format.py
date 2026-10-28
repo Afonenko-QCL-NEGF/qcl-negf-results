@@ -1,109 +1,69 @@
-"""Readers validate both declared and actual native 4.0 payloads."""
-from __future__ import annotations
-
-import hashlib
-import json
-from pathlib import Path
-
+"""Strict native5 headers and ownership, separate from independent audit subresources."""
 import h5py
 import numpy as np
 import pytest
-
 from qcl_negf_contracts.messages import ContractError
-from qcl_negf_results.commits import artifact_row, json_bytes
-from qcl_negf_results.export import export_snapshot
-from qcl_negf_results.native import validate_native_handle
-from qcl_negf_results.render import materialize
-from native_result_fixtures import declare_native
-from test_export import fixture
+from qcl_negf_results.native import validate_native_handle, native_metadata
+from qcl_negf_results.state import _internal_storage
+from result_v2_fixture import metadata, IDENTITY
 
 
-def _republish(generation):
-    commit_path = generation / "commit.json"
-    commit = json.loads(commit_path.read_bytes())
-    commit["artifacts"][0] = artifact_row(generation / "analysis.h5", relative="analysis.h5",
-        role="physics.analysis", schema="qcl-negf-physics-analysis-v4", media_type="application/x-hdf5")
-    commit_path.write_bytes(json_bytes(commit))
-    return commit, hashlib.sha256(commit_path.read_bytes()).hexdigest()
+@pytest.mark.parametrize('field,value', [('schema_version','4.0'), ('contract_set','qcl-negf.results.v1'),
+    ('artifact_role','physics.full'), ('schema','qcl-negf-physics-v4'), ('core_layout_sha256','0'*64),
+    ('representation','unknown')])
+def test_new_header_cannot_disguise_wrong_version_role_layout_or_representation(tmp_path, field, value):
+    with h5py.File(tmp_path / 'native.h5', 'w') as handle:
+        metadata(handle)
+        handle['metadata'].attrs.modify(field, np.bytes_(value))
+        with pytest.raises(ContractError):
+            validate_native_handle(handle, 'science.history', 'qcl-negf-scientific-history-v5')
 
 
-@pytest.mark.parametrize("change", ["old_version", "old_schema", "missing_markers", "legacy_selected", "missing_metadata"])
-def test_new_declaration_cannot_disguise_an_old_or_incomplete_payload(tmp_path: Path, change: str) -> None:
-    generation = fixture(tmp_path / "run")
-    with h5py.File(generation / "analysis.h5", "a") as handle:
-        if change == "old_version":
-            handle["metadata"].attrs["schema_version"] = "2.0"
-        elif change == "old_schema":
-            handle["metadata"].attrs["schema"] = "qcl-negf-physics-analysis-v2"
-        elif change == "missing_markers":
-            del handle["diagnostics/physical_markers"]
-        elif change == "legacy_selected":
-            del handle["diagnostics/psd_history/selected_blocks"]
-            handle["diagnostics/psd_history"].create_group("selected_blocks").create_group("sequence-1")
+@pytest.mark.parametrize('field', ['schema','schema_version','contract_set','artifact_role','core_layout_sha256','representation'])
+def test_each_native5_header_is_required(tmp_path, field):
+    with h5py.File(tmp_path / 'native.h5', 'w') as handle:
+        metadata(handle)
+        del handle['metadata'].attrs[field]
+        with pytest.raises(ContractError):
+            validate_native_handle(handle)
+
+
+def test_native_source_identity_and_epoch_are_bound_independently_of_filename(tmp_path):
+    with h5py.File(tmp_path / 'native.h5', 'w') as handle:
+        metadata(handle)
+        with pytest.raises(ContractError):
+            native_metadata(handle, identity=dict(IDENTITY, attempt='2'))
+        with pytest.raises(ContractError):
+            native_metadata(handle, invocation=dict(source_epoch='different'))
+
+
+def test_unbounded_header_string_is_rejected_before_value_read(tmp_path, monkeypatch):
+    with h5py.File(tmp_path / 'native.h5', 'w') as handle:
+        metadata(handle)
+        del handle['metadata'].attrs['schema_version']
+        handle['metadata'].attrs.create('schema_version', '5.0', dtype=h5py.string_dtype())
+        original = h5py.AttributeManager.__getitem__
+        def guarded(attrs, key):
+            assert key != 'schema_version', 'unbounded variable-length attribute read'
+            return original(attrs, key)
+        monkeypatch.setattr(h5py.AttributeManager, '__getitem__', guarded)
+        with pytest.raises(ContractError):
+            validate_native_handle(handle)
+
+
+@pytest.mark.parametrize('storage', ['soft','external','raw','virtual'])
+def test_unowned_values_are_rejected_without_numeric_read(tmp_path, storage):
+    with h5py.File(tmp_path / 'native.h5', 'w') as handle:
+        metadata(handle, representation='array_payload')
+        if storage == 'soft':
+            handle['values'] = h5py.SoftLink('/metadata')
+        elif storage == 'external':
+            handle['values'] = h5py.ExternalLink('foreign.h5','/values')
+        elif storage == 'raw':
+            handle.create_dataset('values', shape=(1,), dtype='<f8', external=[('foreign.raw',0,8)])
         else:
-            del handle["metadata"]
-    commit, digest = _republish(generation)
-    # Bytes and digest are correct; a fake v3 declaration must still be rejected.
-    with pytest.raises(ContractError, match="native|schema"):
-        export_snapshot(tmp_path / "run", tmp_path / "exports")
-    with pytest.raises(ValueError, match="native|schema"):
-        materialize(generation, commit, digest, tmp_path / "render")
-    assert not list((tmp_path / "exports").glob("*.tar.xz"))
-
-
-@pytest.mark.parametrize("change", ["availability", "equilibrium_flag", "sequence", "sequence_duplicate"])
-def test_diagnostic_coordinates_and_flags_are_required(tmp_path: Path, change: str) -> None:
-    path = tmp_path / "analysis.h5"
-    with h5py.File(path, "w") as handle:
-        declare_native(handle, "qcl-negf-physics-analysis-v4", "physics.analysis", scba_rows=2)
-        markers = handle["diagnostics/physical_markers"]
-        markers["available"][:] = 1
-        if change == "availability":
-            markers["available"][0] = 2
-        elif change == "equilibrium_flag":
-            markers["equilibrium_applicable"][0] = 2
-        elif change == "sequence":
-            markers["sequence"][0] = 9
-        else:
-            markers["sequence"][:] = [1, 1]
-            handle["diagnostics/psd_history/sequence"][:] = [1, 1]
-            handle["diagnostics/scba/sequence"][:] = [1, 1]
-    with h5py.File(path, "r") as handle, pytest.raises(ValueError, match="zero or one|sequence"):
-        validate_native_handle(handle, "physics.analysis", "qcl-negf-physics-analysis-v4")
-
-
-def test_checkpoint_requires_exact_current_scba_columns(tmp_path: Path) -> None:
-    path = tmp_path / "recovery.h5"
-    with h5py.File(path, "w") as handle:
-        declare_native(handle, "qcl-negf-checkpoint-v4", "recovery", scba_rows=1)
-        del handle["convergence/scba"]
-        handle["convergence/scba"] = np.zeros((1, 17))
-    with h5py.File(path, "r") as handle, pytest.raises(ValueError, match="18 native columns"):
-        validate_native_handle(handle, "recovery", "qcl-negf-checkpoint-v4")
-
-
-@pytest.mark.parametrize("name,dtype", [("fdt_raw", np.float32), ("measured_iteration", np.int32),
-                                       ("available", np.int64), ("equilibrium_applicable", np.int64)])
-def test_marker_storage_requires_exact_native_precision(tmp_path: Path, name: str, dtype) -> None:
-    path = tmp_path / "analysis.h5"
-    with h5py.File(path, "w") as handle:
-        declare_native(handle, "qcl-negf-physics-analysis-v4", "physics.analysis", scba_rows=1)
-        markers = handle["diagnostics/physical_markers"]
-        values = markers[name][()].astype(dtype)
-        del markers[name]
-        markers[name] = values
-    with h5py.File(path, "r") as handle, pytest.raises(ValueError, match="incompatible native dtype"):
-        validate_native_handle(handle, "physics.analysis", "qcl-negf-physics-analysis-v4")
-
-
-def test_marker_native_precision_is_independent_of_endianness(tmp_path: Path) -> None:
-    path = tmp_path / "analysis.h5"
-    with h5py.File(path, "w") as handle:
-        declare_native(handle, "qcl-negf-physics-analysis-v4", "physics.analysis", scba_rows=1)
-        markers = handle["diagnostics/physical_markers"]
-        for name, dtype in (("fdt_raw", ">f8"), ("measured_iteration", ">i8")):
-            values = markers[name][()].astype(dtype)
-            del markers[name]
-            markers[name] = values
-    with h5py.File(path, "r") as handle:
-        validate_native_handle(handle, "physics.analysis", "qcl-negf-physics-analysis-v4")
+            layout = h5py.VirtualLayout(shape=(1,), dtype='<f8')
+            layout[:] = h5py.VirtualSource('foreign.h5','/values', shape=(1,))
+            handle.create_virtual_dataset('values', layout)
+        with pytest.raises(ContractError):
+            _internal_storage(handle)

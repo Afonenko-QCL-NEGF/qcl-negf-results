@@ -28,96 +28,57 @@ def save_series(root, series):
     (root / "series_result.json").write_bytes(json_bytes(series))
 
 
-@pytest.mark.parametrize("reference_kind", ["path", "hash"])
-def test_series_point_cannot_reference_another_valid_point_in_the_same_plan(tmp_path, reference_kind):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    plan, series, commit_path, commit = row_and_commit(root)
-    second = copy.deepcopy(plan["points"][0])
-    second.update(id="point-2", order=2)
-    plan["points"].append(second)
-    plan["computation_count"] = 2
-    plan["maximum_solver_runs"] = 2
-    plan["executions"][0]["point_ids"].append("point-2")
-    foreign = root / "point-2/artifacts/generation-000001"
-    shutil.copytree(commit_path.parent, foreign)
-    commit["identity"]["point_id"] = "point-2"
-    payload = json_bytes(commit)
-    (foreign / "commit.json").write_bytes(payload)
-    relative = str((foreign / "commit.json").relative_to(root))
-    series["points"][0]["data"]["result_commit"] = relative if reference_kind == "path" else {
-        "path": relative, "sha256": hashlib.sha256(payload).hexdigest()}
-    save_series(root, series)
-    with pytest.raises(ContractError, match="series.*commit"):
-        export_snapshot(root, output, plan=json_bytes(plan))
-    assert not list(output.glob("*.tar.xz"))
-    assert not list(output.glob("*.json"))
-
-
-@pytest.mark.parametrize("field,value", [("execution_id", "other-execution"), ("attempt", 2),
-                                         ("plan_fingerprint", "c" * 64)])
-def test_specific_commit_must_match_series_execution_attempt_and_plan(tmp_path, field, value):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    _, series, commit_path, commit = row_and_commit(root)
-    commit["identity"][field] = value
-    commit_path.write_bytes(json_bytes(commit))
-    save_series(root, series)
-    with pytest.raises(ContractError, match="series.*commit"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
-
-
 def historical_row(series):
     row = series["points"][0]
     row.update(attempt=2, status="paused")
     row["data"].update(checkpoint_source_attempt=1, pause_reason="resource_pressure",
                        resume_kind="checkpoint", recovery_origin="last_committed_before_resource_pause")
 
-
-def test_declared_resource_pause_preserves_older_checkpoint_attempt(tmp_path):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    plan, series, _, _ = row_and_commit(root)
-    historical_row(series)
-    save_series(root, series)
-    receipt = export_snapshot(root, output, plan=json_bytes(plan))
-    assert receipt["snapshot_consistent"] is True
+# Canonical StateRef replaces implicit series selection. Old constructor helpers
+# above remain for pending native4 consumer tests only.
+from result_v2_fixture import IDENTITY, source, record, put, producer_root, producer_state
+from qcl_negf_results.state import StateReader
 
 
-@pytest.mark.parametrize("field,value", [("status", "running"), ("pause_reason", "other"),
-    ("resume_kind", "cold_start"), ("recovery_origin", "other"),
-    ("checkpoint_source_attempt", 2), ("checkpoint_source_attempt", True),
-    ("checkpoint_source_attempt", 0)])
-def test_historical_checkpoint_requires_exact_declared_resource_pause_lineage(tmp_path, field, value):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    _, series, _, _ = row_and_commit(root)
-    historical_row(series)
-    row = series["points"][0]
-    if field == "status":
-        row[field] = value
-    else:
-        row["data"][field] = value
-    save_series(root, series)
-    with pytest.raises(ContractError, match="checkpoint|series.*commit"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
+@pytest.mark.parametrize('field,value', [('execution_id','other-execution'),('point_id','other-point'),
+    ('attempt','2'),('branch_id','other-branch'),('run_id','other-run'),
+    ('plan_sha256','c'*64),('model_sha256','d'*64)])
+def test_state_ref_must_match_complete_explicit_identity(tmp_path, field, value):
+    ref = source(tmp_path, [record()])
+    expected = copy.deepcopy(IDENTITY)
+    expected[field] = value
+    with pytest.raises(ContractError) as error:
+        StateReader(tmp_path, state_ref=ref, expected_identity=expected)
+    assert error.value.code == 'identity_mismatch'
 
 
-def test_attempt_history_reference_is_pinned_and_checked(tmp_path):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    plan, series, commit_path, commit = row_and_commit(root)
-    history = copy.deepcopy(series["points"][0])
-    series["attempt_history"] = [history]
-    next_generation = commit_path.parent.parent / "generation-000002"
-    shutil.copytree(commit_path.parent, next_generation)
-    commit["identity"]["attempt"] = 2
-    commit["generation"] = 2
-    payload = json_bytes(commit)
-    (next_generation / "commit.json").write_bytes(payload)
-    series["points"][0]["attempt"] = 2
-    series["points"][0]["data"]["result_commit"] = str((next_generation / "commit.json").relative_to(root))
-    save_series(root, series)
-    receipt = export_snapshot(root, output, plan=json_bytes(plan), profile="full-state")
-    assert receipt["committed_records"] == 2
-    history["data"]["result_commit"] = series["points"][0]["data"]["result_commit"]
-    save_series(root, series)
-    with pytest.raises(ContractError, match="series.*commit"):
-        export_snapshot(root, output, plan=json_bytes(plan))
+@pytest.mark.parametrize('field,value', [('state_id','foreign-state'),('state_sequence','2')])
+def test_state_ref_must_match_exact_immutable_manifest(tmp_path, field, value):
+    ref = source(tmp_path, [record()])
+    ref[field] = value
+    with pytest.raises(ContractError):
+        StateReader(tmp_path, state_ref=ref, expected_identity=IDENTITY)
+
+
+@pytest.mark.parametrize('name', ['child','grandchild'])
+def test_explicit_older_attempt_parent_survives_exact_cutoff(producer_root, name):
+    ref = producer_state(producer_root, name)
+    with StateReader(producer_root, state_ref=ref, expected_identity=ref['identity']) as reader:
+        reader.import_history()
+        batch = reader.history_batch()
+        updates = [row for row in batch.records if row['target'] is not None]
+        assert updates and all(row['target']['scope'] == 'parent_checkpoint' for row in updates)
+        assert reader.source.lineage['parent_state']['identity']['attempt'] != ref['identity']['attempt']
+
+
+@pytest.mark.parametrize('field,value', [('branch_id','foreign'), ('model_sha256','c'*64), ('plan_sha256','d'*64)])
+def test_declared_parent_cannot_cross_canonical_identity(producer_root, tmp_path, field, value):
+    from result_v2_fixture import copy_constructor_closure
+    ref = producer_state(producer_root, 'child')
+    root = copy_constructor_closure(producer_root, tmp_path / 'source', ref)
+    manifest = json.loads((root / ref['manifest']['path']).read_text())
+    manifest['lineage']['parent_state']['identity'][field] = value
+    ref['manifest'] = put(root, 'foreign-parent-manifest.json', manifest, manifest['schema'])
+    with pytest.raises(ContractError):
+        with StateReader(root, state_ref=ref, expected_identity=ref['identity']) as reader:
+            reader.history_batch()

@@ -171,32 +171,171 @@ def _scba_count(parent: Any) -> int:
     raise ValueError("native SCBA history has no row count")
 
 
-def validate_native_handle(handle: Any, role: str | None = None,
-                           declared_schema: str | None = None) -> str:
-    """Accept only the current format; no legacy layout, version or marker fallback."""
+def _native_header(group, maximum_bytes):
     import h5py
+    from qcl_negf_contracts.messages import ContractError
+    result = {}
+    for name in ('schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'):
+        if name not in group.attrs:
+            raise ContractError('required native5 metadata attribute missing', 'corrupt_result')
+        attribute = group.attrs.get_id(name)
+        datatype, space = attribute.get_type(), attribute.get_space()
+        try:
+            if (datatype.get_class() != h5py.h5t.STRING or datatype.is_variable_str()
+                    or datatype.get_size() > maximum_bytes or space.get_simple_extent_type() != h5py.h5s.SCALAR):
+                raise ContractError('native5 header requires bounded fixed-width scalar strings', 'corrupt_result')
+            result[name] = _text(group.attrs[name])
+        finally:
+            space.close()
+            datatype.close()
+            attribute.close()
+    return result
+
+
+def validate_native_handle(handle: Any, role: str | None = None,
+                           declared_schema: str | None = None, *,
+                           maximum_metadata_bytes: int = 16 * 1024 * 1024) -> str:
+    """Validate only native5 metadata on an already verified immutable stream."""
+    import h5py
+    from qcl_negf_contracts.messages import ContractError
+    def fail(message):
+        raise ContractError(message, "corrupt_result")
     if "metadata" not in handle or not isinstance(handle["metadata"], h5py.Group):
-        raise ValueError("native format 4.0 requires metadata")
-    metadata = handle["metadata"]
-    if _text(metadata.attrs.get("contract_set", "")) != CONTRACT_SET:
-        raise ValueError(f"unsupported native contract set: requires {CONTRACT_SET}")
-    actual_role = _text(metadata.attrs.get("artifact_role", ""))
-    schema = _text(metadata.attrs.get("schema", ""))
-    if _text(metadata.attrs.get("schema_version", "")) != NATIVE_SCHEMA_VERSION:
-        raise ValueError("unsupported native format: requires schema_version 4.0")
-    if schema not in HDF5_SCHEMAS.get(actual_role, frozenset()) or (role is not None and actual_role != role):
-        raise ValueError("native schema does not match its declared scientific role")
+        fail("native5 metadata missing")
+    attrs = _native_header(handle['metadata'], maximum_metadata_bytes)
+    if (_text(attrs.get("contract_set", "")) != CONTRACT_SET
+            or _text(attrs.get("schema_version", "")) != "5.0"):
+        raise ContractError("only result-v2/native5 is supported", "unsupported_format")
+    actual_role, schema = _text(attrs.get("artifact_role", "")), _text(attrs.get("schema", ""))
+    allowed = {"science.history": "qcl-negf-scientific-history-v5",
+               "recovery": "qcl-negf-checkpoint-v5", "physics.full": "qcl-negf-physics-v5"}
+    if allowed.get(actual_role) != schema or role is not None and role != actual_role:
+        fail("native schema/role differs from owning declaration")
     if declared_schema is not None and schema != declared_schema:
-        raise ValueError("native schema differs from the committed artifact schema")
-    parents = {HISTORY_SCHEMA: "", "qcl-negf-physics-analysis-v4": "diagnostics",
-               "qcl-negf-checkpoint-v4": "convergence", "qcl-negf-physics-v4": "convergence"}
-    if schema in parents:
-        path = parents[schema]
-        if path and path not in handle:
-            raise ValueError(f"native format 4.0 requires {path}")
-        parent = handle[path] if path else handle
-        validate_scba_diagnostics(parent, _scba_count(parent))
+        fail("native schema differs from FileRef")
+    native_metadata(handle, maximum_bytes=maximum_metadata_bytes)
     return schema
+
+
+def native_metadata(handle, *, identity=None, invocation=None, representation=None,
+                    maximum_bytes=16 * 1024 * 1024):
+    from importlib.resources import files
+    import json
+    import numpy as np
+    from qcl_negf_contracts.messages import ContractError
+    from .commits import decode_json
+    def fail(message):
+        raise ContractError(message, "corrupt_result")
+    group = handle["metadata"]
+    attrs = _native_header(group, maximum_bytes)
+    layout = json.loads(files("qcl_negf_contracts").joinpath("core_layout.json").read_text())["layout_sha256"]
+    if attrs['core_layout_sha256'] != layout:
+        raise ContractError("unsupported Core layout", "unsupported_format")
+    actual = attrs['representation']
+    if actual not in ("array_payload", "record_leaf") or representation is not None and actual != representation:
+        fail("native representation differs from ordered catalog/declaration")
+    result = dict(representation=actual)
+    for name, expected in (("identity_json", identity), ("invocation_json", invocation)):
+        if name not in group:
+            fail("native source identity metadata missing")
+        dataset = group[name]
+        # Fixed width makes the allocation bound inspectable before reading.
+        if dataset.shape != () or dataset.dtype.kind != "S" or dataset.dtype.itemsize > maximum_bytes:
+            fail("native identity requires bounded fixed-width UTF-8 scalar")
+        raw = bytes(dataset[()])
+        value = decode_json(raw, name)
+        if expected is not None and value != expected:
+            fail("native source identity/epoch differs from selected reference")
+        result[name] = value
+    return result
+
+
+def record_table(handle, *, maximum_block_bytes=1024*1024):
+    """Check offsets in bounded slabs; numerical array payloads are untouched."""
+    import h5py
+    import numpy as np
+    from qcl_negf_contracts.messages import ContractError
+    def fail(message):
+        raise ContractError(message, "corrupt_result")
+    if type(maximum_block_bytes) is not int or maximum_block_bytes < 8:
+        raise ContractError('record coordinate buffer requires at least eight bytes', 'budget_exceeded')
+    try:
+        offsets, data, ordinals = (handle["records/" + name] for name in
+                                    ("offsets", "json_utf8", "stream_ordinal"))
+    except KeyError:
+        fail("native record table missing")
+    if (any(not isinstance(x, h5py.Dataset) or x.ndim != 1 for x in (offsets, data, ordinals))
+            or offsets.dtype != np.dtype("<u8") or ordinals.dtype != np.dtype("<u8")
+            or data.dtype != np.dtype("u1") or len(offsets) != len(ordinals) + 1):
+        fail("native record coordinates dtype/shape differs")
+    import math
+    for dataset in (offsets, data, ordinals):
+        if dataset.chunks and math.prod(dataset.chunks)*dataset.dtype.itemsize > maximum_block_bytes:
+            raise ContractError('native record chunk decode buffer exceeds limit', 'budget_exceeded')
+        if dataset.scaleoffset is not None or dataset.compression not in (None, 'gzip'):
+            fail('native record uses unsupported/lossy storage filter')
+    if int(offsets[0]) != 0 or int(offsets[-1]) != len(data):
+        fail("native record offset endpoints differ")
+    prior = 0
+    block_entries = min(8192, maximum_block_bytes//offsets.dtype.itemsize)
+    for first in range(0, len(offsets), block_entries):
+        block = offsets[first:first + block_entries]
+        if len(block) and (int(block[0]) < prior or np.any(block[1:] <= block[:-1])):
+            fail("native record offsets are not increasing")
+        if len(block):
+            prior = int(block[-1])
+    return len(ordinals)
+
+
+def validate_native_array(handle, declaration):
+    """Match native dataset storage against the verified tagged Core declaration."""
+    import h5py
+    import numpy as np
+    from qcl_negf_contracts.messages import ContractError
+    from importlib.resources import files
+    import json
+    def fail(message):
+        raise ContractError(message, "corrupt_result")
+    if declaration.get("kind") != "array" or declaration.get("order") != "F":
+        fail("native array requires column-major Core declaration")
+    layout = json.loads(files('qcl_negf_contracts').joinpath('core_layout.json').read_text())
+    supported = {(node['eltype'], node['rank']) for node in layout['graph']['nodes'].values()
+                 if node.get('kind') == 'array' and node.get('storage') == 'dataset'}
+    if (declaration.get('eltype'), len(declaration.get('shape', []))) not in supported:
+        fail('array eltype/rank outside reflected public Core graph')
+    path = declaration.get("dataset")
+    if not isinstance(path, str) or not path.startswith("/arrays/") or any(x in ("", ".", "..") for x in path[1:].split("/")):
+        fail("unsupported native array dataset path")
+    if path not in handle or not isinstance(handle[path], h5py.Dataset):
+        fail("native array dataset missing")
+    dataset = handle[path]
+    if dataset.shape != tuple(int(x) for x in declaration["shape"]):
+        fail("native array logical shape differs from descriptor")
+    dtype = dataset.dtype
+    eltype = declaration["eltype"]
+    kind = dataset.id.get_type()
+    if eltype == "Bool":
+        if kind.get_class() != h5py.h5t.ENUM or dtype != np.dtype("bool"):
+            fail("native Bool is not exact HDF Boolean enum")
+    elif eltype.startswith("ComplexF"):
+        width = int(eltype[8:]) // 8
+        if (kind.get_class() != h5py.h5t.COMPOUND or kind.get_nmembers() != 2
+                or [kind.get_member_name(i) for i in range(2)] != [b"r", b"i"]
+                or [kind.get_member_offset(i) for i in range(2)] != [0, width]
+                or kind.get_size() != 2 * width or dtype != np.dtype("<c" + str(2 * width))):
+            fail("native complex requires exact consecutive r/i compound")
+        for i in range(2):
+            field = kind.get_member_type(i)
+            if field.get_class() != h5py.h5t.FLOAT or field.get_size() != width or field.get_order() != h5py.h5t.ORDER_LE:
+                fail("native complex component precision/order differs")
+    else:
+        prefix = "f" if eltype.startswith("Float") else "u" if eltype.startswith("UInt") else "i" if eltype.startswith("Int") else None
+        digits = ''.join(x for x in eltype if x.isdigit())
+        if prefix is None or not digits or dtype != np.dtype("<" + prefix + str(int(digits) // 8)):
+            fail("native array eltype differs from descriptor")
+    if dataset.scaleoffset is not None or dataset.compression not in (None, "gzip"):
+        fail("native array uses unsupported/lossy storage filter")
+    return dataset
 
 
 _FINAL_AUDIT_SCHEMA = "qcl-negf-final-fixed-point-audit-v1"

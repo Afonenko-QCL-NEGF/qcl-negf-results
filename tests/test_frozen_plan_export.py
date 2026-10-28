@@ -31,71 +31,46 @@ def planned_result(root):
     (root / "series_result.json").write_bytes(json_bytes(series))
     return plan, generation
 
-
-def test_frozen_plan_bytes_and_source_are_preserved_and_byte_identity_is_pinned(tmp_path):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    plan, generation = planned_result(root)
-    raw = (json.dumps(plan, ensure_ascii=False, indent=3) + "\n\n").encode()
-    receipt = export_snapshot(root, output, plan=raw,
-                              plan_source="aiida.retrieved:result/scientific_plan.json")
-    with tarfile.open(output / receipt["archive"], "r:xz") as archive:
-        assert archive.extractfile("plan.json").read() == raw
-        manifest = json.load(archive.extractfile("manifest.json"))
-        provenance = manifest["frozen_plan"]
-        assert provenance["source"] == "aiida.retrieved:result/scientific_plan.json"
-        assert provenance["sha256"] == hashlib.sha256(raw).hexdigest()
-        assert provenance["bytes"] == len(raw)
-        assert provenance["fingerprint"] == plan["fingerprint"]
-        assert "contract_set" not in json.loads(raw)
-        analysis = manifest["records"][0]["included"][0]
-        assert archive.extractfile(analysis["object"]).read() == (generation / analysis["source_path"]).read_bytes()
-    same = export_snapshot(root, output, plan=raw,
-                           plan_source="aiida.retrieved:result/scientific_plan.json")
-    assert same == receipt
-    reformatted = export_snapshot(root, output, plan=json_bytes(plan),
-                                  plan_source="aiida.retrieved:result/scientific_plan.json")
-    assert reformatted["snapshot_identity"] != receipt["snapshot_identity"]
+# Historical helper retained for consumers pending their owning migration.
+# The supported reader binds the exact canonical plan/model hash in Identity.
+from result_v2_fixture import IDENTITY, source, record, reference, put, export_source
+from qcl_negf_results.state import StateReader
+import copy
 
 
-def test_valid_mapping_plan_keeps_the_existing_keyword_api(tmp_path):
-    root = tmp_path / "run"
-    plan, _ = planned_result(root)
-    receipt = export_snapshot(root, tmp_path / "exports", plan=plan)
-    with tarfile.open(tmp_path / "exports" / receipt["archive"], "r:xz") as archive:
-        assert json.load(archive.extractfile("plan.json")) == plan
+@pytest.mark.parametrize('field', ['plan_sha256','model_sha256'])
+def test_selected_frozen_identity_rejects_foreign_plan_or_model(tmp_path, field):
+    ref = source(tmp_path, [record()])
+    expected = copy.deepcopy(IDENTITY)
+    expected[field] = 'c'*64
+    with pytest.raises(ContractError) as error:
+        StateReader(tmp_path, state_ref=ref, expected_identity=expected)
+    assert error.value.code == 'identity_mismatch'
 
 
-@pytest.mark.parametrize("change", ["schema", "model_revision", "contract_set"])
-def test_invalid_frozen_plan_schema_is_rejected_before_publication(tmp_path, change):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    plan, _ = planned_result(root)
-    plan[change] = "foreign"
-    with pytest.raises(ContractError, match="scientific plan"):
-        export_snapshot(root, output, plan=plan)
-    assert not list(output.glob("*.tar.xz"))
-    assert not list(output.glob("*.json"))
-
-
-@pytest.mark.parametrize("change", ["fingerprint", "scientific_fingerprint", "execution_id", "coordinates"])
-def test_plan_identity_mismatch_is_rejected_before_publication(tmp_path, change):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    plan, _ = planned_result(root)
-    if change in {"fingerprint", "scientific_fingerprint"}:
-        plan[change] = "c" * 64 if plan[change] != "c" * 64 else "d" * 64
-    elif change == "execution_id":
-        plan["points"][0]["execution_id"] = "foreign-execution"
-    else:
-        plan["points"][0]["temperature_K"] += 1
-    with pytest.raises(ContractError, match="plan"):
-        export_snapshot(root, output, plan=json_bytes(plan))
-    assert not list(output.glob("*.tar.xz"))
-    assert not list(output.glob("*.json"))
-
-
-@pytest.mark.parametrize("raw", [b'{"schema":', b'{"schema":"a","schema":"b"}', b'\xff'])
-def test_corrupt_plan_bytes_are_rejected_before_publication(tmp_path, raw):
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
+def test_original_source_manifest_bytes_are_preserved_exactly(tmp_path):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    value = json.loads((root / ref['manifest']['path']).read_text())
+    raw = (json.dumps(value, indent=3)+'\n\n').encode()
+    (root / ref['manifest']['path']).write_bytes(raw)
+    ref['manifest'] = reference(root, ref['manifest']['path'], value['schema'])
+    receipt = export_source(root, ref, output)
+    with tarfile.open(output / receipt['archive'], 'r:xz') as archive:
+        manifest = json.load(archive.extractfile('manifest.json'))
+        row = next(row for row in manifest['source_locator'] if row['reference'] == ref['manifest'])
+        assert archive.extractfile(row['object']).read() == raw
+    (root / ref['manifest']['path']).write_bytes(raw+b' ')
     with pytest.raises(ContractError):
-        export_snapshot(root, output, plan=raw)
-    assert not list(output.glob("*.tar.xz"))
+        export_source(root, ref, tmp_path / 'bad')
+
+
+@pytest.mark.parametrize('override', [{'plan':{}}, {'plan':b'{"schema":'},
+    {'plan_source':'other'}, {'job_status':'completed'}])
+def test_caller_plan_or_process_override_cannot_relabel_selected_source(tmp_path, override):
+    ref = source(tmp_path / 'source', [record()])
+    with StateReader(tmp_path / 'source', state_ref=ref, expected_identity=IDENTITY) as reader:
+        with pytest.raises(TypeError):
+            export_snapshot(reader, tmp_path / 'bad', profile='science',
+                byte_budget=1024*1024, reserve_bytes=0, **override)
+    assert not (tmp_path / 'bad').exists()

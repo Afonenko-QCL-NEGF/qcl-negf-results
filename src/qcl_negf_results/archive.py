@@ -1,4 +1,4 @@
-"""Streaming single-archive transport, with a receiver for legacy multipart sets.
+"""Streaming result-v2 single-archive transport.
 
 The shared inventory describes whole native objects. Independent readback checks
 every member and the complete object closure before publication or restoration.
@@ -179,6 +179,31 @@ def _manifest_closure(manifest: dict[str, Any], index: dict[str, Any]) -> None:
             if (row.get("object") not in objects or not isinstance(dependencies, list)
                     or any(dep not in objects for dep in dependencies)):
                 raise ContractError("snapshot has dangling dependencies", "corrupt_result")
+    if index['profile'] != 'diagnostic':
+        complete = index['profile'] == 'full-state'
+        if manifest.get('canonical_source_complete') is not complete:
+            raise ContractError('subset archive cannot claim complete canonical source', 'corrupt_result')
+        mapping = {}
+        from qcl_negf_contracts import schema_validator
+        from .state import _schema_check
+        common = schema_validator('result-common.schema.json')
+        validator = common.evolve(schema={'$ref': '#/$defs/FileRef', '$defs': common.schema['$defs']})
+        for row in _rows(manifest.get('source_locator')):
+            if set(row) != {'reference','object'}:
+                raise ContractError('invalid source locator row', 'corrupt_result')
+            ref = row['reference']
+            _schema_check(validator, ref)
+            name = relative_path(ref['path'])
+            if name in mapping or row['object'] not in objects:
+                raise ContractError('duplicate or dangling source locator', 'corrupt_result')
+            item = objects[row['object']]
+            if ref['sha256'] != item['sha256'] or int(ref['bytes']) != item['bytes']:
+                raise ContractError('source locator differs from transport bytes', 'corrupt_result')
+            mapping[name] = row
+        state = manifest.get('source_state')
+        _schema_check(common.evolve(schema={'$ref': '#/$defs/StateRef', '$defs': common.schema['$defs']}), state)
+        if state['manifest']['path'] not in mapping or mapping[state['manifest']['path']]['reference'] != state['manifest']:
+            raise ContractError('source manifest locator missing or changed', 'corrupt_result')
 
 
 def _receipt_closure(receipt: dict[str, Any] | None, index: dict[str, Any]) -> None:
@@ -189,14 +214,25 @@ def _receipt_closure(receipt: dict[str, Any] | None, index: dict[str, Any]) -> N
         raise ContractError("receipt and archive identify different snapshots or profiles", "corrupt_result")
 
 
-def _read_archive(path: Path, root: Path | None, report: Callable[..., None]) -> dict[str, Any]:
+def _read_archive(path: Path, root: Path | None, report: Callable[..., None], *, manifest_out=None) -> dict[str, Any]:
+    try:
+        return _read_archive_contents(path, root, report, manifest_out=manifest_out)
+    except (tarfile.TarError, lzma.LZMAError, EOFError) as error:
+        raise ContractError('invalid complete archive stream: ' + str(error), 'corrupt_result') from error
+
+
+def _read_archive_contents(path: Path, root: Path | None, report: Callable[..., None], *, manifest_out=None) -> dict[str, Any]:
     with tarfile.open(path, "r:xz") as archive:
         first = archive.next()
+        if first is not None and first.name == 'part.json':
+            raise ContractError('retired multipart transport is unsupported', 'unsupported_format')
         if first is None or first.name != INDEX_NAME or not first.isfile():
             raise ContractError("archive omitted its leading transport index", "corrupt_result")
         source = archive.extractfile(first)
         assert source is not None
-        index_payload = source.read()
+        if first.size > 64 * 1024 * 1024:
+            raise ContractError('archive index exceeds metadata limit', 'budget_exceeded')
+        index_payload = source.read(64 * 1024 * 1024 + 1)
         index = _json_object(index_payload)
         remaining = _inventory(index)
         total = sum(row["bytes"] for row in remaining.values())
@@ -220,6 +256,8 @@ def _read_archive(path: Path, root: Path | None, report: Callable[..., None]) ->
                 target_path.parent.mkdir(parents=True, exist_ok=True)
                 target = target_path.open("wb")
             digest = hashlib.sha256()
+            if member.name == 'manifest.json' and member.size > 64 * 1024 * 1024:
+                raise ContractError('export manifest exceeds metadata limit', 'budget_exceeded')
             captured = bytearray() if member.name == "manifest.json" else None
             try:
                 while value := source.read(BLOCK):
@@ -258,6 +296,13 @@ def _read_archive(path: Path, root: Path | None, report: Callable[..., None]) ->
             try:
                 with h5py.File(source, "r") as handle:
                     _internal_storage(handle)
+                    if index['profile'] != 'diagnostic':
+                        from .native import validate_native_handle
+                        schemas = {entry['reference']['schema'] for entry in manifest['source_locator']
+                                   if entry['object'] == name}
+                        if len(schemas) != 1:
+                            raise ContractError('native object lacks one exact declared schema', 'corrupt_result')
+                        validate_native_handle(handle, declared_schema=schemas.pop())
             except (OSError, ValueError) as error:
                 raise ContractError(f"invalid HDF5 archive object: {error}", "corrupt_result") from error
             finally:
@@ -265,6 +310,8 @@ def _read_archive(path: Path, root: Path | None, report: Callable[..., None]) ->
                     source.close()
     if root is not None:
         (root / INDEX_NAME).write_bytes(index_payload)
+    if manifest_out is not None:
+        manifest_out.update(manifest)
     return index
 
 
@@ -277,20 +324,78 @@ def verify_archive(path: Path, *, report: Callable[..., None] = _quiet) -> dict[
     return _read_archive(path, None, report)
 
 
+def _verify_source_tree(root, state_ref, *, limits=None, budget=None):
+    """Explicit full-source metadata/dtype proof with the same bounded reader.
+
+    The operation streams integrity hashes; no numerical tensor is materialized.
+    """
+    from .state import StateReader, ResultReadLimits, _IOBudget, _arrays
+    limits = limits or ResultReadLimits()
+    budget = budget or _IOBudget(limits.maximum_io_bytes)
+    queue, seen = [state_ref], set()
+    while queue:
+        state = queue.pop()
+        digest = state['manifest']['sha256']
+        if digest in seen:
+            continue
+        seen.add(digest)
+        reader = StateReader.__new__(StateReader)
+        reader._initialize(root, state_ref=state, expected_identity=state['identity'], limits=limits,
+                           budget=budget)
+        with reader:
+            if len(seen) > reader.limits.maximum_catalog_pages:
+                raise ContractError('restored lineage exceeds metadata limit', 'budget_exceeded')
+            reader.import_history()
+            checkpoint = reader.checkpoint()
+            for declaration in _arrays(checkpoint):
+                reader.describe_array(declaration)
+            cursor = None
+            while True:
+                batch = reader.history_batch(cursor)
+                for record in batch.records:
+                    for declaration in _arrays(record):
+                        reader.describe_array(declaration)
+                cursor = batch.cursor
+                if batch.at_cutoff:
+                    break
+            parent = reader.source.lineage['parent_state']
+            if parent is not None:
+                queue.append(parent)
+
+
+def _restore_source(root, manifest):
+    from ._capture_io import beneath
+    from .state import StateReader
+    source = root / 'source'
+    source.mkdir()
+    for row in manifest['source_locator']:
+        target = beneath(source, row['reference']['path'])
+        target.parent.mkdir(parents=True, exist_ok=True)
+        # Both paths are in our freshly owned private extraction tree. Link the
+        # same immutable bytes instead of allocating another scientific copy.
+        os.link(root / row['object'], target)
+    _verify_source_tree(source, manifest['source_state'])
+    from .export import _selection
+    state = manifest['source_state']
+    with StateReader(source, state_ref=state, expected_identity=state['identity']) as reader:
+        required, _, _ = _selection(reader, 'full-state')
+    supplied = {row['reference']['path']: row['reference'] for row in manifest['source_locator']}
+    if set(supplied) != set(required):
+        raise ContractError('restored source inventory contains unrelated or missing paths', 'corrupt_result')
+    for name, reference in required.items():
+        if name not in supplied or any(supplied[name][key] != reference[key]
+                                      for key in ('path','bytes','sha256','media_type','schema')):
+            raise ContractError('restored source graph has missing/conflicting dependency', 'corrupt_result')
+
+
 def receive(paths: Sequence[Path], destination: Path | None = None, *,
             receipt: dict[str, Any] | None = None) -> dict[str, Any]:
-    """Verify/restore one new archive, or independently verify a legacy part set."""
+    """Verify one result-v2 archive; full-state reconstructs its original source."""
     paths = [Path(path) for path in paths]
     if not paths:
         raise ContractError("no export archives supplied", "corrupt_result")
-    with tarfile.open(paths[0], "r|xz") as archive:
-        first = archive.next()
-        legacy = first is not None and first.name == "part.json"
-    if legacy:
-        from .multipart import receive as receive_legacy
-        return receive_legacy(paths, destination, receipt=receipt)
     if len(paths) != 1:
-        raise ContractError("single archive transport requires exactly one archive", "corrupt_result")
+        raise ContractError("single archive transport requires exactly one archive", "unsupported_format")
     path = paths[0]
     if receipt is not None:
         validate_export_receipt(receipt)
@@ -299,8 +404,9 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
                 raise ContractError("archive checksum differs from receipt", "corrupt_result")
         if path.stat().st_size != receipt["bytes"]:
             raise ContractError("archive size differs from receipt", "corrupt_result")
+    manifest = {}
     if destination is None:
-        index = verify_archive(path)
+        index = _read_archive(path, None, _quiet, manifest_out=manifest)
         _receipt_closure(receipt, index)
     else:
         destination = Path(destination)
@@ -312,11 +418,19 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
             root.mkdir()
             index = _read_archive(path, root, _quiet)
             _receipt_closure(receipt, index)
+            manifest = _json_object((root / 'manifest.json').read_bytes())
+            if index['profile'] == 'full-state':
+                _restore_source(root, manifest)
             os.replace(root, destination)
     return {"snapshot_identity": index["snapshot_identity"], "verified": True,
-            "verification_scope": "transport_hashes_and_hdf5_storage",
+            "verification_scope": ('transport_hashes_native5_storage_and_source_closure'
+                if destination is not None and index['profile'] == 'full-state' else 'transport_hashes_and_hdf5_storage'),
             "archive_count": 1, "objects": len(index["objects"]),
-            "destination": str(destination) if destination is not None else None}
+            "destination": str(destination) if destination is not None else None,
+            'profile': index['profile'],
+            'capabilities': manifest.get('capabilities', []),
+            'source_root': str(destination / 'source') if destination is not None and index['profile'] == 'full-state' else None,
+            'source_state': manifest['source_state'] if manifest and index['profile'] == 'full-state' else None}
 
 
 def main() -> None:

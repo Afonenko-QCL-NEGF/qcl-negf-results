@@ -106,6 +106,8 @@ class DiagnosticReader:
         self.close()
 
     def __init__(self, commit_path, *, expected_identity, limits=None, budget=None):
+        raise ContractError('native5 diagnostic view requires owning followup; use canonical history_batch',
+                            'capability_unavailable')
         self.limits = limits or DiagnosticViewLimits()
         if not isinstance(self.limits, DiagnosticViewLimits):
             raise ValueError('limits must be DiagnosticViewLimits')
