@@ -351,6 +351,7 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
     Each boundary flux has an outward sign (electron flow, not charge current).
     The finite common-mu fit is a construction, not an equilibrium verdict.
     """
+    raise ContractError('native5 equilibrium view requires owning analysis followup', 'capability_unavailable')
     if not isinstance(limits, EquilibriumReadLimits):
         raise TypeError('limits must be EquilibriumReadLimits')
     if not isinstance(expected_identity, Mapping) or not expected_identity:

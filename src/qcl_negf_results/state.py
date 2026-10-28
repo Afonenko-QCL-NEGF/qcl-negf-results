@@ -1,32 +1,78 @@
-"""Verified immutable state access with bounded HDF5 hyperslabs.
+"""One result-v2 source, canonical cursors and bounded, verified native5 reads.
 
-Integrity verification streams each file once; it never deserializes solver
-arrays. Keep a reader open for multiple block reads to avoid repeated hashing.
-Receipts establish local publication and integrity, not scientific acceptance
-or remote storage availability.
+Metadata import and selected byte verification are separate. Nothing here runs a
+solver or converts process completion into scientific acceptance.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections import OrderedDict
+from contextlib import ExitStack
+from dataclasses import dataclass, fields
+import copy
 import hashlib
 import io
-import json
 import math
+import os
+import sys
 from pathlib import Path
 from typing import Any, Mapping
-from types import MappingProxyType
 
 import h5py
-
-from qcl_negf_contracts.artifacts import Artifact, validate_commit, validate_execution_progress
+import numpy as np
+from qcl_negf_contracts import schema_validator
+from qcl_negf_contracts.artifacts import relative_path
 from qcl_negf_contracts.messages import ContractError
-from .commits import decode_json, read_json, safe_path
-from .native import validate_native_handle, _read_final_fixed_point_audit
-from .provenance import _identity_fields, _json_scalar, _state_identity
+from qcl_negf_contracts.results import (validate_manifest, validate_pointer, validate_catalog_page,
+    validate_checkpoint_declaration, validate_scientific_record, validate_cursor)
+from .commits import decode_json, json_bytes
+
+Document = Mapping[str, Any]
+_REF_KEYS = ('path', 'bytes', 'sha256', 'media_type', 'schema')
+_TOTALS = ('records', 'scba_rows', 'outer_rows', 'witness_updates', 'last_record')
 
 
-def _fail(message: str) -> None:
-    raise ContractError(message, "corrupt_result")
+def _fail(message, code='corrupt_result'):
+    raise ContractError(message, code)
+
+
+def _ref(value):
+    return {key: value[key] for key in _REF_KEYS}
+
+
+def _schema_check(validator, value):
+    from jsonschema import ValidationError
+    try:
+        validator.validate(value)
+    except ValidationError as error:
+        raise ContractError('invalid result declaration: ' + error.message, 'corrupt_result') from error
+
+
+def _arrays(value):
+    if isinstance(value, dict):
+        if value.get('kind') == 'array' and 'file' in value:
+            yield value
+        for item in value.values():
+            yield from _arrays(item)
+    elif isinstance(value, list):
+        for item in value:
+            yield from _arrays(item)
+
+
+def _metadata_weight(value):
+    """Conservative retained Python-object estimate; not a process RSS limit."""
+    pending, seen, total = [value], set(), 0
+    while pending:
+        item = pending.pop()
+        if id(item) in seen:
+            continue
+        seen.add(id(item))
+        total += sys.getsizeof(item)
+        if isinstance(item, dict):
+            pending.extend(item.keys())
+            pending.extend(item.values())
+        elif isinstance(item, (tuple, list)):
+            pending.extend(item)
+    return total
 
 
 class _IOBudget:
@@ -112,22 +158,6 @@ class _BudgetStream(io.RawIOBase):
         super().close()
 
 
-def _budget_json(path: Path, maximum: int, budget: _IOBudget) -> tuple[dict[str, Any], bytes]:
-    with _BudgetStream(path.open("rb", buffering=0), budget) as stream:
-        payload = stream.read(maximum + 1)
-    if len(payload) > maximum:
-        _fail("JSON exceeds its declared budget")
-    return decode_json(payload, str(path)), payload
-
-
-def _immutable(value: Any) -> Any:
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _immutable(item) for key, item in value.items()})
-    if isinstance(value, list):
-        return tuple(_immutable(item) for item in value)
-    return value
-
-
 def _verify_stream(stream: Any, size: int, digest: str) -> None:
     stream.seek(0, 2)
     if stream.tell() != size:
@@ -136,23 +166,6 @@ def _verify_stream(stream: Any, size: int, digest: str) -> None:
     if hashlib.file_digest(stream, "sha256").hexdigest() != digest:
         _fail("state payload checksum differs from its commit")
     stream.seek(0)
-
-
-def _receipt(root: Path, commit: Mapping[str, Any], payload: bytes,
-             budget: _IOBudget | None = None) -> dict[str, Any]:
-    path = safe_path(root, "receipt.json")
-    receipt, _ = (read_json(path, maximum=1024 * 1024) if budget is None
-                  else _budget_json(path, 1024 * 1024, budget))
-    if (receipt.get("schema") != "qcl-negf-recovery-receipt-v1"
-            or receipt.get("status") != "verified"
-            or receipt.get("publication_scope") != "local_filesystem"):
-        _fail("unsupported recovery publication receipt")
-    if receipt.get("commit_sha256") != hashlib.sha256(payload).hexdigest():
-        _fail("recovery receipt commit checksum differs")
-    for field in ("identity", "state_id", "state_sequence"):
-        if field not in commit or receipt.get(field) != commit[field]:
-            _fail(f"recovery receipt {field} differs from its commit")
-    return receipt
 
 
 def _same_json_value(left: Any, right: Any) -> bool:
@@ -168,445 +181,800 @@ def _same_json_value(left: Any, right: Any) -> bool:
     return left == right
 
 
-def _commit_final_audit(commit: Mapping[str, Any]) -> dict[str, Any] | None:
-    assessment = commit.get("stationary_assessment")
-    if assessment is None:
-        return None
-    if not isinstance(assessment, dict):
-        _fail("stationary_assessment must be an object")
-    if "final_fixed_point_audit" not in assessment:
-        return None
-    record = assessment["final_fixed_point_audit"]
-    if not isinstance(record, dict):
-        _fail("present final_fixed_point_audit must be an object")
-    return record
+@dataclass(frozen=True)
+class ResultReadLimits:
+    maximum_metadata_bytes: int = 16 * 1024 * 1024
+    maximum_io_bytes: int = 256 * 1024 * 1024
+    maximum_catalog_pages: int = 4096
+    maximum_catalog_entries: int = 65536
+    maximum_catalog_bytes: int = 64 * 1024 * 1024
+    maximum_open_files: int = 8
+    maximum_record_bytes: int = 1024 * 1024
+    maximum_batch_bytes: int = 4 * 1024 * 1024
+    maximum_batch_records: int = 256
+    maximum_hdf_objects: int = 65536
+    maximum_hdf_depth: int = 64
+    maximum_array_bytes: int = 1024 * 1024
 
-
-def _validated_final_fixed_point_audit(handle: Any, commit: Mapping[str, Any], *,
-                                      final_state: bool) -> dict[str, Any]:
-    """Bind the two stored copies; never evaluate a fresh physical map."""
-    from qcl_negf_contracts.final_audit import validate_final_audit_pair
-    raw = _read_final_fixed_point_audit(handle)
-    result = validate_final_audit_pair(raw, _commit_final_audit(commit),
-        expected_identity=commit["identity"], final_state=final_state)
-    if raw is not None:
-        if "metadata/point_identity_json" not in handle:
-            _fail("final audit requires native point identity")
-        identity = _json_scalar(handle, "metadata/point_identity_json")
-        if not _same_json_value(identity, commit["identity"]):
-            _fail("final audit native point identity differs from its commit")
-    return result
-
-
-def _validate_final_audit_sidecar(handle: Any, role: str,
-                                 commit: Mapping[str, Any]) -> None:
-    """Optional analysis copies agree; checkpoint payloads never carry finals."""
-    raw = _read_final_fixed_point_audit(handle)
-    if commit.get("storage_class") == "recovery" and _commit_final_audit(commit) is not None:
-        _fail("recovery commit must not publish a final audit")
-    if raw is None:
-        return
-    if role == "recovery" or commit.get("storage_class") == "recovery":
-        _fail("recovery payload must not publish a final audit")
-    from qcl_negf_contracts.final_audit import validate_final_audit_pair
-    validate_final_audit_pair(raw, _commit_final_audit(commit),
-        expected_identity=commit["identity"], final_state=True)
-    if "metadata/identity_json" not in handle:
-        _fail("analysis final audit requires native identity_json")
-    identity = _json_scalar(handle, "metadata/identity_json")
-    if not _same_json_value(identity, commit["identity"]):
-        _fail("analysis final audit native identity_json differs from its commit")
-
-
-def _verify_final_audit_sidecars(root: Path, artifacts: tuple[Artifact, ...],
-                                commit: Mapping[str, Any], budget: _IOBudget) -> None:
-    """Use the same physical cap for each declared analysis/checkpoint owner."""
-    for owner in artifacts:
-        if (owner.role not in {"physics.analysis", "recovery"}
-                or owner.media_type != "application/x-hdf5"):
-            continue
-        budget.require(owner.size)
-        with _BudgetStream(safe_path(root, owner.path).open("rb", buffering=0), budget) as stream:
-            budget.phase = "sha"
-            _verify_stream(stream, owner.size, owner.sha256)
-            budget.phase = "hdf"
-            with h5py.File(stream, "r") as handle:
-                _internal_storage(handle)
-                validate_native_handle(handle, owner.role, owner.schema)
-                _validate_final_audit_sidecar(handle, owner.role, commit)
-
-
-def _prior_declarations(files: list[Mapping[str, Any]], owned: tuple[Artifact, ...],
-                        identity: Mapping[str, Any], locator: str) -> tuple[dict[str, Any], ...]:
-    """Normalize one validated final's declarations, preserving both SHA obligations.
-
-    This metadata preflight grants no byte lifetime or reusable verification proof.
-    The caller must still run the original index, owner and native passes.
-    """
-    declarations = {row["path"]: {**row, "origins": ("index",)} for row in files}
-    for owner in owned:
-        row = declarations.get(owner.path)
-        if row is None:
-            row = {"path": owner.path, "bytes": owner.size, "sha256": owner.sha256,
-                   "origins": ("owner",)}
-            declarations[owner.path] = row
-        else:
-            claims = {"bytes": owner.size, "sha256": owner.sha256, "role": owner.role,
-                      "schema": owner.schema, "media_type": owner.media_type,
-                      "identity": identity}
-            for field, expected in claims.items():
-                if field not in row:
-                    continue
-                matches = (_same_json_value(row[field], expected) if field == "identity"
-                           else row[field] == expected)
-                if not matches:
-                    _fail(f"prior final {locator}: {owner.path} {field} declaration conflict")
-            row["origins"] += ("owner",)
-        row["owner"] = owner
-    return tuple(declarations.values())
-
-
-def verify_recovery_bundle(directory: str | Path,
-                           expected_identity: Mapping[str, Any] | None = None, *,
-                           archive_directory: str | Path | None = None) -> dict[str, Any]:
-    """Verify every declared dependency and receipt, without running Julia.
-
-    The caller owns compatibility decisions for application/model contracts.
-    A successful checksum verification alone does not certify resumability.
-    """
-    root = Path(directory)
-    commit, payload = read_json(safe_path(root, "commit.json"), maximum=16 * 1024 * 1024)
-    artifacts = validate_commit(commit)
-    if commit.get("storage_class") == "recovery" and _commit_final_audit(commit) is not None:
-        _fail("recovery commit must not publish a final audit")
-    if expected_identity is not None and any(
-            commit["identity"].get(key) != value for key, value in expected_identity.items()):
-        _fail("recovery bundle identity differs from the selected attempt")
-    receipt = _receipt(root, commit, payload)
-    for artifact in artifacts:
-        with safe_path(root, artifact.path).open("rb") as stream:
-            _verify_stream(stream, artifact.size, artifact.sha256)
-            if artifact.media_type == "application/x-hdf5":
-                with h5py.File(stream, "r") as handle:
-                    _internal_storage(handle)
-                    validate_native_handle(handle, artifact.role, artifact.schema)
-                    if artifact.role == "physics.full":
-                        _validated_final_fixed_point_audit(handle, commit,
-                            final_state=commit.get("storage_class") != "recovery")
-                    elif artifact.role in {"physics.analysis", "recovery"}:
-                        _validate_final_audit_sidecar(handle, artifact.role, commit)
-    prior_finals = 0
-    for artifact in artifacts:
-        if artifact.role != "execution.progress":
-            continue
-        progress, _ = read_json(safe_path(root, artifact.path), maximum=16 * 1024 * 1024)
-        entries = validate_execution_progress(progress)
-        if progress["identity"] != commit["identity"]:
-            _fail("execution progress state identity differs from its commit")
-        if entries and archive_directory is None:
-            _fail("recovery requires its prior archive dependencies")
-        for entry in entries:
-            final_path = safe_path(Path(archive_directory), entry["final_commit"])
-            final, final_bytes = read_json(final_path, maximum=16 * 1024 * 1024)
-            owned = validate_commit(final)
-            if final.get("storage_class") != "archive" or not {"physics.full", "model", "science.history"} <= {item.role for item in owned}:
-                _fail("prior final must own full state, resolved model and history in the scientific archive")
-            proof = entry["receipt"]
-            if hashlib.sha256(final_bytes).hexdigest() != proof["commit_sha256"]:
-                _fail("prior archive commit checksum differs from progress")
-            for field in ("identity", "state_id", "state_sequence"):
-                if final.get(field) != proof.get(field):
-                    _fail("prior archive identity differs from progress")
-            _receipt(final_path.parent, final, final_bytes)
-            _prior_declarations(entry["files"], owned, final["identity"], entry["final_commit"])
-            for dependency in (*entry["files"], *({"path": item.path, "bytes": item.size,
-                    "sha256": item.sha256} for item in owned)):
-                with safe_path(final_path.parent, dependency["path"]).open("rb") as stream:
-                    _verify_stream(stream, dependency["bytes"], dependency["sha256"])
-            for item in owned:
-                if item.media_type == "application/x-hdf5":
-                    with h5py.File(safe_path(final_path.parent, item.path), "r") as handle:
-                        _internal_storage(handle)
-                        validate_native_handle(handle, item.role, item.schema)
-                        if item.role == "physics.full":
-                            _validated_final_fixed_point_audit(handle, final, final_state=True)
-                        elif item.role in {"physics.analysis", "recovery"}:
-                            _validate_final_audit_sidecar(handle, item.role, final)
-            prior_finals += 1
-    return {"commit": commit, "receipt": receipt, "verified_artifacts": len(artifacts),
-            "verified_prior_finals": prior_finals}
+    def __post_init__(self):
+        if any(type(getattr(self, item.name)) is not int or getattr(self, item.name) < 1
+               for item in fields(self)):
+            raise ValueError('read limits require positive integers')
 
 
 @dataclass(frozen=True)
-class StateBlock:
+class ResultDescription:
+    state: Document
+    invocation: Document
+    history: Document
+    lineage: Document
+    status: Document
+    closed: bool
+    capabilities: Document
+    integrity: Document
+    io_counters: Mapping[str, int | None]
+
+
+@dataclass(frozen=True)
+class HistoryBatch:
+    source: Document
+    records: tuple[Document, ...]
+    cursor: Document
+    at_cutoff: bool
+    io_counters: Mapping[str, int | None]
+
+
+@dataclass(frozen=True)
+class ArrayDescription:
+    declaration: Document
+    logical_shape: tuple[int, ...]
+    stored_shape: tuple[int, ...]
+    eltype: str
+    element_bytes: int
+    order: str
+    source: Document
+
+
+@dataclass(frozen=True)
+class ArrayBlock:
     values: Any
-    axes: tuple[str, ...]
-    units: str
-    coordinates: Mapping[str, Any]
-    weights: Mapping[str, Any]
-    source_identity: Mapping[str, Any]
+    selection: tuple[int | slice, ...]
+    declaration: Document
+    source: Document
+    io_counters: Mapping[str, int | None]
 
 
-@dataclass(frozen=True)
-class StateDescription:
-    object_kind: str
-    shape: tuple[int, ...] = ()
-    dtype: Any = None
-    itemsize: int = 0
-    chunks: tuple[int, ...] | None = None
-    compression: str | None = None
-    axes: tuple[str, ...] = ()
-    units: str = ""
-    coordinate_paths: tuple[str | None, ...] | None = None
-    child_names: tuple[str, ...] = ()
-    filters: tuple[int, ...] = ()
-
-
-@dataclass(frozen=True)
-class StateScalar:
-    value: Any
-    units: str
-    source_identity: Mapping[str, Any]
-
-
-class StateReader:
-    """Read one committed physics.full owner in its external HDF5 axis order."""
-
-    def __init__(self, commit_path: str | Path, *,
-                 expected_identity: Mapping[str, Any] | None = None,
-                 maximum_io_bytes: int | None = None):
-        path = Path(commit_path).resolve()
-        self._budget = _IOBudget(maximum_io_bytes)
-        self.commit, payload = _budget_json(path, 16 * 1024 * 1024, self._budget)
-        artifacts = validate_commit(self.commit)
-        if expected_identity is not None and any(
-                not _same_json_value(self.commit["identity"].get(key), value)
-                for key, value in expected_identity.items()):
-            _fail("state identity differs from the selected attempt")
-        owners = [item for item in artifacts if item.role == "physics.full"]
-        if len(owners) != 1:
-            _fail("state must have exactly one physics.full owner")
-        receipt_verified = False
-        if "state_id" in self.commit:
-            _receipt(path.parent, self.commit, payload, self._budget)
-            receipt_verified = True
-        owner = owners[0]
-        # The entire owner is mandatory for SHA; fail before opening physics if
-        # the remaining cap cannot even cover that irreducible obligation.
-        self._budget.require(owner.size)
-        self._stream = _BudgetStream(safe_path(path.parent, owner.path).open("rb", buffering=0), self._budget)
-        self._handle = None
-        try:
-            self._budget.phase = "sha"
-            _verify_stream(self._stream, owner.size, owner.sha256)
-            self._budget.phase = "hdf"
-            self._handle = h5py.File(self._stream, "r")
-            _internal_storage(self._handle)
-            validate_native_handle(self._handle, owner.role, owner.schema)
-            if "state_id" in self.commit and "metadata/point_identity_json" not in self._handle:
-                _fail("native state identity is missing")
-            for name in ("metadata/identity_json", "metadata/point_identity_json"):
-                if name in self._handle:
-                    identity = _json_scalar(self._handle, name)
-                    _state_identity(identity, self.commit["identity"])
-                    _identity_fields(identity, self.commit["identity"])
-            self._final_fixed_point_audit = _immutable(_validated_final_fixed_point_audit(
-                self._handle, self.commit, final_state=self.commit.get("storage_class") != "recovery"))
-            _verify_final_audit_sidecars(path.parent, artifacts, self.commit, self._budget)
-            metadata = self._handle["metadata"]
-            self._source = _immutable({
-                "commit_path": str(path), "commit_sha256": hashlib.sha256(payload).hexdigest(),
-                "identity": dict(self.commit["identity"]), "expected_identity": dict(expected_identity or {}),
-                "state_id": self.commit.get("state_id"), "state_sequence": self.commit.get("state_sequence"),
-                "storage_class": self.commit.get("storage_class"),
-                "owner": {"path": owner.path, "bytes": owner.size, "sha256": owner.sha256,
-                          "role": owner.role, "schema": owner.schema},
-                "producer_format": _text(metadata.attrs["schema_version"]),
-                "contract_set": _text(metadata.attrs["contract_set"]),
-                "native_verified": True, "receipt_verified": receipt_verified})
-        except Exception:
-            self.close()
-            raise
-
-    def __enter__(self) -> "StateReader":
-        return self
-
-    def __exit__(self, *args: Any) -> None:
-        self.close()
-
-    def close(self) -> None:
-        if self._handle is not None:
-            self._handle.close()
-            self._handle = None
-        self._stream.close()
-
-    @property
-    def source(self) -> Mapping[str, Any]:
-        """Immutable certificate from the exact constructor verification passes."""
-        return _immutable({**self._source, "budgets": self._budget.counters()})
-
-    @property
-    def io_counters(self) -> Mapping[str, int | None]:
-        return MappingProxyType(self._budget.counters())
-
-    def _object(self, path: str) -> Any:
-        if self._handle is None:
-            raise ValueError("state reader is closed")
-        if not isinstance(path, str) or not path or ".." in path.split("/"):
-            raise ValueError("dataset path must be a native HDF5 path")
-        try:
-            return self._handle[path]
-        except KeyError as error:
-            raise ContractError(f"missing native object: {path}", "invalid_data") from error
-
-    def describe(self, path: str, *, maximum_children: int = 128) -> StateDescription:
-        """Immutable metadata; no numerical payload or raw HDF handle escapes."""
-        if type(maximum_children) is not int or maximum_children < 1:
-            raise ValueError("maximum_children must be positive")
-        obj = self._object(path)
-        if isinstance(obj, h5py.Group):
-            if len(obj) > maximum_children:
-                raise ContractError("group inventory exceeds its budget", "budget_exceeded")
-            return StateDescription("group", child_names=tuple(obj))
-        if not isinstance(obj, h5py.Dataset):
-            _fail("unsupported native object")
-        coordinate = obj.attrs.get("axis_coordinate_paths_json")
-        try:
-            paths = None if coordinate is None else json.loads(_text(coordinate))
-        except (ValueError, UnicodeError) as error:
-            raise ContractError("invalid coordinate inventory", "unsupported_layout") from error
-        if paths is not None and (not isinstance(paths, list) or any(
-                item is not None and not isinstance(item, str) for item in paths)):
-            raise ContractError("invalid coordinate inventory", "unsupported_layout")
-        plist = obj.id.get_create_plist()
-        return StateDescription("dataset", tuple(obj.shape), obj.dtype, obj.dtype.itemsize,
-            obj.chunks, obj.compression, tuple(_text(obj.attrs.get("logical_axis_order", "")).split(",")),
-            _text(obj.attrs.get("units", "")), None if paths is None else tuple(paths),
-            filters=tuple(plist.get_filter(i)[0] for i in range(plist.get_nfilters())))
-
-    def _numeric(self, path: str, rank: int, maximum_bytes: int) -> Any:
-        if type(maximum_bytes) is not int or maximum_bytes < 1:
-            raise ValueError("maximum_bytes must be positive")
-        dataset = self._object(path)
-        if (not isinstance(dataset, h5py.Dataset) or dataset.ndim != rank
-                or dataset.dtype.hasobject or dataset.dtype.kind not in "biufc"):
-            raise ContractError("requires a fixed-width numeric dataset of the declared rank", "unsupported_layout")
-        if not _text(dataset.attrs.get("units", "")):
-            raise ContractError("numeric dataset units missing", "invalid_data")
-        count = math.prod(dataset.shape) * dataset.dtype.itemsize
-        if count > maximum_bytes:
-            raise ContractError("numeric read exceeds its byte budget", "budget_exceeded")
-        return dataset
-
-    def read_scalar(self, path: str, *, maximum_bytes: int = 64) -> StateScalar:
-        dataset = self._numeric(path, 0, maximum_bytes)
-        value = dataset[()]
-        self._budget.logical_selected_bytes += dataset.dtype.itemsize
-        return StateScalar(value.item(), _text(dataset.attrs["units"]), _immutable(self.commit["identity"]))
-
-    def read_vector(self, path: str, *, maximum_bytes: int) -> StateBlock:
-        dataset = self._numeric(path, 1, maximum_bytes)
-        values = dataset[:]
-        self._budget.logical_selected_bytes += values.nbytes
-        return StateBlock(values, tuple(_text(dataset.attrs.get("logical_axis_order", "")).split(",")),
-            _text(dataset.attrs["units"]), {}, {}, _immutable(self.commit["identity"]))
-
-    def read(self, dataset_path: str, selection: tuple[int | slice, ...], *,
-             maximum_bytes: int = 1024 * 1024) -> StateBlock:
-        if self._handle is None:
-            raise ValueError("state reader is closed")
-        if type(maximum_bytes) is not int or maximum_bytes < 1:
-            raise ValueError("maximum_bytes must be positive")
-        if not isinstance(dataset_path, str) or not dataset_path or ".." in dataset_path.split("/"):
-            raise ValueError("dataset path must be a native absolute or relative HDF5 path")
-        dataset = self._handle[dataset_path]
-        if not isinstance(dataset, h5py.Dataset) or dataset.dtype.hasobject:
-            _fail("state block requires a fixed width native dataset")
-        if not isinstance(selection, tuple) or len(selection) != dataset.ndim:
-            raise ValueError("selection must name every stored axis")
-        normalized: list[int | slice] = []
-        counts: list[int] = []
-        for item, size in zip(selection, dataset.shape):
-            if type(item) is int:
-                position = item + size if item < 0 else item
-                if not 0 <= position < size:
-                    raise IndexError("state selection is outside its axis")
-                normalized.append(position)
-                counts.append(1)
-            elif isinstance(item, slice):
-                if item.step is not None and item.step <= 0:
-                    raise ValueError("state selection requires a positive slice step")
-                start, stop, step = item.indices(size)
-                normalized.append(slice(start, stop, step))
-                counts.append(len(range(start, stop, step)))
-            else:
-                raise ValueError("state selection supports integers and positive slices")
-        axes = tuple(_text(dataset.attrs.get("logical_axis_order", "")).split(","))
-        if len(axes) != dataset.ndim or any(not axis for axis in axes):
-            _fail("state block has no explicit stored axis order")
-        units = _text(dataset.attrs.get("units", ""))
-        if not units:
-            _fail("state block units are missing")
-        coordinate_paths = json.loads(_text(dataset.attrs.get("axis_coordinate_paths_json", "null")))
-        if not isinstance(coordinate_paths, list) or len(coordinate_paths) != dataset.ndim:
-            _fail("state block coordinate inventory differs from its rank")
-        # Include coordinate and weight vectors in the allocation budget, not
-        # just the multidimensional payload. Missing measures remain None.
-        vectors: list[tuple[str, str, h5py.Dataset, int | slice]] = []
-        for axis, source, item, size in zip(axes, coordinate_paths, normalized, dataset.shape):
-            if source is not None:
-                vector = self._handle[source]
-                if not isinstance(vector, h5py.Dataset) or vector.shape != (size,) or vector.dtype.hasobject:
-                    _fail("state coordinate shape or dtype differs from its axis")
-                vectors.append(("coordinate", axis, vector, item))
-            for candidate in _weight_paths(axis):
-                if candidate in self._handle:
-                    vector = self._handle[candidate]
-                    if not isinstance(vector, h5py.Dataset) or vector.shape != (size,) or vector.dtype.hasobject:
-                        _fail("state quadrature weight shape or dtype differs from its axis")
-                    vectors.append(("weight", axis, vector, item))
-                    break
-        required = math.prod(counts) * dataset.dtype.itemsize + sum(
-            (1 if type(item) is int else len(range(item.start, item.stop, item.step))) * vector.dtype.itemsize
-            for _, _, vector, item in vectors)
-        if required > maximum_bytes:
-            raise ContractError(f"state block needs {required} bytes; budget is {maximum_bytes}", "budget_exceeded")
-        coordinates: dict[str, Any] = dict.fromkeys(axes)
-        weights: dict[str, Any] = dict.fromkeys(axes)
-        for kind, axis, vector, item in vectors:
-            (coordinates if kind == "coordinate" else weights)[axis] = vector[item]
-        values = dataset[tuple(normalized)]
-        self._budget.logical_selected_bytes += required
-        return StateBlock(values, axes, units, coordinates, weights,
-                          dict(self.commit["identity"]))
-
-
-def _text(value: Any) -> str:
-    return value.decode("utf-8") if isinstance(value, bytes) else str(value)
-
-
-def _internal_storage(handle: Any) -> None:
-    """Reject payloads whose values can change outside the committed HDF5 file."""
-    seen: set[int] = set()
-    pending = [handle]
+def _internal_storage(handle, *, maximum_objects=65536, maximum_depth=64):
+    """Bounded ownership walk, without reading dataset values."""
+    seen, pending = set(), [(handle, 0)]
     while pending:
-        group = pending.pop()
+        group, depth = pending.pop()
         address = h5py.h5o.get_info(group.id).addr
         if address in seen:
             continue
+        if depth > maximum_depth or len(seen) >= maximum_objects:
+            _fail('native object inventory exceeds read limit', 'budget_exceeded')
         seen.add(address)
+        if len(group) > maximum_objects - len(seen):
+            _fail('native group inventory exceeds read limit', 'budget_exceeded')
         for name in group:
-            link = group.get(name, getlink=True)
-            if not isinstance(link, h5py.HardLink):
-                _fail("state payload rejects unowned external HDF5 or soft links")
+            if not isinstance(group.get(name, getlink=True), h5py.HardLink):
+                _fail('native source rejects soft/external links')
             child = group[name]
             if isinstance(child, h5py.Group):
-                pending.append(child)
-            elif isinstance(child, h5py.Dataset) and (child.external or child.is_virtual):
-                _fail("state payload rejects unowned external or virtual storage")
+                pending.append((child, depth + 1))
+            elif isinstance(child, h5py.Dataset):
+                if child.external or child.is_virtual:
+                    _fail('native source rejects external/virtual storage')
+                address = h5py.h5o.get_info(child.id).addr
+                seen.add(address)
+                if len(seen) > maximum_objects:
+                    _fail('native object inventory exceeds read limit', 'budget_exceeded')
 
 
-def _weight_paths(axis: str) -> tuple[str, ...]:
-    return {"E": ("grids_dimensionless/wE", "axes/energy_weights"),
-            "k": ("grids_dimensionless/wk", "axes/momentum_weights"),
-            "z": ("grids_dimensionless/wx", "axes/spatial_weights")}.get(axis, ())
+class StateReader:
+    """One explicitly selected immutable result source; no legacy format branch.
+
+    Each operation has a physical stream budget. Open handles reuse SHA proof;
+    cache eviction/reopen is a new verification boundary. Returned JSON is copied.
+    """
+    def __init__(self, artifact_root: str | Path, *, state_ref: Document,
+                 expected_identity: Document, limits: ResultReadLimits | None = None):
+        self._initialize(artifact_root, state_ref=state_ref, expected_identity=expected_identity, limits=limits)
+
+    def _initialize(self, artifact_root, *, state_ref, expected_identity, limits=None,
+                    verified_manifest=None, budget=None, lineage_depth=0):
+        self.limits = limits or ResultReadLimits()
+        if not isinstance(self.limits, ResultReadLimits):
+            raise TypeError('limits must be ResultReadLimits')
+        self.root = Path(os.path.abspath(artifact_root))
+        self._root_stamp = self._root_identity()
+        self._closed = False
+        self._handles = OrderedDict()
+        self._pages, self._index, self._known_states = [], {}, {}
+        self._catalog_by_hash, self._published_paths, self._catalog_by_leaf = {}, set(), {}
+        self._page_proofs = {}
+        self._parent_anchor_cache = None
+        self._catalog_ready, self._catalog_size = False, 0
+        self._index_weight = self._known_weight = self._pending_state_weight = 0
+        self._checkpoint = None
+        self._declarations, self._verified_refs = {}, {}
+        self._pointer_path, self._pointer_raw = None, None
+        self._shared_budget = budget
+        self._lineage_depth = lineage_depth
+        if lineage_depth > self.limits.maximum_hdf_depth:
+            _fail('lineage proof depth exceeds metadata limit', 'budget_exceeded')
+        self._operation()
+        self._state_ref = copy.deepcopy(dict(state_ref))
+        _schema_check(schema_validator('result-common.schema.json').evolve(schema={
+            '$ref': '#/$defs/StateRef', '$defs': schema_validator('result-common.schema.json').schema['$defs']
+        }), self._state_ref)
+        if not _same_json_value(self._state_ref['identity'], dict(expected_identity)):
+            _fail('complete selected identity differs from StateRef', 'identity_mismatch')
+        self._manifest = validate_manifest(verified_manifest if verified_manifest is not None
+                                           else self._json(self._state_ref['manifest']))
+        for key in ('identity', 'state_id', 'state_sequence'):
+            if self._manifest[key] != self._state_ref[key]:
+                _fail('manifest differs from selected StateRef')
+        self._register_manifest()
+        self._remember_state()
+
+    def _root_identity(self):
+        from ._capture_io import regular
+        # Opening a known child is unnecessary; nofollow traversal is performed
+        # by regular for every actual file. Reject symlink root itself as well.
+        current = self.root
+        for part in (current, *current.parents):
+            if part.is_symlink():
+                _fail('artifact root traverses a symbolic link')
+        stat = self.root.stat()
+        return stat.st_dev, stat.st_ino
+
+    def _operation(self):
+        if getattr(self, '_closed', False):
+            raise ValueError('state reader is closed')
+        if hasattr(self, '_root_stamp') and self._root_identity() != self._root_stamp:
+            _fail('artifact root replaced', 'source_changed')
+        self._budget = getattr(self, '_shared_budget', None) or _IOBudget(self.limits.maximum_io_bytes)
+        for item in getattr(self, '_handles', {}).values():
+            item['stream']._budget = self._budget
+
+    @classmethod
+    def from_pointer(cls, artifact_root, *, expected_identity, pointer, limits=None):
+        if pointer not in ('live', 'recovery'):
+            raise ValueError('pointer must be live or recovery')
+        selected = dict(expected_identity)
+        path = ('executions/' + selected['execution_id'] + '/' + selected['point_id'] +
+                '/attempt-' + selected['attempt'] + ('/current.json' if pointer == 'live'
+                else '/recovery/current.json'))
+        # Validate selection/path through canonical pure schema before file access.
+        common = schema_validator('result-common.schema.json')
+        _schema_check(common.evolve(schema={'$ref': '#/$defs/Identity', '$defs': common.schema['$defs']}), selected)
+        from ._capture_io import beneath, small_json
+        cap = limits or ResultReadLimits()
+        budget = _IOBudget(cap.maximum_io_bytes)
+        value, raw = small_json(beneath(Path(artifact_root), path), cap.maximum_metadata_bytes, budget=budget)
+        value = validate_pointer(value)
+        if value['identity'] != selected:
+            _fail('pointer differs from selected identity', 'identity_mismatch')
+        # Capture the hashed manifest once to derive its StateRef; the private
+        # initializer consumes that exact verified document and physical budget.
+        temporary = cls.__new__(cls)
+        temporary.root, temporary.limits, temporary._budget = Path(os.path.abspath(artifact_root)), cap, budget
+        manifest = validate_manifest(temporary._json(value['manifest']))
+        ref = {key: manifest[key] for key in ('identity', 'state_id', 'state_sequence')}
+        ref['manifest'] = value['manifest']
+        result = cls.__new__(cls)
+        result._initialize(artifact_root, state_ref=ref, expected_identity=selected, limits=cap,
+                           verified_manifest=manifest, budget=budget)
+        result._shared_budget = None
+        if manifest['generation'] != value['generation']:
+            result.close()
+            _fail('pointer generation differs from manifest')
+        result._pointer_path, result._pointer_raw = path, raw
+        return result
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
+
+    def close(self):
+        for value in self._handles.values():
+            value['stack'].close()
+        self._handles.clear()
+        self._closed = True
+
+    def _json(self, reference):
+        from ._capture_io import beneath, regular, stamp
+        if int(reference['bytes']) > self.limits.maximum_metadata_bytes:
+            _fail('metadata exceeds read limit', 'budget_exceeded')
+        with regular(beneath(self.root, reference['path']), size=int(reference['bytes'])) as raw:
+            before = stamp(raw)
+            stream = _BudgetStream(raw, self._budget)
+            payload = stream.read(int(reference['bytes']))
+            if stamp(raw) != before or hashlib.sha256(payload).hexdigest() != reference['sha256']:
+                _fail('metadata differs from immutable reference')
+        return decode_json(payload, reference['path'])
+
+    def _register(self, reference, *, table=None):
+        target = self._index if table is None else table
+        relative_path(reference['path'])
+        simple = _ref(reference)
+        old = target.get(simple['path'])
+        if old is not None and _ref(old) != simple:
+            _fail('immutable path rebound to different bytes')
+        value = copy.deepcopy(dict(reference))
+        if target is self._index:
+            changed_weight = _metadata_weight(value) - (_metadata_weight(old) if old is not None else 0)
+            if (self._index_weight + changed_weight + self._known_weight + self._pending_state_weight
+                    + self._catalog_size > self.limits.maximum_catalog_bytes):
+                _fail('retained metadata context exceeds limit', 'budget_exceeded')
+            self._index_weight += changed_weight
+        target[simple['path']] = value
+        if len(target) > self.limits.maximum_catalog_entries:
+            _fail('imported reference inventory exceeds limit', 'budget_exceeded')
+
+    def _register_manifest(self):
+        self._register(self._state_ref['manifest'])
+        for row in self._manifest['artifacts']:
+            self._register(row)
+
+    def _remember_state(self):
+        digest = self._state_ref['manifest']['sha256']
+        if digest not in self._known_states:
+            weight = _metadata_weight(self._state_ref) + _metadata_weight(self._manifest)
+            if self._known_weight + weight + self._index_weight + self._catalog_size > self.limits.maximum_catalog_bytes:
+                _fail('retained metadata context exceeds limit', 'budget_exceeded')
+            self._known_states[digest] = (self._state_ref, self._manifest)
+            self._known_weight += weight
+        self._pending_state_weight = 0
+
+    @property
+    def io_counters(self):
+        return self._budget.counters()
+
+    @property
+    def source(self):
+        ready = self._catalog_ready
+        def cap(value, reason):
+            return dict(available=bool(value), reason=None if value else reason)
+        checkpoint = self._checkpoint is not None
+        history = int(self._manifest['history']['records']) > 0
+        capabilities = dict(history_read=cap(ready, 'catalog_import_required'),
+            array_slice=cap(bool(self._declarations), 'verified_array_declaration_required'),
+            exact_checkpoint=cap(checkpoint, 'checkpoint_verification_required' if self._manifest['checkpoint'] else 'selected_state_has_no_checkpoint'),
+            exact_restore=cap(False, 'core_owned'), saved_views=cap(False, 'native5_view_not_implemented'),
+            stored_observables=cap(False, 'independent_analysis_not_published'),
+            streaming_export=cap(history or self._manifest['checkpoint'], 'no_selected_scientific_data'),
+            science_export=cap(history, 'independent_analysis_not_published'),
+            full_state_export=cap(self._manifest['checkpoint'] is not None, 'selected_state_has_no_checkpoint'),
+            scalar_derive=cap(ready, 'catalog_import_required'))
+        return ResultDescription(copy.deepcopy(self._state_ref), copy.deepcopy(self._manifest['invocation']),
+            copy.deepcopy(self._manifest['history']), copy.deepcopy(self._manifest['lineage']),
+            copy.deepcopy(self._manifest['status']), self._manifest['closed'], capabilities,
+            dict(manifest_verified=True, catalog_verified=ready,
+                 selected_payloads_verified=copy.deepcopy(list(self._verified_refs.values())), scope='selected_bytes'),
+            self.io_counters)
+
+    @staticmethod
+    def _pin(page, reference):
+        return dict(head=_ref(reference), entries=page['entries'], **page['totals'])
+
+    def import_history(self):
+        self._operation()
+        self._import_history()
+        return self.source
+
+    def _import_history(self):
+        pin = self._manifest['history']
+        known = self._catalog_by_hash
+        ref, pending, seen = pin['head'], [], set()
+        size, delta, added_paths, delta_weights, index_change = self._catalog_size, {}, set(), {}, 0
+        def register(reference):
+            nonlocal index_change
+            old = delta.get(reference['path'], self._index.get(reference['path']))
+            if old is not None and _ref(old) != _ref(reference):
+                _fail('immutable path rebound to different bytes')
+            self._register(reference, table=delta)
+            existing = self._index.get(reference['path'])
+            changed = _metadata_weight(delta[reference['path']]) - (_metadata_weight(existing) if existing is not None else 0)
+            index_change += changed - delta_weights.get(reference['path'], 0)
+            delta_weights[reference['path']] = changed
+            if reference['path'] not in self._index:
+                added_paths.add(reference['path'])
+            if len(self._index) + len(added_paths) > self.limits.maximum_catalog_entries:
+                _fail('imported reference inventory exceeds limit', 'budget_exceeded')
+            if (size + self._index_weight + index_change + self._known_weight
+                    + self._pending_state_weight > self.limits.maximum_catalog_bytes):
+                _fail('retained catalog/context metadata exceeds limit', 'budget_exceeded')
+        anchors = self._parent_anchors()
+        for reference in anchors.values():
+            register(dict(reference, role='science.history', dependencies=[]))
+        while ref is not None and ref['sha256'] not in known:
+            if ref['path'] in seen or len(pending) + len(self._pages) >= self.limits.maximum_catalog_pages:
+                _fail('catalog cycle or page limit', 'budget_exceeded')
+            seen.add(ref['path'])
+            page = self._json(ref)
+            size += _metadata_weight(page) + _metadata_weight(ref)
+            if size + self._index_weight + self._known_weight + self._pending_state_weight > self.limits.maximum_catalog_bytes:
+                _fail('decoded catalog inventory exceeds limit', 'budget_exceeded')
+            pending.append((copy.deepcopy(ref), page))
+            # Syntax is checked before following an untrusted predecessor.
+            _schema_check(schema_validator('scientific-catalog.schema.json'), page)
+            ref = page['previous']['head'] if page['previous'] else None
+        if self._pages and pending and ref != self._pages[-1][0]:
+            _fail('new history does not extend imported head', 'source_changed')
+        prior = known.get(ref['sha256']) if ref else None
+        previous_pin = self._pin(prior[1], prior[0]) if prior else None
+        prior_page = prior[1] if prior else None
+        prior_ref = prior[0] if prior else None
+        additions, new_paths_published = [], set()
+        for reference, raw_page in reversed(pending):
+            page = validate_catalog_page(raw_page, previous=previous_pin,
+                previous_page=prior_page, previous_ref=prior_ref)
+            if page['identity'] != self._manifest['identity'] or page['invocation'] != self._manifest['invocation']:
+                _fail('catalog identity or epoch differs from manifest')
+            rows = page['artifacts']
+            if len(rows) not in (1, 2):
+                _fail('native5 batch requires optional array owner then one record leaf')
+            new_paths = {row['path'] for row in rows}
+            if new_paths & self._published_paths or new_paths & new_paths_published:
+                _fail('catalog republishes a nonadjacent immutable path')
+            if new_paths & anchors.keys():
+                _fail('catalog republishes an ancestor append dependency')
+            if len(rows) == 2 and (rows[0]['dependencies'] or rows[0]['path'] not in rows[-1]['dependencies']):
+                _fail('ordered native5 array dependency differs')
+            for row in rows:
+                register(row)
+            for row in rows:
+                if any(path == row['path'] or not (path in self._published_paths
+                        or path in new_paths_published or path in new_paths or path in anchors)
+                        for path in row['dependencies']):
+                    _fail('catalog dependency absent, future or self-referential')
+                if row is rows[0] and len(rows) == 2 and row['dependencies']:
+                    _fail('array owner cannot depend on another leaf')
+            register(reference)
+            new_paths_published.update(new_paths)
+            additions.append((reference, page))
+            prior_ref, prior_page, previous_pin = reference, page, self._pin(page, reference)
+        actual_pin = previous_pin if pending else (self._pin(*reversed(self._pages[-1])) if self._pages else None)
+        if pin['head'] is None:
+            if self._pages:
+                _fail('history disappeared', 'source_changed')
+        elif actual_pin != pin:
+            _fail('catalog head counters differ from manifest pin')
+        first_new = len(self._pages)
+        self._pages.extend(additions)
+        for offset, (reference, page) in enumerate(additions, first_new):
+            leaf = page['artifacts'][-1]
+            self._catalog_by_leaf[(leaf['path'], leaf['sha256'])] = (offset, reference, page)
+        self._index.update(delta)
+        self._index_weight += index_change
+        self._catalog_by_hash.update({reference['sha256']: (reference, page) for reference, page in additions})
+        self._published_paths.update(new_paths_published)
+        self._catalog_size, self._catalog_ready = size, True
+
+    def _open_hdf(self, reference, *, identity=None, invocation=None, representation=None):
+        from ._capture_io import regular, stamp
+        from .native import validate_native_handle
+        key = (reference['path'], reference['sha256'])
+        from .commits import safe_path
+        path = safe_path(self.root, reference['path'])
+        if key in self._handles:
+            item = self._handles[key]
+            try:
+                current = path.stat(follow_symlinks=False)
+                value = (current.st_dev, current.st_ino, current.st_size, current.st_mtime_ns, current.st_ctime_ns)
+            except OSError:
+                _fail('trusted payload path disappeared', 'source_changed')
+            if value != item['stamp'] or stamp(item['raw'], include_change=True) != item['stamp']:
+                _fail('trusted payload source changed', 'source_changed')
+            self._handles.move_to_end(key)
+        else:
+            stack = ExitStack()
+            try:
+                raw = stack.enter_context(regular(path, size=int(reference['bytes'])))
+                before = stamp(raw, include_change=True)
+                stream = _BudgetStream(raw, self._budget)
+                self._budget.phase = 'sha'
+                _verify_stream(stream, int(reference['bytes']), reference['sha256'])
+                self._budget.phase = 'hdf'
+                handle = stack.enter_context(h5py.File(stream, 'r', rdcc_nbytes=self.limits.maximum_array_bytes))
+                _internal_storage(handle, maximum_objects=self.limits.maximum_hdf_objects,
+                                  maximum_depth=self.limits.maximum_hdf_depth)
+                validate_native_handle(handle, reference.get('role'), reference['schema'],
+                                       maximum_metadata_bytes=self.limits.maximum_metadata_bytes)
+                if stamp(raw, include_change=True) != before:
+                    _fail('payload changed while being verified')
+                item = dict(stack=stack, raw=raw, stream=stream, handle=handle, stamp=before)
+                self._handles[key] = item
+                self._verified_refs[reference['path']] = _ref(reference)
+                while len(self._handles) > self.limits.maximum_open_files:
+                    _, old = self._handles.popitem(last=False)
+                    old['stack'].close()
+                    self._verified_refs = {path: value for path, value in self._verified_refs.items()
+                        if any(key[0] == path for key in self._handles)}
+            except Exception:
+                stack.close()
+                raise
+        self._budget.phase = 'hdf'
+        handle = item['handle']
+        from .native import native_metadata
+        native_metadata(handle, identity=identity, invocation=invocation,
+                        representation=representation, maximum_bytes=self.limits.maximum_metadata_bytes)
+        return handle
+
+    def _record(self, leaf, offset, *, identity, invocation, page=None):
+        handle = self._open_hdf(leaf, identity=identity, invocation=invocation, representation='record_leaf')
+        n = self._record_count(handle)
+        if type(offset) is not int or not 0 <= offset < n:
+            _fail('record offset outside physical record leaf')
+        start, stop = (int(x) for x in handle['records/offsets'][offset:offset+2])
+        if stop - start > self.limits.maximum_record_bytes:
+            _fail('record JSON exceeds read limit', 'budget_exceeded')
+        payload = handle['records/json_utf8'][start:stop].tobytes()
+        record = decode_json(payload, 'scientific record')
+        ordinal = int(handle['records/stream_ordinal'][offset])
+        if record.get('identity') != identity or record.get('invocation') != invocation or record.get('stream_ordinal') != str(ordinal):
+            _fail('record identity/epoch/ordinal differs from native coordinates')
+        if page is not None and not int(page['range']['first_record']) <= ordinal <= int(page['range']['last_record']):
+            _fail('record ordinal outside containing page')
+        return record
+
+    def _record_count(self, handle):
+        from .native import record_table
+        for item in self._handles.values():
+            if item['handle'] is handle:
+                if 'record_count' not in item:
+                    item['record_count'] = record_table(handle,
+                        maximum_block_bytes=self.limits.maximum_record_bytes)
+                return item['record_count']
+        _fail('record handle is no longer trusted', 'source_changed')
+
+    def _validate_record(self, record, leaf, offset, *, manifest=None):
+        source = manifest or self._manifest
+        target = record.get('target')
+        kwargs = {}
+        parent_reader = None
+        if target is not None and target.get('scope') == 'parent_checkpoint':
+            parent_ref = source['lineage']['parent_state']
+            if parent_ref is None:
+                _fail('parent update has no actual lineage parent')
+            parent_reader = self._parent_reader(parent_ref)
+            kwargs = dict(parent_checkpoint=parent_reader._load_checkpoint(),
+                parent_state=parent_ref, parent_manifest_ref=parent_ref['manifest'])
+        try:
+            checked = validate_scientific_record(record, **kwargs)
+            core = checked['core']['fields']
+            stage, row = core['stage']['value'], core['row']
+            if stage not in ('scba', 'outer') or row['type'] != ('SCBAIteration' if stage == 'scba' else 'OuterIteration'):
+                _fail('scientific stage and typed row differ')
+            counter = row['fields']['ν' if stage == 'scba' else 'μ']
+            expected = core['inner_iteration'] if stage == 'scba' else core['outer_iteration']
+            if (counter != expected or stage == 'outer' and core['inner_iteration'] is not None
+                    or int(core['outer_iteration']['decimal']) < 1
+                    or stage == 'scba' and int(expected['decimal']) < 1
+                    or int(core['sequence']['decimal']) < 1
+                    or int(core['domain_revision']['decimal']) < 0):
+                _fail('scientific row counters/domain/sequence differ from snapshot')
+            owner = self._index.get(leaf['path'])
+            dependencies = set(owner.get('dependencies', ())) if owner is not None else set()
+            for declaration in _arrays(checked):
+                reference = declaration['file']
+                if (reference['path'] not in dependencies or reference['path'] not in self._index
+                        or _ref(self._index[reference['path']]) != reference):
+                    _fail('record array owner absent from verified leaf dependency closure')
+            if target is not None:
+                target_leaf = _ref(leaf) if target['scope'] == 'same_leaf' else target['leaf']
+                target_offset = int(target['row_offset'])
+                if target['scope'] == 'same_leaf' and target_offset >= offset:
+                    _fail('same-leaf update does not target an earlier physical append')
+                if target['scope'] != 'parent_checkpoint':
+                    target_owner = self._index.get(target_leaf['path'])
+                    target_context = self._catalog_by_leaf.get((target_leaf['path'], target_leaf['sha256']))
+                    if (target_owner is None or target_context is None
+                            or _ref(target_owner) != target_leaf
+                            or _ref(target_context[2]['artifacts'][-1]) != target_leaf):
+                        _fail('update target FileRef differs from frozen catalog record leaf')
+                    if target['scope'] == 'sealed_leaf':
+                        current_context = self._catalog_by_leaf.get((leaf['path'], leaf['sha256']))
+                        if (current_context is None or target_context[0] >= current_context[0]
+                                or target_leaf['path'] not in current_context[2]['artifacts'][-1]['dependencies']):
+                            _fail('sealed update target is not an earlier declared catalog dependency')
+                    target_leaf = _ref(target_owner)
+                original = self._record(target_leaf, target_offset, identity=target['source_identity'],
+                    invocation=dict(source_epoch=target['source_epoch']))
+                validate_scientific_record(original)
+                if (original['target'] is not None or original['core']['fields']['action']['value'] != 'append'
+                        or original['row_key'] != checked['row_key']
+                        or original['stream_ordinal'] != target['append_ordinal']):
+                    _fail('update target differs from original append action/key/ordinal')
+            return checked
+        finally:
+            if parent_reader is not None:
+                parent_reader.close()
+
+    def _cursor(self, leaf=None, offset=0, ordinal=0):
+        return dict(schema='qcl-negf.result-cursor.v1', contract_set='qcl-negf.results.v2',
+            identity=copy.deepcopy(self._manifest['identity']), invocation=copy.deepcopy(self._manifest['invocation']),
+            manifest=copy.deepcopy(self._state_ref['manifest']), history=copy.deepcopy(self._manifest['history']),
+            leaf=None if leaf is None else _ref(leaf), row_offset=str(offset), last_record=str(ordinal))
+
+    def _cursor_page(self, cursor):
+        if cursor['leaf'] is None:
+            return None
+        context = self._catalog_by_leaf.get((cursor['leaf']['path'], cursor['leaf']['sha256']))
+        if context is not None:
+            _, reference, page = context
+            if _ref(page['artifacts'][-1]) == cursor['leaf']:
+                return dict(reference=reference, document=page)
+        _fail('cursor record leaf is not reachable from pinned source')
+
+    def _check_cursor(self, cursor):
+        _schema_check(schema_validator('result-cursor.schema.json'), cursor)
+        context = self._cursor_page(cursor)
+        validate_cursor(cursor, manifest=self._manifest, manifest_ref=self._state_ref['manifest'], catalog_page=context)
+        if cursor['leaf'] is not None:
+            row = self._record(cursor['leaf'], int(cursor['row_offset']),
+                identity=self._manifest['identity'], invocation=self._manifest['invocation'], page=context['document'])
+            self._validate_record(row, cursor['leaf'], int(cursor['row_offset']))
+            if row['stream_ordinal'] != cursor['last_record']:
+                _fail('cursor physical position differs from scientific ordinal')
+            return row
+        return None
+
+    def history_batch(self, cursor=None, *, maximum_records=256):
+        self._operation()
+        if not self._catalog_ready:
+            _fail('explicit catalog import required', 'capability_unavailable')
+        if type(maximum_records) is not int or not 1 <= maximum_records <= self.limits.maximum_batch_records:
+            raise ValueError('maximum_records exceeds configured batch limit')
+        current = self._cursor() if cursor is None else copy.deepcopy(dict(cursor))
+        previous_row = self._check_cursor(current)
+        previous_sequence = int(previous_row['core']['fields']['sequence']['decimal']) if previous_row else 0
+        output, consumed, last = [], 0, int(current['last_record'])
+        first_page = (self._catalog_by_leaf[(current['leaf']['path'], current['leaf']['sha256'])][0]
+                      if current['leaf'] is not None else 0)
+        for page_index in range(first_page, len(self._pages)):
+            _, page = self._pages[page_index]
+            if int(page['range']['last_record']) <= last:
+                continue
+            leaf = page['artifacts'][-1]
+            start = int(current['row_offset']) + 1 if current['leaf'] == _ref(leaf) else 0
+            handle = self._open_hdf(leaf, identity=self._manifest['identity'],
+                invocation=self._manifest['invocation'], representation='record_leaf')
+            count = self._record_count(handle)
+            expected = int(page['range']['last_record']) - int(page['range']['first_record']) + 1
+            if count != expected:
+                _fail('physical record count differs from catalog range')
+            for offset in range(start, count):
+                raw = self._record(leaf, offset, identity=self._manifest['identity'],
+                    invocation=self._manifest['invocation'], page=page)
+                row = self._validate_record(raw, leaf, offset)
+                if int(row['stream_ordinal']) != last + 1:
+                    _fail('scientific record ordinal gap or replay')
+                sequence = int(row['core']['fields']['sequence']['decimal'])
+                if sequence <= previous_sequence:
+                    _fail('Core delivery sequence replay or regression')
+                previous_sequence = sequence
+                proof = self._page_proofs.setdefault(leaf['sha256'],
+                    dict(next_offset=0, scba_rows=0, outer_rows=0, witness_updates=0))
+                if proof.get('invalid'):
+                    _fail('actual scientific record categories differ from catalog totals')
+                if offset == proof['next_offset']:
+                    category = ('witness_updates' if row['core']['fields']['action']['value'] == 'witness_update'
+                        else 'scba_rows' if row['core']['fields']['stage']['value'] == 'scba' else 'outer_rows')
+                    proof[category] += 1
+                    proof['next_offset'] += 1
+                    if proof['next_offset'] == count:
+                        for category in ('scba_rows','outer_rows','witness_updates'):
+                            before = int(page['previous'][category]) if page['previous'] else 0
+                            if proof[category] != int(page['totals'][category]) - before:
+                                proof['invalid'] = True
+                                _fail('actual scientific record categories differ from catalog totals')
+                consumed += len(json_bytes(row))
+                if consumed > self.limits.maximum_batch_bytes:
+                    _fail('batch JSON exceeds byte limit', 'budget_exceeded')
+                output.append(copy.deepcopy(row))
+                last += 1
+                current = self._cursor(leaf, offset, last)
+                if len(output) == maximum_records:
+                    break
+            if len(output) == maximum_records:
+                break
+        declarations = {json_bytes(item): copy.deepcopy(item) for row in output for item in _arrays(row)}
+        if self._checkpoint is not None:
+            declarations.update({json_bytes(item): copy.deepcopy(item) for item in _arrays(self._checkpoint)})
+        self._declarations = declarations
+        return HistoryBatch(copy.deepcopy(self._state_ref), tuple(output), current,
+            last == int(self._manifest['history']['last_record']), self.io_counters)
+
+    def checkpoint(self):
+        self._operation()
+        return copy.deepcopy(self._load_checkpoint())
+
+    def _load_checkpoint(self):
+        if self._checkpoint is not None:
+            return self._checkpoint
+        reference = self._manifest['checkpoint']
+        if reference is None:
+            _fail('selected state has no checkpoint', 'capability_unavailable')
+        checkpoint = validate_checkpoint_declaration(self._json(reference), manifest=self._manifest)
+        self._import_history()
+        parent_reader, parent_checkpoint = None, None
+        parent_ref = self._manifest['lineage']['parent_state']
+        if parent_ref is not None:
+            parent_reader = self._parent_reader(parent_ref)
+            try:
+                parent_checkpoint = parent_reader._load_checkpoint()
+            finally:
+                parent_reader.close()
+        for ref in checkpoint['payloads']:
+            if ref['path'] not in self._index or _ref(self._index[ref['path']]) != ref:
+                _fail('checkpoint payload differs from manifest dependencies')
+        for target in checkpoint['witness_targets']:
+            locator = target['locator']
+            local = (locator['source_identity'] == self._manifest['identity']
+                     and locator['source_epoch'] == self._manifest['invocation']['source_epoch'])
+            if local:
+                if not any(_ref(page['artifacts'][-1]) == locator['leaf'] for _, page in self._pages):
+                    _fail('checkpoint target is not in frozen scientific catalog')
+            elif parent_checkpoint is None or target not in parent_checkpoint['witness_targets']:
+                _fail('ancestor checkpoint target is not retained by actual immediate parent')
+            row = self._record(locator['leaf'], int(locator['row_offset']), identity=locator['source_identity'],
+                invocation=dict(source_epoch=locator['source_epoch']))
+            validate_scientific_record(row)
+            if (row['target'] is not None or row['row_key'] != target['row_key']
+                    or row['stream_ordinal'] != locator['append_ordinal']):
+                _fail('checkpoint witness locator differs from original append')
+        self._checkpoint = checkpoint
+        self._declarations.update({json_bytes(item): copy.deepcopy(item) for item in _arrays(checkpoint)})
+        return checkpoint
+
+    def _parent_reader(self, reference):
+        parent = StateReader.__new__(StateReader)
+        parent._initialize(self.root, state_ref=reference, expected_identity=reference['identity'],
+            limits=self.limits, budget=self._budget, lineage_depth=self._lineage_depth + 1)
+        return parent
+
+    def _parent_anchors(self):
+        """Authenticated parent metadata only; no HDF or prefix payload scan."""
+        if self._parent_anchor_cache is not None:
+            return self._parent_anchor_cache
+        reference = self._manifest['lineage']['parent_state']
+        anchors = {}
+        if reference is not None:
+            parent = self._parent_reader(reference)
+            try:
+                checkpoint_ref = parent._manifest['checkpoint']
+                if checkpoint_ref is None:
+                    _fail('lineage parent has no exact checkpoint declaration')
+                checkpoint = validate_checkpoint_declaration(parent._json(checkpoint_ref), manifest=parent._manifest)
+                for target in checkpoint['witness_targets']:
+                    leaf = target['locator']['leaf']
+                    prior = anchors.get(leaf['path'])
+                    if prior is not None and prior != leaf:
+                        _fail('parent anchors rebound an immutable path')
+                    anchors[leaf['path']] = copy.deepcopy(leaf)
+            finally:
+                parent.close()
+        self._parent_anchor_cache = anchors
+        return anchors
+
+    def _array(self, declaration):
+        key = json_bytes(declaration)
+        if key not in self._declarations:
+            _fail('array descriptor not from retained verified state/records', 'source_changed')
+        declaration = self._declarations[key]
+        reference = declaration['file']
+        if reference['path'] not in self._index or _ref(self._index[reference['path']]) != reference:
+            _fail('array owner not in verified source dependencies')
+        handle = self._open_hdf(self._index[reference['path']], identity=self._manifest['identity'],
+            invocation=self._manifest['invocation'], representation='array_payload')
+        from .native import validate_native_array
+        dataset = validate_native_array(handle, declaration)
+        return declaration, dataset
+
+    def describe_array(self, declaration):
+        self._operation()
+        wire, dataset = self._array(declaration)
+        return ArrayDescription(copy.deepcopy(wire), tuple(int(v) for v in wire['shape']),
+            tuple(dataset.shape), wire['eltype'], dataset.dtype.itemsize, 'F', copy.deepcopy(self._state_ref))
+
+    def read_array(self, declaration, selection, *, maximum_bytes=1024*1024):
+        self._operation()
+        wire, dataset = self._array(declaration)
+        if type(maximum_bytes) is not int or not 0 < maximum_bytes <= self.limits.maximum_array_bytes:
+            raise ValueError('maximum_bytes exceeds configured array read limit')
+        if not isinstance(selection, tuple) or len(selection) != dataset.ndim:
+            raise ValueError('one explicit selector required per logical axis')
+        normalized, counts = [], []
+        for item, size in zip(selection, dataset.shape):
+            if type(item) is int:
+                if not 0 <= item < size:
+                    raise IndexError('array index outside logical shape')
+                normalized.append(item)
+            elif isinstance(item, slice):
+                if item.step is not None and item.step <= 0:
+                    raise ValueError('array selection requires positive step')
+                a, b, step = item.indices(size)
+                normalized.append(slice(a, b, step))
+                counts.append(len(range(a, b, step)))
+            else:
+                raise ValueError('array selectors must be integers or slices')
+        required = math.prod(counts) * dataset.dtype.itemsize
+        if required > maximum_bytes:
+            _fail('selected array buffer exceeds limit', 'budget_exceeded')
+        if dataset.chunks and math.prod(dataset.chunks)*dataset.dtype.itemsize > self.limits.maximum_array_bytes:
+            _fail('native array chunk decode buffer exceeds limit', 'budget_exceeded')
+        values = np.asarray(dataset[tuple(normalized)])
+        values.flags.writeable = False
+        self._budget.logical_selected_bytes += values.nbytes
+        return ArrayBlock(values, tuple(normalized), copy.deepcopy(wire), copy.deepcopy(self._state_ref), self.io_counters)
+
+    def poll(self):
+        self._operation()
+        if self._pointer_path is None:
+            return self.source
+        from ._capture_io import beneath, small_json
+        value, raw = small_json(beneath(self.root, self._pointer_path), self.limits.maximum_metadata_bytes, budget=self._budget)
+        if raw == self._pointer_raw:
+            return self.source
+        pointer = validate_pointer(value)
+        if pointer['identity'] != self._manifest['identity']:
+            _fail('selected pointer source replaced', 'source_changed')
+        candidate = validate_manifest(self._json(pointer['manifest']))
+        if (candidate['identity'] != self._manifest['identity'] or candidate['invocation'] != self._manifest['invocation']
+                or candidate['lineage'] != self._manifest['lineage']
+                or candidate['provenance'] != self._manifest['provenance']
+                or int(candidate['generation']) <= int(self._manifest['generation'])
+                or int(candidate['state_sequence']) <= int(self._manifest['state_sequence'])
+                or candidate['generation'] != pointer['generation']):
+            _fail('pointer source/regression differs from current invocation', 'source_changed')
+        old_manifest, old_ref = self._manifest, self._state_ref
+        changed_paths = {pointer['manifest']['path'], *(row['path'] for row in candidate['artifacts'])}
+        original_entries = {path: self._index.get(path) for path in changed_paths}
+        original_weight = self._index_weight
+        self._manifest = candidate
+        self._state_ref = {key: candidate[key] for key in ('identity', 'state_id', 'state_sequence')}
+        self._state_ref['manifest'] = pointer['manifest']
+        self._pending_state_weight = _metadata_weight(self._state_ref) + _metadata_weight(candidate)
+        try:
+            self._register_manifest()
+            if self._catalog_ready:
+                self._import_history()
+        except Exception:
+            self._manifest, self._state_ref = old_manifest, old_ref
+            self._index_weight, self._pending_state_weight = original_weight, 0
+            for path, value in original_entries.items():
+                if value is None:
+                    self._index.pop(path, None)
+                else:
+                    self._index[path] = value
+            raise
+        self._checkpoint, self._declarations = None, {}
+        self._pointer_raw = raw
+        self._remember_state()
+        return self.source
+
+    def rebase_cursor(self, cursor):
+        self._operation()
+        _schema_check(schema_validator('result-cursor.schema.json'), cursor)
+        digest = cursor['manifest']['sha256']
+        if digest not in self._known_states:
+            _fail('cursor source not observed in this invocation', 'source_changed')
+        ref, manifest = self._known_states[digest]
+        if cursor['identity'] != self._manifest['identity'] or cursor['invocation'] != self._manifest['invocation']:
+            _fail('cursor source replaced', 'source_changed')
+        validate_cursor(cursor, manifest=manifest, manifest_ref=ref['manifest'], catalog_page=self._cursor_page(cursor))
+        rebased = copy.deepcopy(dict(cursor))
+        rebased['manifest'], rebased['history'] = copy.deepcopy(self._state_ref['manifest']), copy.deepcopy(self._manifest['history'])
+        self._check_cursor(rebased)
+        return rebased
+
+
+def verify_recovery_bundle(*args, **kwargs):
+    """Retired v1 directory API; use explicit StateRef and checkpoint()."""
+    _fail('legacy recovery directory unsupported; select result-v2 StateRef', 'unsupported_format')

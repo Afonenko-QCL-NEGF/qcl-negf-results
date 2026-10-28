@@ -1,116 +1,85 @@
-"""Finite intermediate storage refuses publication without harming existing data."""
-from __future__ import annotations
-
-import base64
+"""Native5 source capture and independent finite spool guards."""
 import json
-import os
-from pathlib import Path
 import shutil
 import sys
-
+from pathlib import Path
 import pytest
-
 from qcl_negf_contracts.messages import ContractError
-from qcl_negf_results.commits import artifact_row, json_bytes
 from qcl_negf_results.export import export_snapshot
-from test_export import fixture
+from qcl_negf_results.state import StateReader
+from result_v2_fixture import IDENTITY, source, record, encoded, export_source
 
 
-def _add_noise(generation: Path) -> int:
-    path = generation / "noise.txt"
-    path.write_bytes(base64.b64encode(os.urandom(256 * 1024)))
-    commit_path = generation / "commit.json"
-    commit = json.loads(commit_path.read_bytes())
-    commit["artifacts"].append(artifact_row(path, relative=path.name, role="plan", media_type="text/plain"))
-    commit_path.write_bytes(json_bytes(commit))
-    return path.stat().st_size
-
-
-def test_tiny_budget_refuses_before_any_payload_capture(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    source = (generation / "analysis.h5").read_bytes()
-    progress = []
-    with pytest.raises(ContractError, match="export.*budget"):
-        export_snapshot(root, output, byte_budget=1, reserve_bytes=0, progress=progress.append)
-    assert not any(row["phase"] == "capturing" for row in progress)
+def test_tiny_budget_refuses_before_any_payload_capture(tmp_path):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    original = (root / 'records.h5').read_bytes()
+    events = []
+    with pytest.raises(ContractError, match='export.*budget'):
+        export_source(root, ref, output, byte_budget=1, progress=events.append)
+    assert not any(row['phase'] == 'capturing' for row in events)
     assert not list(output.iterdir())
-    assert (generation / "analysis.h5").read_bytes() == source
+    assert (root / 'records.h5').read_bytes() == original
 
 
-def test_free_space_reserve_refuses_before_payload_capture(tmp_path: Path, monkeypatch) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
+def test_free_space_reserve_refuses_before_payload_capture(tmp_path, monkeypatch):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
     usage = shutil.disk_usage(tmp_path)
-    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage._replace(free=4096))
-    progress = []
-    with pytest.raises(ContractError, match="space|reserve"):
-        export_snapshot(root, output, byte_budget=1024 * 1024, reserve_bytes=4096, progress=progress.append)
-    assert not any(row["phase"] == "capturing" for row in progress)
+    monkeypatch.setattr(shutil, 'disk_usage', lambda path: usage._replace(free=4096))
+    events = []
+    with pytest.raises(ContractError, match='space|reserve'):
+        export_source(root, ref, output, reserve_bytes=4096, progress=events.append)
+    assert not any(row['phase'] == 'capturing' for row in events)
     assert not list(output.iterdir())
 
 
-def test_actual_compressed_bytes_exhaust_budget_and_never_acknowledge(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    noise_bytes = _add_noise(generation)
-    # Captures fit. The real XZ stream (incompressible ASCII) cannot fit in
-    # the remaining 16 KiB. No scientific object may be removed to make it fit.
-    budget = noise_bytes + (generation / "analysis.h5").stat().st_size + 16 * 1024
-    progress = []
-    with pytest.raises(ContractError, match="export.*budget"):
-        export_snapshot(root, output, byte_budget=budget, reserve_bytes=0, progress=progress.append)
-    assert any(row["phase"] == "compressing" for row in progress)
-    assert not any(row["phase"] in {"publishing", "completed"} for row in progress)
+def test_actual_archive_bytes_exhaust_spool_budget_without_publication(tmp_path):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    # Exact captures fit this allowance, but capture+compressed archive+metadata
+    # do not. The format must not trim any chosen scientific source object.
+    catalog = json.loads((root / 'catalog.json').read_text())
+    size = int(ref['manifest']['bytes']) + (root / 'catalog.json').stat().st_size + sum(int(row['bytes']) for row in catalog['artifacts'])
+    events = []
+    with pytest.raises(ContractError, match='export.*budget'):
+        export_source(root, ref, output, byte_budget=size+32, progress=events.append)
+    assert any(row['phase'] == 'compressing' for row in events)
     assert not list(output.iterdir())
-    assert (generation / "noise.txt").stat().st_size == noise_bytes
 
 
-def test_budget_failure_preserves_previous_archive_and_receipt(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    old = export_snapshot(root, output)
-    previous = {path.name: path.read_bytes() for path in output.iterdir()}
-    _add_noise(generation)
-    with pytest.raises(ContractError, match="export.*budget"):
-        export_snapshot(root, output, byte_budget=1, reserve_bytes=0)
-    assert {path.name: path.read_bytes() for path in output.iterdir()} == previous
-    assert output.joinpath(old["archive"]).exists()
+def test_failed_new_export_preserves_previous_archive_and_receipt(tmp_path):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    export_source(root, ref, output)
+    previous = {p.name:p.read_bytes() for p in output.iterdir()}
+    with pytest.raises(ContractError, match='export.*budget'):
+        export_source(root, ref, output, byte_budget=1)
+    assert {p.name:p.read_bytes() for p in output.iterdir()} == previous
 
 
-def test_matching_verified_cache_needs_no_new_spool_budget(tmp_path: Path, monkeypatch) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    old = export_snapshot(root, output)
-    usage = shutil.disk_usage(tmp_path)
-    monkeypatch.setattr(shutil, "disk_usage", lambda path: usage._replace(free=0))
-    progress = []
-    actual = export_snapshot(root, output, byte_budget=1, reserve_bytes=4096, progress=progress.append)
-    assert actual == old
-    assert progress[-1]["phase"] == "cached"
-    assert len(list(output.iterdir())) == 2
-
-
-@pytest.mark.parametrize("kwargs", [{"byte_budget": 0}, {"byte_budget": True},
-    {"byte_budget": 1.5}, {"reserve_bytes": -1}, {"reserve_bytes": False}])
-def test_invalid_budget_options_refused_before_destination_write(tmp_path: Path, kwargs: dict) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    with pytest.raises((ContractError, ValueError), match="budget|reserve"):
-        export_snapshot(root, output, **kwargs)
+@pytest.mark.parametrize('kwargs', [{'byte_budget':0}, {'byte_budget':True}, {'byte_budget':1.5},
+    {'reserve_bytes':-1}, {'reserve_bytes':False}])
+def test_invalid_budget_options_refused_before_destination_write(tmp_path, kwargs):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    with pytest.raises(ValueError, match='budget|reserve'):
+        export_source(root, ref, output, **kwargs)
     assert not output.exists()
 
 
-def test_cli_passes_finite_budget_and_reports_refusal(tmp_path: Path, monkeypatch, capsys) -> None:
+def test_cli_passes_finite_budget_and_reports_refusal(tmp_path, monkeypatch, capsys):
     from qcl_negf_results.cli import main
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    monkeypatch.setattr(sys, "argv", ["qcl-negf-results", "export", str(root), str(output),
-                                     "--byte-budget", "1", "--reserve-bytes", "0"])
-    with pytest.raises(SystemExit) as stopped:
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    identity, state = tmp_path / 'identity.json', tmp_path / 'state.json'
+    identity.write_bytes(encoded(IDENTITY)); state.write_bytes(encoded(ref))
+    monkeypatch.setattr(sys, 'argv', ['qcl-negf-results', 'export', str(root), str(output),
+        '--identity', str(identity), '--state-ref', str(state), '--byte-budget','1','--reserve-bytes','0'])
+    with pytest.raises(SystemExit) as error:
         main()
-    assert stopped.value.code == 2
-    assert "intermediate export budget" in capsys.readouterr().err
+    assert error.value.code == 2
+    assert 'intermediate export budget' in capsys.readouterr().err
     assert not output.exists() or not list(output.iterdir())
 
 
@@ -167,28 +136,23 @@ def test_parquet_derivation_writes_are_actually_limited(tmp_path: Path) -> None:
     assert source.read_bytes() == original
 
 
-def test_hdf5_derivation_growth_is_limited_without_touching_source(tmp_path: Path) -> None:
+def test_hdf5_derivation_growth_is_limited_without_touching_source(tmp_path):
     import h5py
     import numpy as np
-    from native_result_fixtures import declare_native
-    from test_psd_history_proof import _selected
-    from qcl_negf_results.witness_selection import select_history_witnesses
     from qcl_negf_results.export_budget import ExportBudget
-    source, spool = tmp_path / "history.h5", tmp_path / "spool"
-    with h5py.File(source, "w") as handle:
-        declare_native(handle, "qcl-negf-scientific-history-v4", "science.history", scba_rows=20)
-        handle["metadata/source_segments_json"] = json.dumps([{
-            "identity": {"attempt": 1}, "scba_rows": 20, "scba_sequence_first": 1, "scba_sequence_last": 20}])
-        psd = handle["psd_history"]
-        del psd["selected_blocks"]
-        _selected(psd, 20)
-        psd["ratio"] = np.asarray([-1.0] * 4 + [1.0] * 8 + [3.0] + [1.0] * 7)
-        psd["available"][:] = 1
-    original = source.read_bytes()
+    from result_v2_fixture import metadata
+    root = tmp_path / 'source'
+    source(root, [record()])
+    original = (root / 'records.h5').read_bytes()
+    spool = tmp_path / 'spool'
     spool.mkdir()
-    byte_budget = source.stat().st_size
-    budget = ExportBudget(spool, byte_budget=byte_budget, reserve_bytes=0)
-    with pytest.raises(ContractError, match="export.*budget"):
-        select_history_witnesses(source, spool / "selected.h5", budget=budget)
-    assert sum(path.stat().st_size for path in spool.iterdir()) <= byte_budget
-    assert source.read_bytes() == original
+    budget = ExportBudget(spool, byte_budget=4096, reserve_bytes=0)
+    with pytest.raises(ContractError, match='export.*budget'):
+        with budget.open(spool / 'derived.h5', 'w+b', defer_errors=True) as stream:
+            with h5py.File(stream, 'w') as handle:
+                metadata(handle)
+                dataset = handle.create_dataset('manufactured', shape=(32768,), dtype='<f8')
+                for first in range(0, 32768, 1024):
+                    dataset[first:first+1024] = np.ones(1024)
+    assert sum(path.stat().st_size for path in spool.iterdir()) <= 4096
+    assert (root / 'records.h5').read_bytes() == original

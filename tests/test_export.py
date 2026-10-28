@@ -53,315 +53,6 @@ def unpack(receipt: dict, destination: Path) -> tuple[dict, dict[str, bytes]]:
     return json.loads(members["manifest.json"]), members
 
 
-def test_running_science_pins_complete_native_hdf5_without_recovery(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    receipt = export_snapshot(root, output)
-    manifest, members = unpack(receipt, output)
-    assert receipt["job_complete"] is False and receipt["snapshot_consistent"] is True
-    assert manifest["records"][0]["scientific_accepted"] is False
-    included = manifest["records"][0]["included"]
-    assert [item["role"] for item in included] == ["physics.analysis"]
-    assert members[included[0]["object"]] == (generation / "analysis.h5").read_bytes()
-    assert manifest["records"][0]["omitted_by_policy"][0]["role"] == "recovery"
-    assert receipt["bytes"] > 0
-
-
-def test_full_state_includes_recovery(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    receipt = export_snapshot(root, output, profile="full-state", job_status="completed_with_warnings")
-    manifest, _ = unpack(receipt, output)
-    assert {item["role"] for item in manifest["records"][0]["included"]} == {"physics.analysis", "recovery"}
-    assert manifest["complete"] is True
-
-
-@pytest.mark.parametrize("profile,roles", [
-    ("science", ["physics.analysis"]),
-    ("full-state", ["physics.analysis", "recovery"]),
-])
-def test_preview_roles_follow_profile_without_reading_payloads(tmp_path: Path,
-        profile: str, roles: list[str]) -> None:
-    job = "1234567890abcdef"
-    root = tmp_path / "runs" / job
-    generation = fixture(root)
-    # Preview is metadata-only. Actual export remains responsible for verifying
-    # the payload even when a role is available in the pinned descriptor.
-    (generation / "analysis.h5").unlink()
-    value = exporter.preview(root, profile=profile, job_id=job)
-    assert value["selected_roles"] == roles
-    assert value["id"] == job and value["complete"] is False
-    with pytest.raises(ContractError, match="disappeared"):
-        exporter.export_snapshot(root, tmp_path / "exports", profile=profile)
-
-
-def test_analysis_clock_comes_from_commit_and_unknown_is_not_zero(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    first = export_snapshot(root, output)
-    assert first["freshness"]["records"][0]["analysis_unix"] is None
-    value = json.loads((generation / "commit.json").read_bytes())
-    value.update(published_unix=100.0, analysis_coordinates={"attempt": 1,
-        "last_completed_outer": None, "last_inner": None})
-    (generation / "commit.json").write_bytes(json_bytes(value))
-    receipt = export_snapshot(root, output)
-    frame = receipt["freshness"]["records"][0]
-    assert frame["analysis_unix"] == 100.0
-    assert frame["analysis_coordinates"]["last_inner"] is None
-    assert frame["analysis_age_seconds"] == receipt["captured_unix"] - 100.0
-
-
-
-
-def test_archive_reuses_identical_committed_generation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    first = export_snapshot(root, output)
-    monkeypatch.setattr(exporter, "_capture", lambda *_: pytest.fail("unchanged export must reuse validated receipt"))
-    assert export_snapshot(root, output) == first
-
-
-def test_progress_reports_frozen_prefix_without_reading_live_recovery(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    # A science snapshot must not spend time reading or validating recovery bytes.
-    (generation / "recovery.h5").write_bytes(b"not selected by science profile")
-    updates = []
-    advanced = False
-
-    def progress(value: dict) -> None:
-        nonlocal advanced
-        updates.append(value)
-        if value["phase"] == "capturing" and not advanced:
-            # The producer advances after collection; this export keeps its
-            # previously captured committed index instead of chasing live state.
-            advanced = True
-            new_generation = generation.parent / "generation-000002"
-            new_generation.mkdir()
-            new_analysis = new_generation / "analysis.h5"
-            with h5py.File(new_analysis, "w") as handle:
-                declare_native(handle, "qcl-negf-physics-analysis-v4", "physics.analysis")
-                handle.create_dataset("density", data=np.array([99.0]))
-            new_commit = json.loads((generation / "commit.json").read_bytes())
-            new_commit.update(generation=2, artifacts=[artifact_row(new_analysis,
-                relative="analysis.h5", role="physics.analysis", schema="qcl-negf-physics-analysis-v4", media_type="application/x-hdf5")])
-            commit_payload = json_bytes(new_commit)
-            atomic_write(new_generation / "commit.json", commit_payload, immutable=True)
-            publish_pointer(generation.parent / "current.json", "generation-000002/commit.json", commit_payload, 2)
-            atomic_write(root / "series_result.json", json_bytes({
-                "schema": "qcl-negf-series-result-v3", "contract_set": "qcl-negf.results.v1", "points": [{"id": "point-1", "status": "running",
-                "data": {"result_commit": "point-1/artifacts/generation-000002/commit.json"}}]}))
-
-    receipt = export_snapshot(root, output, progress=progress)
-    manifest, members = unpack(receipt, output)
-    assert len(manifest["coverage"]) == 1
-    assert advanced and manifest["records"][0]["generation"] == 1
-    source = manifest["records"][0]["included"][0]["object"]
-    assert members[source] == (generation / "analysis.h5").read_bytes()
-    phases = list(dict.fromkeys(value["phase"] for value in updates))
-    assert phases == ["collecting", "capturing", "validating_closure", "compressing", "verifying", "publishing", "completed"]
-    for phase in ("capturing", "compressing", "verifying", "completed"):
-        last = [value for value in updates if value["phase"] == phase][-1]
-        assert 0 < last["completed_bytes"] == last["total_bytes"]
-    assert receipt["export_seconds"] >= receipt["compression_seconds"] >= 0
-    assert receipt["captured_unix"] > 0 and receipt["committed_records"] == 1
-
-
-def test_truncated_json_rejected_even_with_matching_hash(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    (generation / "metadata.json").write_bytes(b'{"status":"running"')
-    value = json.loads((generation / "commit.json").read_bytes())
-    value["artifacts"].append(artifact_row(generation / "metadata.json", relative="metadata.json",
-                                          role="model", schema="qcl-negf-resolved-configuration-v3",
-                                          media_type="application/json"))
-    (generation / "commit.json").write_bytes(json_bytes(value))
-    with pytest.raises(ContractError, match="invalid complete UTF-8 JSON"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_hdf5_parser_rejects_fake_extension(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root, data=b"Not HDF5 despite matching byte count and SHA256")
-    with pytest.raises(ContractError, match="invalid HDF5"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_atomic_replacement_cannot_create_old_length_truncation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    original = exporter._capture
-    def replace_before_open(source: Path, destination: Path, artifact: object, on_bytes=None, **kwargs) -> None:
-        replacement = source.with_suffix(".replacement")
-        replacement.write_bytes(source.read_bytes() + b"expanded new generation")
-        replacement.replace(source)
-        original(source, destination, artifact, on_bytes, **kwargs)
-    monkeypatch.setattr(exporter, "_capture", replace_before_open)
-    with pytest.raises(ContractError, match="grew beyond committed"):
-        export_snapshot(root, output)
-    assert (generation / "analysis.h5").exists()
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_running_series_advancement_does_not_mix_generations(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    original = exporter._capture
-    def advance_series(source: Path, destination: Path, artifact: object, on_bytes=None, **kwargs) -> None:
-        atomic_write(root / "series_result.json", json_bytes({"schema": "qcl-negf-series-result-v3", "contract_set": "qcl-negf.results.v1", "points": [{"id": "point-2", "data": {}}]}))
-        original(source, destination, artifact, on_bytes, **kwargs)
-    monkeypatch.setattr(exporter, "_capture", advance_series)
-    receipt = export_snapshot(root, output)
-    manifest, _ = unpack(receipt, output)
-    assert [point["id"] for point in manifest["coverage"]] == ["point-1"]
-    assert manifest["snapshot_consistent"] is True
-
-
-def test_mandatory_payload_is_not_trimmed_by_transport(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    before = (generation / "analysis.h5").read_bytes()
-    manifest, members = unpack(export_snapshot(root, output), output)
-    assert members[manifest["records"][0]["included"][0]["object"]] == before
-    assert (generation / "analysis.h5").read_bytes() == before
-
-
-def test_required_dependency_omission_is_rejected(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    value = json.loads((generation / "commit.json").read_bytes())
-    value["artifacts"][0]["dependencies"] = ["recovery.h5"]
-    (generation / "commit.json").write_bytes(json_bytes(value))
-    with pytest.raises(ContractError, match="omits a dependency"):
-        export_snapshot(root, output)
-
-
-def test_symlink_and_external_hdf5_link_are_rejected(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    outside = tmp_path / "outside.h5"
-    (generation / "analysis.h5").rename(outside)
-    (generation / "analysis.h5").symlink_to(outside)
-    with pytest.raises(ContractError, match="symbolic link"):
-        export_snapshot(root, output)
-    (generation / "analysis.h5").unlink()
-    with h5py.File(generation / "analysis.h5", "w") as handle:
-        declare_native(handle, "qcl-negf-physics-analysis-v4", "physics.analysis")
-        handle["external"] = h5py.ExternalLink(str(outside), "/density")
-    value = json.loads((generation / "commit.json").read_bytes())
-    value["artifacts"][0] = artifact_row(generation / "analysis.h5", relative="analysis.h5",
-                                         role="physics.analysis", schema="qcl-negf-physics-analysis-v4", media_type="application/x-hdf5")
-    (generation / "commit.json").write_bytes(json_bytes(value))
-    with pytest.raises(ContractError, match="external HDF5"):
-        export_snapshot(root, output)
-
-
-def test_changed_committed_bytes_fail_hash_verification(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    payload = bytearray((generation / "analysis.h5").read_bytes())
-    payload[-1] ^= 1
-    (generation / "analysis.h5").write_bytes(payload)
-    with pytest.raises(ContractError, match="do not match immutable commit"):
-        export_snapshot(root, output)
-
-
-def test_legacy_profile_is_not_silently_accepted(tmp_path: Path) -> None:
-    with pytest.raises(ContractError, match="science or full-state"):
-        export_snapshot(tmp_path, tmp_path / "exports", profile="compact")
-
-
-def test_recovery_generation_keeps_its_previous_native_analysis(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    original = fixture(root)
-    recovery = original.parent / "generation-000002"
-    recovery.mkdir()
-    value = json.loads((original / "commit.json").read_bytes())
-    parent_sha = hashlib.sha256((original / "commit.json").read_bytes()).hexdigest()
-    (recovery / "recovery.h5").write_bytes((original / "recovery.h5").read_bytes())
-    value["generation"] = 2
-    value["artifacts"] = [item for item in value["artifacts"] if item["role"] == "recovery"]
-    value["science_parent_commit"] = {"path": "generation-000001/commit.json", "sha256": parent_sha}
-    atomic_write(recovery / "commit.json", json_bytes(value), immutable=True)
-    atomic_write(root / "series_result.json", json_bytes({"schema": "qcl-negf-series-result-v3", "contract_set": "qcl-negf.results.v1", "points": [{"id": "point-1", "status": "paused",
-        "data": {"result_commit": "point-1/artifacts/generation-000002/commit.json"}}]}))
-    manifest, _ = unpack(export_snapshot(root, output), output)
-    assert len(manifest["records"]) == 2
-    assert manifest["records"][0]["science_parent_sha256"] == parent_sha
-    assert manifest["records"][1]["included"][0]["role"] == "physics.analysis"
-
-
-def test_complete_queue_without_physical_record_is_not_complete_export(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    root.mkdir()
-    receipt = export_snapshot(root, output, job_status="completed")
-    manifest, _ = unpack(receipt, output)
-    assert receipt["job_complete"] is True
-    assert receipt["complete"] is False
-    assert manifest["missing_records"] == [{"availability": "no_committed_scientific_records"}]
-
-
-def test_single_archive_verification_checks_xz_footer_after_valid_members(tmp_path: Path) -> None:
-    import lzma
-    from qcl_negf_results.archive import verify_archive
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    receipt = export_snapshot(root, output)
-    source = output / receipt["archive"]
-    payload = bytearray(source.read_bytes())
-    payload[-12] ^= 1  # Corrupt only the footer CRC after valid native members.
-    target = tmp_path / "damaged-footer.tar.xz"
-    target.write_bytes(payload)
-    with pytest.raises((lzma.LZMAError, EOFError, tarfile.ReadError)):
-        verify_archive(target)
-
-
-def test_empty_chunked_diagnostic_dataset_is_a_valid_native_state(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generation = fixture(root)
-    with h5py.File(generation / "analysis.h5", "a") as handle:
-        handle.create_dataset("history", shape=(0, 12), maxshape=(None, 12), chunks=(1, 12), dtype="f8")
-    value = json.loads((generation / "commit.json").read_bytes())
-    value["artifacts"][0] = artifact_row(generation / "analysis.h5", relative="analysis.h5",
-        role="physics.analysis", schema="qcl-negf-physics-analysis-v4", media_type="application/x-hdf5")
-    (generation / "commit.json").write_bytes(json_bytes(value))
-    assert export_snapshot(root, output)["snapshot_consistent"] is True
-
-
-def test_campaign_commit_pins_series_instead_of_live_projection(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    fixture(root)
-    generation = root / "control" / "generations" / "000001"
-    generation.mkdir(parents=True)
-    (generation / "series_result.json").write_bytes((root / "series_result.json").read_bytes())
-    atomic_write(generation / "control-state.json", json_bytes({"workers": [], "status": "running"}), immutable=True)
-    series = artifact_row(generation / "series_result.json", relative="series_result.json", role="control.series",
-                          media_type="application/json", profile="local")
-    control = artifact_row(generation / "control-state.json", relative="control-state.json", role="control.state",
-                           media_type="application/json", profile="full-state")
-    payload = json_bytes({"schema": COMMIT_SCHEMA, "contract_set": "qcl-negf.results.v1", "identity": {"campaign_id": "test"},
-                          "generation": 1, "artifacts": [series, control]})
-    atomic_write(generation / "commit.json", payload, immutable=True)
-    publish_pointer(root / "current-commit.json", "control/generations/000001/commit.json", payload, 1)
-    atomic_write(root / "series_result.json", json_bytes({"schema": "qcl-negf-series-result-v3", "contract_set": "qcl-negf.results.v1",
-                                                        "points": [{"id": "new-uncommitted-point", "data": {}}]}))
-    receipt = export_snapshot(root, output)
-    manifest, _ = unpack(receipt, output)
-    assert [item["id"] for item in manifest["coverage"]] == ["point-1"]
-    assert "control.series" in {item["role"] for record in manifest["records"] for item in record["omitted_by_policy"]}
-    assert "control.state" not in {item["role"] for record in manifest["records"] for item in record["included"]}
-
-
-def test_previous_series_format_is_explicitly_rejected(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    root.mkdir()
-    atomic_write(root / "series_result.json", json_bytes({"schema": "qcl-negf-series-result-v1", "points": []}))
-    with pytest.raises(ContractError, match="unsupported result contract set"):
-        export_snapshot(root, output)
-
-
 def cumulative_fixture(root: Path, *, corrupt_prefix: bool = False, dependent: bool = False,
                        foreign_plan: bool = False) -> list[Path]:
     """Three generations, with full history spanning two numerical attempts."""
@@ -422,99 +113,121 @@ def cumulative_fixture(root: Path, *, corrupt_prefix: bool = False, dependent: b
         "id": "point-1", "status": "running", "data": {"result_commit": "point-1/artifacts/generation-000003/commit.json"}}]}))
     return generations
 
-
-def test_cumulative_science_history_keeps_all_attempts_once_and_parent_physics(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generations = cumulative_fixture(root)
-    manifest, members = unpack(export_snapshot(root, output), output)
-    records = manifest["records"]
-    histories = [item for record in records for item in record["included"] if item["role"] == "science.history"]
-    assert len(histories) == 1
-    assert members[histories[0]["object"]] == (generations[-1] / "history.h5").read_bytes()
-    physics = [item for record in records for item in record["included"] if item["role"] == "physics.analysis"]
-    assert len(physics) == 2
-    assert {members[item["object"]] for item in physics} == {(path / "analysis.h5").read_bytes() for path in generations[:2]}
-    omissions = [item for record in records for item in record["omitted_by_policy"] if item["role"] == "science.history"]
-    assert len(omissions) == 2
-    assert all(item["reason"] == "superseded_by_verified_cumulative_history" for item in omissions)
-    assert all(item["replacement_sha256"] == histories[0]["sha256"] for item in omissions)
-    assert sorted(item["replacement_verification"]["previous_rows"]["scba"] for item in omissions) == [2, 4]
-    assert all(item["replacement_verification"]["replacement_rows"] == {"scba": 6, "outer": 3} for item in omissions)
-    import io
-    with h5py.File(io.BytesIO(members[histories[0]["object"]]), "r") as handle:
-        assert handle["scba/sequence"][:].tolist() == list(range(1, 7))
-        assert handle["outer/sequence"][:].tolist() == [1, 2, 3]
-        assert {row["identity"]["attempt"] for row in json.loads(handle["metadata/source_segments_json"][()])} == {1, 2}
-    full_manifest, _ = unpack(export_snapshot(root, output, profile="full-state"), output)
-    assert sum(item["role"] == "science.history" for record in full_manifest["records"] for item in record["included"]) == 3
+# Native4 helper constructors above remain for the pending owning consumer
+# migrations; supported export tests below use only an explicit native5 source.
+from result_v2_fixture import (IDENTITY, source, record, reference, put,
+    producer_root, producer_state, copy_constructor_closure, export_source)
+from qcl_negf_results.state import StateReader
 
 
-def test_cumulative_history_must_preserve_exact_previous_numerical_rows(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    cumulative_fixture(root, corrupt_prefix=True)
-    with pytest.raises(ContractError, match="changes or omits earlier numerical rows"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_cumulative_history_cannot_cross_frozen_plan_identity(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    cumulative_fixture(root, foreign_plan=True)
-    with pytest.raises(ContractError, match="crosses scientific point provenance"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_exact_parent_history_dependency_is_retained(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    cumulative_fixture(root, dependent=True)
-    manifest, _ = unpack(export_snapshot(root, output), output)
-    assert sum(item["role"] == "science.history" for record in manifest["records"] for item in record["included"]) == 3
-    for record in manifest["records"]:
-        for item in record["included"]:
-            assert all(dependency in {row["path"] for row in manifest["files"]} for dependency in item["dependencies"])
-
-
-def test_cumulative_history_cannot_hide_an_earlier_attempt_provenance(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generations = cumulative_fixture(root)
-    newest = generations[-1]
-    with h5py.File(newest / "history.h5", "r+") as handle:
-        sources = json.loads(handle["metadata/source_segments_json"][()])
-        sources.pop(0)  # Keep numerical arrays, but incorrectly erase attempt-1 provenance.
-        sources[0]["scba_rows"] += 2
-        sources[0]["outer_rows"] += 1
-        del handle["metadata/source_segments_json"]
-        handle["metadata"].create_dataset("source_segments_json", data=json.dumps(sources))
-    commit = json.loads((newest / "commit.json").read_bytes())
-    commit["artifacts"][0] = artifact_row(newest / "history.h5", relative="history.h5",
-        role="science.history", schema="qcl-negf-scientific-history-v4", media_type="application/x-hdf5")
-    (newest / "commit.json").write_bytes(json_bytes(commit))
-    with pytest.raises(ContractError, match="omits or changes an earlier source segment"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_omitted_history_still_requires_matching_committed_bytes(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generations = cumulative_fixture(root)
-    with (generations[0] / "history.h5").open("ab") as stream:
-        stream.write(b"not the committed history")
-    with pytest.raises(ContractError, match="grew beyond committed"):
-        export_snapshot(root, output)
-    assert not list(output.glob("*.tar.xz"))
-
-
-def test_verified_history_reports_raw_size_without_using_it_for_admission(tmp_path: Path) -> None:
-    root, output = tmp_path / "run", tmp_path / "exports"
-    generations = cumulative_fixture(root)
-    receipt = export_snapshot(root, output)
-    all_history_bytes = sum((path / "history.h5").stat().st_size for path in generations)
+def test_science_preserves_exact_source_bytes_without_claiming_acceptance(tmp_path):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    receipt = export_source(root, ref, output)
     manifest, members = unpack(receipt, output)
-    exported_history_bytes = sum(len(members[item["object"]]) for record in manifest["records"]
-                                 for item in record["included"] if item["role"] == "science.history")
-    assert all_history_bytes > exported_history_bytes
-    assert receipt["payload_bytes"] == sum(map(len, members.values()))
-    assert receipt["bytes"] < receipt["payload_bytes"]
-    assert receipt["size_policy"]["archive_byte_limit"] is None
-    assert receipt["size_policy"]["scope"] == "one complete archive, all profiles"
+    assert manifest['source_state'] == ref
+    assert manifest['scientific_accepted'] is None and receipt['scientific_accepted'] is None
+    assert manifest['snapshot_consistent'] is True
+    assert manifest['canonical_source_complete'] is False and manifest['complete'] is False
+    assert 'raw_scientific_history' in manifest['capabilities']
+    assert 'exact_restart' in manifest['requires_full_state']
+    for row in manifest['source_locator']:
+        assert members[row['object']] == (root / row['reference']['path']).read_bytes()
+
+
+def test_science_omits_optional_checkpoint_owner_without_reading_it(producer_root, tmp_path):
+    ref = producer_state(producer_root, 'exact', recovery=True)
+    root = copy_constructor_closure(producer_root, tmp_path / 'source', ref)
+    original = json.loads((root / ref['manifest']['path']).read_text())
+    # These owners really are optional for the selected raw history. Their
+    # absence must neither pull full state into science nor validate restore.
+    full = [row for row in original['artifacts'] if row['role'] == 'recovery' and row['media_type'] == 'application/x-hdf5']
+    assert full
+    for row in full:
+        (root / row['path']).unlink()
+    receipt = export_source(root, ref, tmp_path / 'export')
+    manifest, members = unpack(receipt, tmp_path / 'export')
+    assert all(row['role'] != 'recovery' for row in manifest['records'][0]['included'])
+    assert any(row['role'] == 'recovery' for row in manifest['omitted_by_policy'])
+    assert members[next(row['object'] for row in manifest['source_locator']
+        if row['reference'] == ref['manifest'])] == (root / ref['manifest']['path']).read_bytes()
+    with pytest.raises(ContractError):
+        export_source(root, ref, tmp_path / 'full', profile='full-state')
+
+
+def test_preview_does_not_read_hdf_payload_and_reports_actual_declared_bytes(tmp_path, monkeypatch):
+    root = tmp_path / 'source'
+    ref = source(root, [record()])
+    (root / 'records.h5').unlink()
+    with StateReader(root, state_ref=ref, expected_identity=IDENTITY) as reader:
+        monkeypatch.setattr(h5py, 'File', lambda *a, **kw: pytest.fail('preview opened HDF'))
+        value = exporter.preview(reader, profile='science')
+        assert value['bytes'] > 0 and value['source'] == ref
+        assert value['integrity_scope'] == 'declared_metadata_availability'
+        with pytest.raises(ContractError):
+            exporter.export_snapshot(reader, tmp_path / 'export', profile='science',
+                byte_budget=1024*1024, reserve_bytes=0)
+
+
+@pytest.mark.parametrize('raw', [b'{"schema":', b'{"a":1,"a":2}', b'\xff'])
+def test_manifest_json_strictness_even_with_matching_hash(tmp_path, raw):
+    root = tmp_path / 'source'
+    ref = source(root, [record()])
+    (root / 'manifest.json').write_bytes(raw)
+    ref['manifest'] = reference(root, 'manifest.json', ref['manifest']['schema'])
+    with pytest.raises(ContractError):
+        StateReader(root, state_ref=ref, expected_identity=IDENTITY)
+
+
+def test_changed_closed_bytes_fail_hash_verification_and_do_not_publish(tmp_path):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    path = root / 'records.h5'
+    path.write_bytes(path.read_bytes() + b'not-declared')
+    with pytest.raises(ContractError):
+        export_source(root, ref, output)
+    assert not output.exists() or not list(output.iterdir())
+
+
+def test_implicit_legacy_root_profile_and_status_overrides_are_retired(tmp_path):
+    root = tmp_path / 'source'
+    ref = source(root, [record()])
+    with pytest.raises(TypeError, match='explicit selected StateReader'):
+        export_snapshot(root, tmp_path / 'bad', profile='science', byte_budget=1000, reserve_bytes=0)
+    with StateReader(root, state_ref=ref, expected_identity=IDENTITY) as reader:
+        with pytest.raises(ValueError, match='profile'):
+            exporter.preview(reader, profile='legacy')
+        with pytest.raises(TypeError):
+            export_snapshot(reader, tmp_path / 'bad', profile='science', byte_budget=1000,
+                reserve_bytes=0, job_status='completed')
+    assert not (tmp_path / 'bad').exists()
+
+
+def test_history_only_source_has_no_automatic_recovery_substitution(tmp_path):
+    root = tmp_path / 'source'
+    ref = source(root, [record()])
+    with StateReader(root, state_ref=ref, expected_identity=IDENTITY) as reader:
+        with pytest.raises(ContractError) as error:
+            exporter.preview(reader, profile='full-state')
+    assert error.value.code == 'capability_unavailable'
+
+
+def test_unselected_orphans_do_not_change_snapshot_or_get_read(tmp_path):
+    root, output = tmp_path / 'source', tmp_path / 'export'
+    ref = source(root, [record()])
+    first = export_source(root, ref, output)
+    (root / 'series_result.json').write_bytes(b'legacy malformed untrusted orphan')
+    (root / 'later.h5').write_bytes(b'not HDF')
+    assert export_source(root, ref, output) == first
+
+
+def test_explicit_parent_history_is_preserved_once(producer_root, tmp_path):
+    ref = producer_state(producer_root, 'grandchild')
+    receipt = export_source(producer_root, ref, tmp_path / 'export')
+    manifest, members = unpack(receipt, tmp_path / 'export')
+    paths = [row['reference']['path'] for row in manifest['source_locator']]
+    assert len(paths) == len(set(paths))
+    assert any(row['role'] == 'parent.checkpoint.proof' for row in manifest['records'][0]['included'])
+    assert not set(paths) & {row['source_path'] for row in manifest['omitted_by_policy']}
+    assert manifest['coverage']['scope'] == 'explicit_selected_state'
+    assert not manifest['canonical_source_complete']

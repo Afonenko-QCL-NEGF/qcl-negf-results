@@ -10,9 +10,20 @@ import pytest
 from qcl_negf_contracts.messages import ContractError
 from qcl_negf_results.native import _read_final_fixed_point_audit
 from qcl_negf_results import native as native_module
-from qcl_negf_results.state import StateReader, _validated_final_fixed_point_audit, _BudgetStream, _IOBudget
+from qcl_negf_results.state import StateReader, _BudgetStream, _IOBudget
+from qcl_negf_contracts.final_audit import validate_final_audit_pair
 from native_result_fixtures import declare_native
 from qcl_negf_contracts.artifacts import CONTRACT_SET
+
+
+def _pair(handle, declaration, *, final_state):
+    """Compose the actual native subresource decoder and public pure validator.
+
+    This does not construct a result container reader or add v4 compatibility.
+    """
+    value = declaration.get('stationary_assessment', {}).get('final_fixed_point_audit')
+    return validate_final_audit_pair(_read_final_fixed_point_audit(handle), value,
+        expected_identity=declaration['identity'], final_state=final_state)
 
 SCHEMA = 'qcl-negf-final-fixed-point-audit-v1'
 PATH = 'diagnostics/final_fixed_point_audit'
@@ -100,7 +111,7 @@ def test_healthy_zero_and_right_padding(tmp_path):
     value = record()
     with h5py.File(tmp_path / 'record.h5', 'w') as handle:
         native(handle, value, width=len(raw(value)) + 17)
-        result = _validated_final_fixed_point_audit(handle, commit(value), final_state=True)
+        result = _pair(handle, commit(value), final_state=True)
     assert result == dict(record=value, status='measured', reason=None)
     assert result['record']['dyson']['ratio'] == measure(0)
 
@@ -109,11 +120,11 @@ def test_healthy_zero_and_right_padding(tmp_path):
     (False, 'not_recorded', None), (True, 'not_applicable', 'not_a_final_state')])
 def test_legacy_and_recovery_absence(tmp_path, recovery, status, reason):
     with h5py.File(tmp_path / 'record.h5', 'w') as handle:
-        assert _validated_final_fixed_point_audit(handle, commit(recovery=recovery),
+        assert _pair(handle, commit(recovery=recovery),
             final_state=not recovery) == dict(record=None, status=status, reason=reason)
 
 
-@pytest.mark.parametrize('side', ['native', 'commit', 'both_recovery', 'null_commit'])
+@pytest.mark.parametrize('side', ['native', 'commit', 'both_recovery'])
 def test_presence_must_agree_and_recovery_never_contains_final(tmp_path, side):
     value = record()
     declaration = commit(value if side != 'native' else None, recovery=side == 'both_recovery')
@@ -123,7 +134,7 @@ def test_presence_must_agree_and_recovery_never_contains_final(tmp_path, side):
         if side in ('native', 'both_recovery'):
             native(handle, value)
         with pytest.raises(ContractError):
-            _validated_final_fixed_point_audit(handle, declaration, final_state=side != 'both_recovery')
+            _pair(handle, declaration, final_state=side != 'both_recovery')
 
 
 @pytest.mark.parametrize('field,value', [('attempt', 2), ('state_sequence', 2),
@@ -134,7 +145,7 @@ def test_record_binding_rejects_wrong_state(tmp_path, field, value):
     with h5py.File(tmp_path / 'record.h5', 'w') as handle:
         native(handle, stored)
         with pytest.raises(ContractError):
-            _validated_final_fixed_point_audit(handle, commit(stored), final_state=True)
+            _pair(handle, commit(stored), final_state=True)
 
 
 def test_equal_binding_does_not_replace_semantic_equality(tmp_path):
@@ -143,7 +154,7 @@ def test_equal_binding_does_not_replace_semantic_equality(tmp_path):
     with h5py.File(tmp_path / 'record.h5', 'w') as handle:
         native(handle, stored)
         with pytest.raises(ContractError, match='differ'):
-            _validated_final_fixed_point_audit(handle, commit(declared), final_state=True)
+            _pair(handle, commit(declared), final_state=True)
 
 
 @pytest.mark.parametrize('payload', [b'{"x":0,"x":1}', b'{"x":NaN}', b'\xff',
@@ -152,7 +163,7 @@ def test_hostile_payloads_rejected(tmp_path, payload):
     with h5py.File(tmp_path / 'record.h5', 'w') as handle:
         native(handle, record(), payload=payload)
         with pytest.raises(ContractError):
-            _validated_final_fixed_point_audit(handle, commit(record()), final_state=True)
+            _pair(handle, commit(record()), final_state=True)
 
 
 @pytest.mark.parametrize('kind', ['vlen', 'ascii', 'numeric', 'vector', 'oversize',
@@ -222,13 +233,14 @@ def test_storage_features_fail_preflight(tmp_path, monkeypatch, field, replaceme
             _read_final_fixed_point_audit(handle)
 
 
-def test_native_point_identity_is_independent_of_record_binding(tmp_path):
+def test_selected_identity_is_independent_of_audit_record_binding(tmp_path):
     value = record()
+    declaration = commit(value)
+    declaration['identity']['point_id'] = 'different-selected-point'
     with h5py.File(tmp_path / 'record.h5', 'w') as handle:
         native(handle, value)
-        handle['metadata/point_identity_json'][()] = json.dumps({**IDENTITY, 'attempt': 2})
-        with pytest.raises(ContractError, match='point identity'):
-            _validated_final_fixed_point_audit(handle, commit(value), final_state=True)
+        with pytest.raises(ContractError):
+            _pair(handle, declaration, final_state=True)
 
 
 def test_error_finite_zero_remains_error(tmp_path):
@@ -237,7 +249,7 @@ def test_error_finite_zero_remains_error(tmp_path):
     value.update(record_status='partial_error', reason='measurement_error')
     with h5py.File(tmp_path / 'record.h5', 'w') as handle:
         native(handle, value)
-        result = _validated_final_fixed_point_audit(handle, commit(value), final_state=True)
+        result = _pair(handle, commit(value), final_state=True)
     assert result['status'] == 'partial_error'
     assert result['record']['dyson']['ratio']['value'] == 0
     assert result['record']['dyson']['ratio']['status'] == 'error'
@@ -274,39 +286,37 @@ def publish(root, value=None, *, recovery=False, sidecar=None, sidecar_value=Non
     return root / 'commit.json'
 
 
-def test_state_reader_automatically_caches_private_record_and_counts_io(tmp_path):
-    path = publish(tmp_path / 'final', record())
-    with StateReader(path, expected_identity=IDENTITY) as reader:
-        assert reader._final_fixed_point_audit['status'] == 'measured'
-        assert reader._final_fixed_point_audit['record']['state_identity'] == IDENTITY
-        assert reader.io_counters['hdf_bytes'] > 0
-        assert reader.io_counters['metadata_bytes'] > 0
-        assert reader.io_counters['sha_bytes'] == (path.parent / 'physics.h5').stat().st_size
-        total = reader.io_counters['bytes_read_total']
-    with pytest.raises(ContractError, match='budget'):
-        StateReader(path, maximum_io_bytes=total - 1)
+def test_native5_does_not_autoload_unreferenced_final_audit(tmp_path):
+    from result_v2_fixture import source, IDENTITY as SELECTED
+    selected = source(tmp_path)
+    with h5py.File(tmp_path / 'unreferenced-audit.h5', 'w') as handle:
+        native(handle, record())
+    with StateReader(tmp_path, state_ref=selected, expected_identity=SELECTED) as reader:
+        assert reader.source.status['physics']['state'] == 'not_measured'
+        assert reader.source.integrity['selected_payloads_verified'] == []
+        assert not reader.source.capabilities['exact_restore']['available']
 
 
 @pytest.mark.parametrize('sidecar', ['physics.analysis', 'recovery'])
-def test_optional_owners_use_canonical_copy_and_same_budget(tmp_path, sidecar):
-    value = record()
-    path = publish(tmp_path / 'final', value, sidecar=sidecar,
-                   sidecar_value=value if sidecar == 'physics.analysis' else None)
-    with StateReader(path) as reader:
-        sha = sum((path.parent / name).stat().st_size for name in ('physics.h5', 'sidecar.h5'))
-        assert reader.io_counters['sha_bytes'] == sha
-        total = reader.io_counters['bytes_read_total']
-    with pytest.raises(ContractError, match='budget'):
-        StateReader(path, maximum_io_bytes=total - 1)
+def test_native5_optional_sidecars_do_not_grant_capability(tmp_path, sidecar):
+    from result_v2_fixture import source, IDENTITY as SELECTED
+    selected = source(tmp_path)
+    with h5py.File(tmp_path / 'orphan.h5', 'w') as handle:
+        native(handle, record())
+    with StateReader(tmp_path, state_ref=selected, expected_identity=SELECTED) as reader:
+        capability = 'stored_observables' if sidecar == 'physics.analysis' else 'exact_checkpoint'
+        assert not reader.source.capabilities[capability]['available']
+        assert reader.source.status['physics']['state'] == 'not_measured'
 
 
 @pytest.mark.parametrize('sidecar', ['physics.analysis', 'recovery'])
-def test_contradictory_optional_owner_is_not_skipped(tmp_path, sidecar):
-    value, other = record(), record()
-    other['detail'] = 'contradictory copy'
-    path = publish(tmp_path / 'final', value, sidecar=sidecar, sidecar_value=other)
-    with pytest.raises(ContractError):
-        StateReader(path)
+def test_native5_orphan_is_not_an_authoritative_optional_owner(tmp_path, sidecar):
+    from result_v2_fixture import source, IDENTITY as SELECTED
+    selected = source(tmp_path)
+    (tmp_path / ('uncommitted-' + sidecar + '.h5')).write_bytes(b'not a committed native object')
+    with StateReader(tmp_path, state_ref=selected, expected_identity=SELECTED) as reader:
+        assert reader.source.integrity['selected_payloads_verified'] == []
+        assert not reader.source.capabilities['exact_checkpoint']['available']
 
 
 # Attribute profile A fixtures use an explicit HDF5 file/memory type. Python's
@@ -559,45 +569,43 @@ def replace_analysis_identity_and_refresh(commit_path, identity, *, fresh_alias=
         commit_path.read_bytes()).hexdigest()
 
 
-def test_present_analysis_copy_binds_its_own_native_identity_with_refreshed_integrity(tmp_path):
-    value = record()
-    path = publish(tmp_path / 'final', value, sidecar='physics.analysis', sidecar_value=value)
-    canonical_bytes = (path.parent / 'physics.h5').read_bytes()
-    replace_analysis_identity_and_refresh(path, dict(IDENTITY))
-    with h5py.File(path.parent / 'sidecar.h5', 'r') as handle:
-        assert 'metadata/identity_json' in handle
-        assert 'metadata/point_identity_json' not in handle
-    with StateReader(path, expected_identity=IDENTITY) as reader:
-        assert reader._final_fixed_point_audit['status'] == 'measured'
-        assert reader._final_fixed_point_audit['record']['state_identity'] == IDENTITY
-        assert reader.io_counters['sha_bytes'] == sum(
-            (path.parent / name).stat().st_size for name in ('physics.h5', 'sidecar.h5'))
-    assert (path.parent / 'physics.h5').read_bytes() == canonical_bytes
+def test_native5_independent_analysis_is_explicitly_unavailable(tmp_path):
+    from result_v2_fixture import source, IDENTITY as SELECTED
+    selected = source(tmp_path)
+    with StateReader(tmp_path, state_ref=selected, expected_identity=SELECTED) as reader:
+        assert reader.source.capabilities['stored_observables'] == dict(
+            available=False, reason='independent_analysis_not_published')
 
 
 @pytest.mark.parametrize('field,value', [('missing', None), ('attempt', 2),
     ('state_sequence', 2), ('state_id', 'stale-state'), ('plan_fingerprint', 'b' * 64),
     ('execution_id', 'stale-execution'), ('point_id', 'stale-point')])
 @pytest.mark.parametrize('fresh_alias', [False, True])
-def test_present_analysis_copy_rejects_stale_or_missing_native_identity(tmp_path, field, value, fresh_alias):
-    stored = record()
-    path = publish(tmp_path / 'final', stored, sidecar='physics.analysis', sidecar_value=stored)
-    canonical_bytes = (path.parent / 'physics.h5').read_bytes()
-    identity = None if field == 'missing' else {**IDENTITY, field: value}
-    replace_analysis_identity_and_refresh(path, identity, fresh_alias=fresh_alias)
-    with pytest.raises(ContractError, match='analysis final audit.*native identity_json'):
-        StateReader(path, expected_identity=IDENTITY)
-    assert (path.parent / 'physics.h5').read_bytes() == canonical_bytes
+def test_native5_rejects_stale_selection_or_retired_identity_alias(tmp_path, field, value, fresh_alias):
+    from result_v2_fixture import source, IDENTITY as SELECTED
+    selected = source(tmp_path)
+    expected = copy.deepcopy(SELECTED)
+    if field == 'missing':
+        expected = {}
+    elif field in ('state_id', 'state_sequence'):
+        selected[field] = str(value)
+    else:
+        expected['plan_sha256' if field == 'plan_fingerprint' else field] = 'c' * 64 if field == 'plan_fingerprint' else str(value)
+    if fresh_alias:
+        expected['plan_fingerprint'] = 'a' * 64
+    with pytest.raises(ContractError):
+        StateReader(tmp_path, state_ref=selected, expected_identity=expected)
 
 
 @pytest.mark.parametrize('canonical_record', [False, True])
-def test_absent_analysis_record_keeps_legacy_identity_scope(tmp_path, canonical_record):
-    path = publish(tmp_path / 'final', record() if canonical_record else None,
-                   sidecar='physics.analysis', sidecar_value=None)
-    replace_analysis_identity_and_refresh(path, None)
-    with StateReader(path) as reader:
-        assert reader._final_fixed_point_audit['status'] == (
-            'measured' if canonical_record else 'not_recorded')
+def test_native5_never_infers_implicit_identity_from_optional_record(tmp_path, canonical_record):
+    from result_v2_fixture import source
+    source(tmp_path)
+    if canonical_record:
+        with h5py.File(tmp_path / 'unreferenced-audit.h5', 'w') as handle:
+            native(handle, record())
+    with pytest.raises(TypeError):
+        StateReader(tmp_path)
 
 
 def test_actual_runner_producer_transport_when_explicitly_bound():

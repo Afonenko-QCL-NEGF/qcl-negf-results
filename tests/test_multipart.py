@@ -15,7 +15,6 @@ import pytest
 
 from qcl_negf_contracts.messages import ContractError
 from qcl_negf_results.archive import receive
-from qcl_negf_results.multipart import receive as legacy_receive
 
 
 def canonical(value) -> bytes:
@@ -70,40 +69,26 @@ def legacy_fixture(root: Path, *, identity: str = "a" * 64):
     return paths, receipt, name, payload
 
 
-@pytest.mark.parametrize("receiver", [receive, legacy_receive])
-def test_legacy_multipart_restore_exact_object_without_current_exporter(tmp_path: Path, receiver) -> None:
-    paths, receipt, name, payload = legacy_fixture(tmp_path / "legacy")
-    target = tmp_path / "restored"
-    result = receiver(list(reversed(paths)), target, receipt=receipt)
-    assert result["verified"] is True and result["part_count"] == 3
-    assert result["verification_scope"] == "transport_hashes"
-    assert (target / name).read_bytes() == payload
-    assert json.loads((target / "manifest.json").read_bytes())["schema"] == "qcl-negf.science-export.v2"
+def test_supported_receiver_rejects_manufactured_legacy_parts_without_publication(tmp_path):
+    paths, receipt, _, _ = legacy_fixture(tmp_path / 'legacy')
+    for selected in (paths, list(reversed(paths)), paths[:1], paths[1:], [*paths, paths[-1]]):
+        with pytest.raises(ContractError):
+            receive(selected, tmp_path / 'restored', receipt=receipt)
+        assert not (tmp_path / 'restored').exists()
 
 
-def test_legacy_missing_duplicate_mixed_or_corrupt_parts_never_publish(tmp_path: Path) -> None:
-    paths, receipt, _, _ = legacy_fixture(tmp_path / "legacy")
-    for invalid in (paths[1:], paths[:-1], [*paths, paths[-1]]):
-        with pytest.raises(ContractError, match="missing|duplicate"):
-            receive(invalid, tmp_path / "invalid")
-        assert not (tmp_path / "invalid").exists()
-    other, _, _, _ = legacy_fixture(tmp_path / "other", identity="c" * 64)
-    with pytest.raises(ContractError, match="different snapshots"):
-        receive([paths[0], *other[1:]], tmp_path / "invalid")
-    damaged = tmp_path / "damaged.tar.xz"
-    value = bytearray(paths[-1].read_bytes())
-    value[len(value) // 2] ^= 32
-    damaged.write_bytes(value)
-    with pytest.raises((ContractError, lzma.LZMAError, tarfile.ReadError)):
-        receive([*paths[:-1], damaged], tmp_path / "invalid", receipt=receipt)
-    assert not (tmp_path / "invalid").exists()
+def test_legacy_part_marker_cannot_trigger_a_compatibility_receiver(tmp_path):
+    paths, _, _, _ = legacy_fixture(tmp_path / 'legacy')
+    with pytest.raises(ContractError) as error:
+        receive(paths[:1], tmp_path / 'restored')
+    assert error.value.code == 'unsupported_format'
+    assert not (tmp_path / 'restored').exists()
 
 
-def test_receiver_cli_accepts_legacy_fixture(tmp_path: Path) -> None:
-    paths, _, name, payload = legacy_fixture(tmp_path / "legacy")
-    target = tmp_path / "restored"
-    completed = subprocess.run([sys.executable, "-m", "qcl_negf_results.archive", "reassemble",
-                                "--destination", str(target), *map(str, paths)],
-                               text=True, capture_output=True, check=True)
-    assert json.loads(completed.stdout)["verified"] is True
-    assert (target / name).read_bytes() == payload
+def test_receiver_cli_rejects_retired_multipart_fixture(tmp_path):
+    paths, _, _, _ = legacy_fixture(tmp_path / 'legacy')
+    target = tmp_path / 'restored'
+    completed = subprocess.run([sys.executable, '-m', 'qcl_negf_results.archive', 'reassemble',
+        '--destination', str(target), *map(str, paths)], text=True, capture_output=True)
+    assert completed.returncode == 2
+    assert not target.exists()

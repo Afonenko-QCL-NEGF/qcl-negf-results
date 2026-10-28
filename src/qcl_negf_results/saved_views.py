@@ -223,6 +223,8 @@ def _saved_budget_json(path, maximum, budget):
 class AnalysisReader:
     """One declared analysis owner, metadata-only description and verified reads."""
     def __init__(self, commit_path, *, expected_identity, limits=None):
+        raise ContractError('native5 independent analysis view is not yet published; use selected raw StateReader',
+                            'capability_unavailable')
         self.limits = limits or SavedViewLimits()
         self._budget = _IOBudget(self.limits.maximum_io_bytes)
         self._handle = self._stream = self._raw = None
