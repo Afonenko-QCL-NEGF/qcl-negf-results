@@ -45,11 +45,23 @@ def test_native5_domain_views_report_capability_without_opening_old_layout(tmp_p
     from qcl_negf_results.saved_views import AnalysisReader
     from qcl_negf_results.diagnostic_views import DiagnosticReader
     from qcl_negf_results.equilibrium import diagnose_stored_equilibrium, EquilibriumReadLimits
+    from qcl_negf_results.state import StateReader
+    from consumer_context_fixture import semantic_fixture
+    root=tmp_path/'source'
+    selected,artifact,_,_,_=semantic_fixture(root)
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity']) as reader:
+        with AnalysisReader(reader,artifact_ref=artifact) as analysis:
+            assert analysis.describe()['source_state']==selected
+            assert analysis.read('density',[slice(None)])['values']==[0.,-2.,8.]
+        assert reader._handles and not reader._closed
+    with pytest.raises(TypeError):
+        AnalysisReader(tmp_path/'not-a-native4-layout',expected_identity=IDENTITY)
+    with pytest.raises(TypeError,match='StateReader'):
+        AnalysisReader(tmp_path/'not-a-native4-layout',artifact_ref=artifact)
     equilibrium = lambda path, **kw: diagnose_stored_equilibrium(path, limits=EquilibriumReadLimits(maximum_io_bytes=1024*1024), **kw)
-    for create in (AnalysisReader, equilibrium):
-        with pytest.raises(ContractError) as error:
-            create(tmp_path / 'not-a-native4-layout', expected_identity=IDENTITY)
-        assert error.value.code == 'capability_unavailable'
+    with pytest.raises(ContractError) as error:
+        equilibrium(tmp_path / 'not-a-native4-layout', expected_identity=IDENTITY)
+    assert error.value.code == 'capability_unavailable'
     with pytest.raises(TypeError,match='StateReader'):
         DiagnosticReader(tmp_path / 'not-a-native4-layout')
 

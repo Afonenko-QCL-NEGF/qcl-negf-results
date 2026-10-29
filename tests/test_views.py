@@ -1,5 +1,4 @@
 from __future__ import annotations
-import hashlib
 import json
 from pathlib import Path
 
@@ -7,102 +6,90 @@ import h5py
 import numpy as np
 import pytest
 
-from qcl_negf_results.presentation import atomic_json, committed_generation
+from qcl_negf_results.presentation import atomic_json
 from qcl_negf_results.render import materialize, materialize_series
-from native_result_fixtures import declare_native
 
 
-def generation_fixture(root: Path, *, generation=1, quality="unconverged"):
-    destination = root / "artifacts" / f"generation-{generation:06d}"
-    destination.mkdir(parents=True)
-    path = destination / "analysis.h5"
-    with h5py.File(path, "w") as file:
-        file["axes/z_nm"] = np.array([0., 1., 2.])
-        file["axes/energy_eV"] = np.array([-.1, .2])
-        file["axes/k_per_nm"] = np.array([0., 1.])
-        for name in ("structure", "external", "hartree", "total"):
-            file[f"observables/potential_{name}_eV"] = [0., .1, .2]
-        file["observables/density_per_m3"] = [1e20, -1e-10, 2e20]
-        file["observables/spectral"] = [[1., 2.], [3., 4.]]
-        file["observables/occupied_spectral"] = [[.1, .2], [.3, .4]]
-        file["observables/spatial_energy_density"] = [[1., -1., np.nan], [0., .5, 2.]]
-        file["observables/spatial_energy_density"].attrs["units"] = "m^-3/eV"
-        file["basis/effective_wavefunctions/real"] = np.array([[1.,0.],[.5,.5],[0.,1.]])
-        file["diagnostics/scba/r_K"] = [1e-2, 0, 1e-4, float("nan"), 1e-6]
-        file["diagnostics/scba/sequence"] = np.arange(1, 6, dtype=np.int64)
-        file["diagnostics/outer/r_U"] = [1e-2, 1e-3]
-        file["diagnostics/validation_json"] = json.dumps({"evaluated": True, "strict_passed": False, "metrics": [{"metric": "r_sum", "value": .43, "strict_threshold": .05, "approximate_threshold": .05, "strict_passed": False}], "messages": ["r_sum exceeds threshold"]})
-        file["diagnostics/positivity_json"] = json.dumps({"matrices": [{"matrix_kind": name, "minimum_eigenvalue": -.001, "unit": "eV" if name == "broadening" else "1/eV", "strict_passed": False} for name in ("spectral", "occupied", "unoccupied", "broadening")]})
-        for name, axes in {"axes/z_nm":"z", "axes/energy_eV":"E", "axes/k_per_nm":"k",
-                           "observables/spatial_energy_density":"E,z", "observables/spectral":"E,k",
-                           "observables/occupied_spectral":"E,k", "basis/effective_wavefunctions/real":"z,state",
-                           "observables/density_per_m3":"z",
-                           **{f"observables/potential_{name}_eV":"z" for name in ("structure", "external", "hartree", "total")}}.items():
-            file[name].attrs["logical_axis_order"]=axes
-            file[name].attrs["logical_shape"]=",".join(str(size) for size in file[name].shape)
-        declare_native(file, "qcl-negf-physics-analysis-v4", "physics.analysis", scba_rows=5)
 
-    identity = {"point_id":"p1", "execution_id":"ex1", "attempt":1, "plan_fingerprint":"f"*64}
-    commit = {"schema":"qcl-negf.artifact-commit.v2", "contract_set": "qcl-negf.results.v1", "identity":identity, "generation":generation,
-              "quality":quality, "terminal_status":"completed", "scientific_accepted":False,
-              "physics_ready":True, "checkpoint_ready":True, "artifacts":[{"role":"physics.analysis", "path":"analysis.h5", "schema":"qcl-negf-physics-analysis-v4", "contract_set": "qcl-negf.results.v1", "media_type":"application/x-hdf5", "profile":"science", "dependencies":[], "sha256":hashlib.sha256(path.read_bytes()).hexdigest(), "bytes":path.stat().st_size}]}
-    atomic_json(destination / "commit.json", commit)
-    digest = hashlib.sha256((destination / "commit.json").read_bytes()).hexdigest()
-    atomic_json(root / "artifacts/current.json", {"schema":"qcl-negf.artifact-pointer.v2", "contract_set": "qcl-negf.results.v1", "generation":generation, "commit_path":f"generation-{generation:06d}/commit.json", "sha256":digest})
-    return destination, commit, digest
+
+
+from contextlib import contextmanager
+from qcl_negf_results.saved_views import AnalysisReader, SavedViewLimits
+from qcl_negf_results.state import StateReader, ResultReadLimits
+from qcl_negf_contracts.messages import ContractError
+from consumer_context_fixture import render_fixture,history_batch,change
+
+SELECTIONS={'potential_total':[slice(None)],'density':[slice(None)],
+    'effective_wavefunctions_real':[slice(None),slice(None)],'spectral_trace':[slice(None),slice(None)],
+    'spatial_energy_density':[slice(None),slice(None)]}
+
+
+@contextmanager
+def native_render(root,*,ne=2,selected_bytes=1024*1024):
+    selected,artifact,value,checkpoint,values=render_fixture(root,ne=ne)
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity'],limits=ResultReadLimits(maximum_array_bytes=selected_bytes)) as owner:
+        with AnalysisReader(owner,artifact_ref=artifact,limits=SavedViewLimits(maximum_selected_bytes=selected_bytes)) as analysis:
+            yield analysis,selected,artifact,checkpoint
 
 
 def test_native_fields_materialize_without_json_arrays_and_preserve_scientific_evidence(tmp_path):
-    generation, commit, digest = generation_fixture(tmp_path / "point")
-    source_before = (generation / "analysis.h5").read_bytes()
-    view = materialize(generation, commit, digest, tmp_path / "views")
-    assert view["scientific_accepted"] is False and view["presentation_ready"] is True
-    assert view["validation"]["metrics"][0]["value"] == .43
-    assert len(view["positivity"]["matrices"]) == 4
-    assert {figure["id"] for figure in view["figures"]} >= {"potentials", "density", "wavefunctions", "spectra", "energy-density", "convergence-scba", "convergence-outer"}
-    for figure in view["figures"]:
-        assert figure["source_commit"] == digest
-        assert (tmp_path / "views" / figure["path"]).is_file()
-        assert "values" not in figure and "x" not in figure
-    convergence = next(f for f in view["figures"] if f["id"] == "convergence-scba")
-    svg = (tmp_path / "views" / convergence["path"]).read_text()
-    assert "log" in svg and "разрывы/неположительные значения: 2" in svg
-    assert "nan" not in svg.lower()
-    image = next(f for f in view["figures"] if f["id"] == "energy-density")
-    assert image["native_shape"] == [2, 3] and image["color_range"] == [-2, 2]
-    assert image["media_type"] == "image/svg+xml"
-    svg = (tmp_path / "views" / image["path"]).read_text()
-    assert 'viewBox="0 0 840 560"' in svg and "z, nm" in svg and "E, eV" in svg
-    assert "линейная шкала" in svg and "m⁻³/eV" in svg
-    assert 'href="data:image/png;base64,' in svg
-    assert (tmp_path / "views" / image["raw_path"]).read_bytes().startswith(b"\x89PNG")
-    assert (generation / "analysis.h5").read_bytes() == source_before
-    assert len(json.dumps(view).encode()) < 100_000
+    source=tmp_path/'point'
+    with native_render(source) as (analysis,selected,artifact,checkpoint):
+        source_before=(source/artifact['path']).read_bytes()
+        scba=history_batch(selected,sequence=(1,2,3,4,5),residual=(1e-2,0.,1e-4,float('nan'),1e-6))
+        outer=history_batch(selected,sequence=(6,7),outer=(1,2),residual=(1e-2,1e-3),stage='outer',checkpoint=checkpoint)
+        view=materialize(analysis,tmp_path/'views',selections=SELECTIONS,history=(scba,outer))
+        assert view['scientific_accepted'] is None and view['presentation_ready'] is True
+        import struct
+        assert struct.unpack('>d',bytes.fromhex(view['validation']['summary_metrics'][0]['value']['bits']))[0]==.43
+        assert len(view['positivity']['data']['witnesses'])==6
+        assert all(struct.unpack('>d',bytes.fromhex(v['minimum_eigenvalue']['bits']))[0]==-.001 for v in view['positivity']['data']['witnesses'])
+        assert {figure['id'] for figure in view['figures']} >= {'potentials','density','wavefunctions','spectra','energy-density','convergence-scba','convergence-outer'}
+        for figure in view['figures']:
+            assert figure['source_state']==selected
+            assert (tmp_path/'views'/figure['path']).is_file()
+            assert 'values' not in figure and 'x' not in figure
+        convergence=next(f for f in view['figures'] if f['id']=='convergence-scba')
+        svg=(tmp_path/'views'/convergence['path']).read_text()
+        assert 'log' in svg and 'разрывы/неположительные значения: 2' in svg
+        assert 'nan' not in svg.lower()
+        image=next(f for f in view['figures'] if f['id']=='energy-density')
+        assert image['native_shape']==[2,3] and image['color_range']==[-2,2]
+        assert image['media_type']=='image/svg+xml'
+        svg=(tmp_path/'views'/image['path']).read_text()
+        assert 'viewBox="0 0 840 560"' in svg and 'z, nm' in svg and 'E, eV' in svg
+        assert 'линейная шкала' in svg and 'm⁻³' in svg and 'eV^-1' in svg
+        assert 'href="data:image/png;base64,' in svg
+        assert (tmp_path/'views'/image['raw_path']).read_bytes().startswith(b'\x89PNG')
+        assert (source/artifact['path']).read_bytes()==source_before
+        assert len(json.dumps(view).encode())<100_000
 
 
-def test_immutable_renderer_cache_and_corrupt_hdf5_rejected(tmp_path, monkeypatch):
-    generation, commit, digest = generation_fixture(tmp_path / "point")
-    view = materialize(generation, commit, digest, tmp_path / "views")
-    monkeypatch.setattr(h5py, "File", lambda *args, **kwargs: pytest.fail("cache hit reopened numerical HDF5"))
-    assert materialize(generation, commit, digest, tmp_path / "views") == view
-    (generation / "analysis.h5").write_bytes(b"truncated")
-    with pytest.raises(ValueError, match="hash"):
-        materialize(generation, commit, digest, tmp_path / "fresh-cache")
+
+def test_immutable_renderer_cache_and_corrupt_hdf5_rejected(tmp_path,monkeypatch):
+    source=tmp_path/'point'
+    with native_render(source) as (analysis,selected,artifact,_):
+        view=materialize(analysis,tmp_path/'views',selections=SELECTIONS)
+        monkeypatch.setattr(h5py,'File',lambda *a,**k:pytest.fail('cache hit reopened numerical HDF5'))
+        assert materialize(analysis,tmp_path/'views',selections=SELECTIONS)==view
+        (source/artifact['path']).write_bytes(b'truncated')
+        with pytest.raises(ContractError,match='changed'):
+            materialize(analysis,tmp_path/'fresh-cache',selections=SELECTIONS)
+
 
 
 def test_pointer_hash_and_path_escape_are_rejected(tmp_path):
-    generation_fixture(tmp_path)
-    pointer = tmp_path / "artifacts/current.json"
-    value = json.loads(pointer.read_text()); value["sha256"]="0"*64;atomic_json(pointer,value)
-    with pytest.raises(ValueError,match="hash"):
-        committed_generation(tmp_path / "artifacts")
-    value["commit_path"]="../../escape.json"; atomic_json(pointer,value)
-    with pytest.raises(ValueError,match="escaped"):
-        committed_generation(tmp_path / "artifacts")
+    from copy import deepcopy
+    root=tmp_path/'source';selected,artifact,_,_,_=render_fixture(root)
+    corrupt=deepcopy(selected);corrupt['manifest']['sha256']='0'*64
+    with pytest.raises(ContractError,match='checksum|hash|differ'):
+        StateReader(root,state_ref=corrupt,expected_identity=selected['identity'])
+    corrupt=deepcopy(selected);corrupt['manifest']['path']='../../escape.json'
+    with pytest.raises(ContractError):StateReader(root,state_ref=corrupt,expected_identity=selected['identity'])
 
 
 def test_series_graph_has_explicit_unaccepted_marker_not_interpolated_line(tmp_path):
-    rows=[{"id":f"p{i}","execution_id":"ex","scientific_accepted":i!=1,"coordinates":{"temperature_K":70,"voltage_per_period_V":i*.01,"branch":"forward","order":i},"observables":{"current_density_A_per_m2":i+1}} for i in range(3)]
+    rows=[{"id":f"p{i}","execution_id":"ex","scientific_accepted":i!=1,"status":"completed","quality":"strict","converged":True,"coordinates":{"temperature_K":70,"voltage_per_period_V":i*.01,"branch":"forward","order":i},"observables":{"current_density_A_per_m2":i+1}} for i in range(3)]
     figures=materialize_series(rows,tmp_path)
     svg=(tmp_path/figures[0]["path"]).read_text()
     assert "непринята" in svg and svg.count("<circle") == 3
@@ -111,89 +98,50 @@ def test_series_graph_has_explicit_unaccepted_marker_not_interpolated_line(tmp_p
 
 
 def test_undeclared_axis_order_is_rejected_without_transpose_guess(tmp_path):
-    generation, commit, digest = generation_fixture(tmp_path / "point")
-    path = generation / "analysis.h5"
-    with h5py.File(path, "r+") as record:
-        record["observables/spatial_energy_density"].attrs["logical_axis_order"] = "z,E"
-    commit["artifacts"][0]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    with pytest.raises(ValueError, match="axis annotation"):
-        materialize(generation, commit, digest, tmp_path / "views")
+    root=tmp_path/'point';selected,artifact,_,_,_=render_fixture(root)
+    change(root,selected,artifact,lambda v:v['views']['spatial_energy_density_per_eV_m3'].update(axes=['z','E']))
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity']) as owner:
+        with pytest.raises(ContractError):materialize(AnalysisReader(owner,artifact_ref=artifact),tmp_path/'views',selections=SELECTIONS)
+
 
 
 def test_empty_outer_history_does_not_hide_committed_scba_physics(tmp_path):
-    generation, commit, digest = generation_fixture(tmp_path / "point")
-    path = generation / "analysis.h5"
-    with h5py.File(path, "r+") as record:
-        del record["diagnostics/outer/r_U"]
-        record["diagnostics/outer/r_U"] = np.array([], dtype=float)
-    commit["artifacts"][0]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
-    result = materialize(generation, commit, digest, tmp_path / "views")
-    assert result["presentation_ready"] and any(figure["id"] == "convergence-scba" for figure in result["figures"])
+    with native_render(tmp_path/'point') as (analysis,selected,_,_):
+        batch=history_batch(selected)
+        result=materialize(analysis,tmp_path/'views',selections=SELECTIONS,history=(batch,))
+        assert result['presentation_ready'] and any(f['id']=='convergence-scba' for f in result['figures'])
+        assert not any(f['id']=='convergence-outer' for f in result['figures'])
 
 
-def history_fixture(root, *, sequence=(1, 2, 3), cumulative=False, residual=(.1, .01, .001), identity=None, iteration=None, outer=None, sources=None, currents=None):
-    from qcl_negf_results.progress import HISTORY_INDEX_SCHEMA
 
-    identity = identity or {"point_id": "p1", "execution_id": "ex1", "attempt": 1, "plan_fingerprint": "f" * 64}
-    root.mkdir(parents=True, exist_ok=True)
-    path = root / ("history.h5" if cumulative else "segment-000001.h5")
-    with h5py.File(path, "w") as file:
-        metadata = file.create_group("metadata")
-        metadata.attrs.update(scba_rows=len(sequence), outer_rows=0)
-        if cumulative:
-            metadata["source_segments_json"] = json.dumps(sources or [{"identity": identity, "scba_rows": len(sequence), "outer_rows": 0}])
-        else:
-            metadata["identity_json"] = json.dumps(identity)
-        file["scba/sequence"] = np.asarray(sequence, dtype="int64")
-        file["scba/iteration"] = np.asarray(iteration if iteration is not None else range(1, len(sequence) + 1), dtype="int64")
-        file["scba/outer_iteration"] = np.asarray(outer if outer is not None else [1] * len(sequence), dtype="int64")
-        file["scba/r_K"] = np.asarray(residual, dtype="float64")
-        file["scba/J"] = np.asarray(currents if currents is not None else np.arange(1, len(sequence) + 1, dtype="float64"), dtype="float64")
-        file["outer/sequence"] = np.array([], dtype="int64")
-        declare_native(file, "qcl-negf-scientific-history-v4", "science.history", scba_rows=len(sequence))
-    artifact = {"path": path.name, "sha256": hashlib.sha256(path.read_bytes()).hexdigest(), "bytes": path.stat().st_size,
-                "scba_rows": len(sequence), "outer_rows": 0, "role": "science.history",
-                "schema": "qcl-negf-scientific-history-v4", "contract_set": "qcl-negf.results.v1", "media_type": "application/x-hdf5",
-                "profile": "science", "dependencies": []}
-    pointer = {"schema": HISTORY_INDEX_SCHEMA, "contract_set": "qcl-negf.results.v1", "identity": identity, "generation": 1, "updated_unix": 10.,
-               "scba_rows": len(sequence), "outer_rows": 0, "segments": [artifact]}
-    if not cumulative:
-        atomic_json(root / "index.json", pointer)
-    return artifact, pointer
 
 
 @pytest.mark.parametrize("damage", ["hash", "identity", "sequence", "path"])
-def test_live_history_rejects_corrupt_or_foreign_segments(tmp_path, damage):
-    from qcl_negf_results.progress import live_history, materialize_history
-
-    artifact, pointer = history_fixture(tmp_path / "history")
-    identity = pointer["identity"].copy()
-    if damage == "identity":
-        identity["point_id"] = "other"
-    elif damage == "path":
-        pointer["segments"][0]["path"] = "../../foreign.h5"
-    elif damage == "hash":
-        pointer["segments"][0]["sha256"] = "0" * 64
+def test_live_history_rejects_corrupt_or_foreign_segments(tmp_path,damage):
+    from copy import deepcopy
+    root=tmp_path/'source';selected,artifact,_,_,_=render_fixture(root);batch=history_batch(selected)
+    identity=deepcopy(selected['identity'])
+    if damage=='identity':identity['point_id']='other'
+    elif damage=='path':selected['manifest']['path']='../../foreign.json'
+    elif damage=='hash':(root/artifact['path']).write_bytes(b'corrupt')
     else:
-        with h5py.File(tmp_path / "history" / artifact["path"], "r+") as file:
-            file["scba/sequence"][...] = [1, 1, 3]
-        pointer["segments"][0]["sha256"] = hashlib.sha256((tmp_path / "history" / artifact["path"]).read_bytes()).hexdigest()
-    atomic_json(tmp_path / "history/index.json", pointer)
-    with pytest.raises(ValueError):
-        artifacts, digest, _ = live_history(tmp_path / "history", identity)
-        materialize_history(tmp_path / "history", artifacts, digest, identity, tmp_path / "views", quality="not_evaluated", complete=False)
+        # An explicitly passed batch still cannot duplicate native append order.
+        batch.rows[1]['sequence']['decimal']='1';batch.records[1]['core']['fields']['sequence']['decimal']='1'
+    with pytest.raises((ContractError,ValueError)):
+        with StateReader(root,state_ref=selected,expected_identity=identity) as owner:
+            materialize(AnalysisReader(owner,artifact_ref=artifact),tmp_path/'views',selections=SELECTIONS,history=(batch,))
+
 
 
 def test_live_log_graph_does_not_bridge_nonfinite_or_nonpositive_history(tmp_path):
-    from qcl_negf_results.progress import materialize_history
+    with native_render(tmp_path/'point') as (analysis,selected,_,_):
+        batch=history_batch(selected,residual=(.1,float('nan'),.001))
+        result=materialize(analysis,tmp_path/'views',selections=SELECTIONS,history=(batch,))
+        figure=next(f for f in result['figures'] if f['id']=='convergence-scba')
+        svg=(tmp_path/'views'/figure['path']).read_text()
+        assert '<polyline' not in svg and svg.count('<circle')==2
+        assert 'nan' not in svg.lower()
 
-    artifact, pointer = history_fixture(tmp_path / "history", residual=(.1, float("nan"), .001))
-    result = materialize_history(tmp_path / "history", [artifact], "f" * 64, pointer["identity"],
-                                 tmp_path / "views", quality="not_evaluated", complete=False)
-    figure = next(figure for figure in result["figures"] if figure["id"] == "convergence-scba")
-    svg = (tmp_path / "views" / figure["path"]).read_text()
-    assert "<polyline" not in svg and svg.count("<circle") == 2
-    assert "nan" not in svg.lower()
 
 
 def test_global_envelope_preserves_spike_and_gap_across_many_tiny_segments():
@@ -220,79 +168,59 @@ def test_global_envelope_preserves_spike_and_gap_across_many_tiny_segments():
             segment.clear()
 
 
-def test_monitor_uses_native_latest_outer_cycle_and_full_history_keeps_boundaries(tmp_path, monkeypatch):
-    from qcl_negf_results import progress
-
-    artifact, pointer = history_fixture(tmp_path / "history", sequence=(100, 101, 102, 103, 104),
-        iteration=(1, 2, 3, 1, 2), outer=(1, 1, 1, 2, 2), residual=(.1, .001, .0001, .2, .02),
-        currents=(9000., 9100., 9200., 7000., 7100.))
-    captured = []
-    original = progress._svg
-    def capture(*args, **kwargs):
-        captured.append((args, kwargs))
-        return original(*args, **kwargs)
-    monkeypatch.setattr(progress, "_svg", capture)
-    source = (tmp_path / "history" / artifact["path"]).read_bytes()
-    value = progress.materialize_history(tmp_path / "history", [artifact], "c" * 64,
-        pointer["identity"], tmp_path / "views", quality="not_evaluated", complete=False, updated_unix=123.)
-    convergence = next(figure for figure in value["figures"] if figure["id"] == "convergence-scba")
-    assert convergence["history_rows"] == 5 and convergence["history_cycle_count"] == 2
-    assert convergence["monitor_context"] == {"phase": "scba", "attempt": 1, "outer_iteration": 2,
-        "first_iteration": 1, "last_iteration": 2, "first_sequence": 103, "last_sequence": 104, "rows": 2}
-    monitor_args, monitor_kwargs = next(item for item in captured if item[1].get("monitor") and item[1].get("logarithmic"))
-    assert monitor_args[1] == "Итерация SCBA, ν"
-    assert monitor_args[3] == [("r_K", [1., 2.], [.2, .02])]
-    full_args, full_kwargs = next(item for item in captured if not item[1].get("monitor") and item[1].get("logarithmic"))
-    xx, yy = full_args[3][0][1:]
-    assert set(x for x in xx if np.isfinite(x)) == {100, 101, 102, 103, 104}
-    assert any(not np.isfinite(x) for x in xx)
-    assert full_kwargs["boundaries"] == [(103., "μ=2 · a=1")]
-    assert (tmp_path / "history" / artifact["path"]).read_bytes() == source
+def test_monitor_uses_native_latest_outer_cycle_and_full_history_keeps_boundaries(tmp_path,monkeypatch):
+    import qcl_negf_results.render as render
+    captured=[];original=render._svg
+    def capture(*args,**kwargs):captured.append((args,kwargs));return original(*args,**kwargs)
+    monkeypatch.setattr(render,'_svg',capture)
+    with native_render(tmp_path/'point') as (analysis,selected,artifact,_):
+        batch=history_batch(selected,sequence=(100,101,102,103,104),iteration=(1,2,3,1,2),outer=(1,1,1,2,2),residual=(.1,.001,.0001,.2,.02))
+        before=(tmp_path/'point'/artifact['path']).read_bytes()
+        value=materialize(analysis,tmp_path/'views',selections=SELECTIONS,history=(batch,))
+        figure=next(v for v in value['figures'] if v['id']=='convergence-scba')
+        assert figure['history_rows']==5 and figure['history_cycle_count']==2
+        assert figure['monitor_context']==dict(phase='scba',attempt='1',outer_iteration=2,first_iteration=1,last_iteration=2,first_sequence=103,last_sequence=104,rows=2)
+        monitor_args,monitor_kwargs=next(v for v in captured if v[1].get('monitor') and v[1].get('logarithmic'))
+        assert monitor_args[1]=='Итерация SCBA, ν' and monitor_args[3]==[('r_K',[1.,2.],[.2,.02])]
+        full_args,full_kwargs=next(v for v in captured if not v[1].get('monitor') and v[1].get('logarithmic'))
+        xx,yy=full_args[3][0][1:]
+        assert set(x for x in xx if np.isfinite(x))=={100,101,102,103,104}
+        assert any(not np.isfinite(x) for x in xx)
+        assert full_kwargs['boundaries']==[(103.,'μ=2 · a=1')]
+        assert (tmp_path/'point'/artifact['path']).read_bytes()==before
 
 
-def test_resume_keeps_native_indices_and_excludes_previous_attempt_from_monitor(tmp_path, monkeypatch):
-    from qcl_negf_results import progress
 
-    identity = {"point_id": "p1", "execution_id": "ex1", "attempt": 10, "plan_fingerprint": "f" * 64}
-    # Source inventory can be in filename order, while consolidated sequence is
-    # chronological. The latest resumed attempt continues ν=3 rather than 1.
-    sources = [{"identity": identity, "scba_rows": 2, "outer_rows": 0},
-               {"identity": {**identity, "attempt": 2}, "scba_rows": 2, "outer_rows": 0}]
-    artifact, pointer = history_fixture(tmp_path / "history", cumulative=True, sequence=(31, 32, 33, 34),
-        iteration=(1, 2, 3, 4), outer=(7, 7, 7, 7), residual=(.1, .01, .009, .008), identity=identity, sources=sources)
-    captured = []
-    original = progress._svg
-    def capture(*args, **kwargs):
-        if kwargs.get("monitor") and kwargs.get("logarithmic"):
-            captured.extend(args[3])
-        return original(*args, **kwargs)
-    monkeypatch.setattr(progress, "_svg", capture)
-    value = progress.materialize_history(tmp_path / "history", [artifact], "d" * 64,
-        pointer["identity"], tmp_path / "views", quality="not_evaluated", complete=False)
-    context = value["history_context"]["scba"]
-    assert context["attempt"] == 10 and context["outer_iteration"] == 7
-    assert context["first_iteration"] == 3 and context["last_iteration"] == 4
-    assert captured == [("r_K", [3., 4.], [.009, .008])]
+def test_resume_keeps_native_indices_and_excludes_previous_attempt_from_monitor(tmp_path,monkeypatch):
+    import qcl_negf_results.render as render
+    captured=[];original=render._svg
+    def capture(*args,**kwargs):
+        if kwargs.get('monitor') and kwargs.get('logarithmic'):captured.extend(args[3])
+        return original(*args,**kwargs)
+    monkeypatch.setattr(render,'_svg',capture)
+    with native_render(tmp_path/'point') as (analysis,selected,_,_):
+        batch=history_batch(selected,sequence=(31,32,33,34),iteration=(1,2,3,4),outer=(7,7,7,7),attempts=('2','2','10','10'),residual=(.1,.01,.009,.008))
+        value=materialize(analysis,tmp_path/'views',selections=SELECTIONS,history=(batch,))
+        context=next(v for v in value['figures'] if v['id']=='convergence-scba')['monitor_context']
+        assert context['attempt']=='10' and context['outer_iteration']==7
+        assert context['first_iteration']==3 and context['last_iteration']==4
+        assert captured==[('r_K',[3.,4.],[.009,.008])]
 
 
-def test_cycle_spanning_closed_segments_does_not_reset_at_file_boundary(tmp_path, monkeypatch):
-    from qcl_negf_results import progress
 
-    first, pointer = history_fixture(tmp_path / "history/first", sequence=(1, 2, 3),
-        iteration=(1, 2, 1), outer=(1, 1, 2), residual=(.1, .01, .2))
-    second, _ = history_fixture(tmp_path / "history/second", sequence=(4, 5, 6),
-        iteration=(2, 3, 4), outer=(2, 2, 2), residual=(.1, float("nan"), .01))
-    first["path"] = "first/" + first["path"]
-    second["path"] = "second/" + second["path"]
-    value = progress.materialize_history(tmp_path / "history", [first, second], "e" * 64,
-        pointer["identity"], tmp_path / "views", quality="not_evaluated", complete=False)
-    figure = next(figure for figure in value["figures"] if figure["id"] == "convergence-scba")
-    assert figure["history_cycle_count"] == 2
-    assert figure["monitor_context"]["rows"] == 4
-    assert figure["monitor_context"]["first_iteration"] == 1 and figure["monitor_context"]["last_iteration"] == 4
-    svg = (tmp_path / "views" / figure["monitor_path"]).read_text()
-    # The valid samples before the NaN connect, while the final sample is isolated.
-    assert svg.count("<polyline") == 1 and svg.count("<circle") == 1
+def test_cycle_spanning_closed_segments_does_not_reset_at_file_boundary(tmp_path,monkeypatch):
+    from dataclasses import replace
+    with native_render(tmp_path/'point') as (analysis,selected,_,_):
+        batch=history_batch(selected,sequence=(1,2,3,4,5,6),iteration=(1,2,1,2,3,4),outer=(1,1,2,2,2,2),residual=(.1,.01,.2,.1,float('nan'),.01))
+        first=replace(batch,records=batch.records[:3],rows=batch.rows[:3],at_cutoff=False)
+        second=replace(batch,records=batch.records[3:],rows=batch.rows[3:])
+        value=materialize(analysis,tmp_path/'views',selections=SELECTIONS,history=(first,second))
+        figure=next(v for v in value['figures'] if v['id']=='convergence-scba')
+        assert figure['history_cycle_count']==2 and figure['monitor_context']['rows']==4
+        assert figure['monitor_context']['first_iteration']==1 and figure['monitor_context']['last_iteration']==4
+        svg=(tmp_path/'views'/figure['monitor_path']).read_text()
+        assert svg.count('<polyline')==1 and svg.count('<circle')==1
+
 
 
 def test_heatmap_uses_all_native_extrema_and_preserves_missing_and_signed_witnesses():
@@ -339,27 +267,16 @@ def test_heatmap_places_nonuniform_axes_in_physical_coordinates():
 
 
 def test_tall_native_heatmap_materializes_as_landscape_without_changing_hdf5(tmp_path):
-    generation, commit, _ = generation_fixture(tmp_path / "point")
-    source = generation / "analysis.h5"
-    with h5py.File(source, "r+") as record:
-        for path in ("axes/energy_eV", "observables/spectral", "observables/occupied_spectral", "observables/spatial_energy_density"):
-            del record[path]
-        energy = np.linspace(-.1473913140194004, .263098718019446, 1921)
-        record["axes/energy_eV"] = energy
-        record["axes/energy_eV"].attrs["logical_axis_order"] = "E"
-        values = np.sin(np.arange(1921)[:, None] / 100) * np.array([[1., 2., 3.]]) * 1e22
-        record["observables/spatial_energy_density"] = values
-        record["observables/spatial_energy_density"].attrs.update(units="m^-3/eV", logical_axis_order="E,z")
-    contents = source.read_bytes()
-    commit["artifacts"][0].update(bytes=len(contents), sha256=hashlib.sha256(contents).hexdigest())
-    view = materialize(generation, commit, "a" * 64, tmp_path / "views")
-    figure = next(item for item in view["figures"] if item["id"] == "energy-density")
-    assert figure["native_shape"] == [1921, 3]
-    assert figure["display_aspect_ratio"] == "3:2"
-    svg = (tmp_path / "views" / figure["path"]).read_text()
-    assert 'viewBox="0 0 840 560"' in svg and "1921 × 3" in svg
-    assert "-0.1473913140194004" not in svg
-    assert source.read_bytes() == contents
+    with native_render(tmp_path/'point',ne=1921,selected_bytes=2*1024*1024) as (analysis,_,artifact,_):
+        source=tmp_path/'point'/artifact['path'];contents=source.read_bytes()
+        view=materialize(analysis,tmp_path/'views',selections={'spatial_energy_density':[slice(None),slice(None)]})
+        figure=next(v for v in view['figures'] if v['id']=='energy-density')
+        assert figure['native_shape']==[1921,3] and figure['display_aspect_ratio']=='3:2'
+        svg=(tmp_path/'views'/figure['path']).read_text()
+        assert 'viewBox="0 0 840 560"' in svg and '1921 × 3' in svg
+        assert '-0.1473913140194004' not in svg
+        assert source.read_bytes()==contents
+
 
 
 def test_line_figure_legends_wrap_long_labels_without_dropping_their_units():
@@ -404,12 +321,467 @@ def test_convergence_references_preserve_raw_values_and_invalid_gaps(monitor):
 
 
 def test_renderer_rejects_cached_view_from_another_contract_set(tmp_path):
-    generation, commit, digest = generation_fixture(tmp_path / "point")
-    destination = tmp_path / "views"
-    view = materialize(generation, commit, digest, destination)
-    cache = destination / Path(view["figures"][0]["path"]).parent / "index.json"
-    stale = json.loads(cache.read_text())
-    stale["contract_set"] = "qcl-negf.results.0.10.5"
-    atomic_json(cache, stale)
-    with pytest.raises(ValueError, match="contract set"):
-        materialize(generation, commit, digest, destination)
+    with native_render(tmp_path/'point') as (analysis,_,_,_):
+        destination=tmp_path/'views';view=materialize(analysis,destination,selections=SELECTIONS)
+        cache=destination/Path(view['figures'][0]['path']).parent/'index.json'
+        stale=json.loads(cache.read_text());stale['contract_set']='qcl-negf.results.0.10.5';atomic_json(cache,stale)
+        with pytest.raises(ValueError,match='contract'):materialize(analysis,destination,selections=SELECTIONS)
+
+
+
+def test_native5_raster_preflight_is_arithmetic_and_nonuniform_does_not_force_screen_minimum():
+    from qcl_negf_results.render import _raster_forecast, _heatmap_svg
+    native, peak = _raster_forecast((4,3),(4,3),retained_bytes=1024)
+    assert native > 8*12 and peak >= native+1024
+    assert _raster_forecast((10**30,10**30),(2,2))[0] > 10**60
+    image, raw, annotation = _heatmap_svg(np.arange(12.).reshape(4,3),[0.,1.,9.],[-.15,-.14,.05,.2],'eV^-1 m^-3','invalid')
+    assert np.prod(annotation['display_shape']) <= 12
+    assert annotation['native_shape'] == [4,3]
+    assert 'image/png' in image and raw.startswith(b'\x89PNG')
+
+
+def test_native5_materialize_explicit_selection_borrowed_cache_and_source_binding(tmp_path,monkeypatch):
+    from consumer_context_fixture import semantic_fixture
+    from qcl_negf_results.saved_views import AnalysisReader
+    from qcl_negf_results.state import StateReader
+    selected,artifact,_,_,_=semantic_fixture(tmp_path/'source')
+    with StateReader(tmp_path/'source',state_ref=selected,expected_identity=selected['identity']) as owner:
+        with AnalysisReader(owner,artifact_ref=artifact) as analysis:
+            selections={'density':[slice(None)],'spatial_energy_density':[slice(None),slice(None)]}
+            view=materialize(analysis,tmp_path/'views',selections=selections)
+            assert view['source_state']==selected and view['scientific_accepted'] is None
+            assert {f['id'] for f in view['figures']}=={'density','energy-density'}
+            image=next(f for f in view['figures'] if f['id']=='energy-density')
+            assert image['native_shape']==[2,3] and image['color_range']==[-21.,21.]
+            monkeypatch.setattr(h5py,'File',lambda *a,**k:pytest.fail('warm native cache reopened HDF'))
+            assert materialize(analysis,tmp_path/'views',selections=selections)==view
+            with (tmp_path/'source'/artifact['path']).open('r+b') as stream:
+                stream.seek(-1,2);cell=stream.read(1);stream.seek(-1,2);stream.write(bytes([cell[0]^1]))
+            with pytest.raises(Exception,match='changed|owner'):
+                materialize(analysis,tmp_path/'views',selections=selections)
+
+
+def test_native5_acceptance_missing_and_null_never_default_true():
+    from qcl_negf_results.presentation import accepted_result
+    record=dict(status='completed',quality='strict',converged=True)
+    assert not accepted_result(record)
+    assert not accepted_result(dict(record,scientific_accepted=None))
+    assert not accepted_result(dict(record,scientific_accepted=False))
+    assert accepted_result(dict(record,scientific_accepted=True))
+
+
+def test_native5_series_missing_middle_is_a_gap_not_a_deleted_point(tmp_path):
+    rows=[dict(id=str(i),execution_id='literal',status='completed',quality='strict',converged=True,coordinates=dict(temperature_K=200.,branch='f',order=i,voltage_per_period_V=.1*i),
+        observables=dict(current_density_A_per_m2=None if i==1 else float(i+1)),scientific_accepted=True) for i in range(3)]
+    result=materialize_series(rows,tmp_path)
+    svg=(tmp_path/result[0]['path']).read_text()
+    assert '<polyline' not in svg
+    assert svg.count('<circle')==2
+
+
+def test_native5_renderer_history_current_cycle_native_indices_and_explicit_boundaries(tmp_path,monkeypatch):
+    from consumer_context_fixture import semantic_fixture,history_batch
+    from qcl_negf_results.saved_views import AnalysisReader
+    from qcl_negf_results.state import StateReader
+    import qcl_negf_results.render as render
+    selected,artifact,_,_,_=semantic_fixture(tmp_path/'source')
+    batch=history_batch(selected,sequence=(100,101,102,103,104),iteration=(1,2,3,1,2),outer=(1,1,1,2,2),residual=(.1,.001,.0001,.2,.02))
+    captured=[];original=render._svg
+    def capture(*args,**kwargs):captured.append((args,kwargs));return original(*args,**kwargs)
+    monkeypatch.setattr(render,'_svg',capture)
+    with StateReader(tmp_path/'source',state_ref=selected,expected_identity=selected['identity']) as owner:
+        view=materialize(AnalysisReader(owner,artifact_ref=artifact),tmp_path/'views',selections={'density':[slice(None)]},history=(batch,))
+    figure=next(v for v in view['figures'] if v['id']=='convergence-scba')
+    assert figure['history_rows']==5 and figure['history_cycle_count']==2
+    assert figure['monitor_context']==dict(phase='scba',attempt='1',outer_iteration=2,first_iteration=1,last_iteration=2,first_sequence=103,last_sequence=104,rows=2)
+    assert next(v[0][3] for v in captured if v[1].get('monitor'))==[('r_K',[1.,2.],[.2,.02])]
+    args,kwargs=next(v for v in captured if v[1].get('logarithmic') and not v[1].get('monitor'))
+    assert set(x for x in args[3][0][1] if np.isfinite(x))=={100,101,102,103,104}
+    assert any(not np.isfinite(x) for x in args[3][0][1])
+    assert kwargs['boundaries']==[(103.,'μ=2 · a=1')]
+
+
+@pytest.mark.parametrize('middle',[dict(status='failed'),dict(scientific_accepted=None),dict(current=float('nan')),dict(current=float('inf'))])
+def test_native5_series_failed_unknown_and_nonfinite_break_only_their_segment(tmp_path,middle):
+    rows=[dict(id=str(i),execution_id='literal',status='completed',quality='strict',converged=True,
+        scientific_accepted=True,coordinates=dict(temperature_K=200.,branch='f',order=i,voltage_per_period_V=.1*i),
+        observables=dict(current_density_A_per_m2=float(i+1))) for i in range(3)]
+    rows[1].update({k:v for k,v in middle.items() if k!='current'})
+    if 'current' in middle:rows[1]['observables']['current_density_A_per_m2']=middle['current']
+    result=materialize_series(rows,tmp_path)
+    svg=(tmp_path/result[0]['path']).read_text()
+    assert '<polyline' not in svg
+    assert svg.count('<circle')== (3 if middle.get('status')=='failed' or 'scientific_accepted' in middle else 2)
+
+
+@pytest.mark.parametrize('shape',[(2,8192),(8192,2),(3,5)])
+def test_native5_rowwise_png_exact_literal_colors_and_extrema_for_wide_deep_invalid(shape):
+    from qcl_negf_results.render import _png
+    import zlib,struct
+    array=np.full(shape,np.nan)
+    if shape!=(3,5):array[0,:7 if shape[1]>=7 else 2]=np.array([-1.,-.5,-0.,0.,.5,1.,np.inf])[:min(7,shape[1])]
+    raw,annotation=_png(array)
+    width,height=struct.unpack('>II',raw[16:24]);assert (height,width)==shape
+    compressed=b'';position=8
+    while position<len(raw):
+        size=struct.unpack('>I',raw[position:position+4])[0];kind=raw[position+4:position+8]
+        if kind==b'IDAT':compressed+=raw[position+8:position+8+size]
+        position+=12+size
+    scan=zlib.decompress(compressed)
+    def pixel(row,column):
+        start=(height-1-row)*(1+3*width)+1+3*column
+        return tuple(scan[start:start+3])
+    assert pixel(height-1,width-1)==(155,155,155)
+    if shape==(3,5):assert annotation['native_range'] is None and annotation['missing_count']==15
+    elif width>=7:
+        assert [pixel(0,i) for i in range(7)]==[(0,0,255),(127,127,255),(255,255,255),(255,255,255),(255,127,127),(255,0,0),(155,155,155)]
+        assert annotation['color_range']==[-1.,1.]
+    else:assert pixel(0,0)==(0,0,255) and pixel(0,1)==(127,127,255)
+
+
+def test_native5_raster_guard_refuses_huge_policy_metadata_before_numeric_payload(tmp_path,monkeypatch):
+    from qcl_negf_results.saved_views import SavedViewLimits
+    with native_render(tmp_path/'source') as (analysis,_,_,_):
+        # Tight policy makes native-alone impossible even for this literal tiny
+        # source. Large dimension arithmetic is separately allocation-free.
+        analysis.limits=SavedViewLimits(maximum_selected_bytes=1,maximum_cells=1)
+        original=h5py.Dataset.__getitem__
+        def no_numeric(dataset,key):
+            assert '/arrays/' not in dataset.name
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        with pytest.raises(ContractError,match='native raster'):
+            materialize(analysis,tmp_path/'views',selections={'spatial_energy_density':[slice(None),slice(None)]})
+
+
+def test_native5_explicit_history_current_is_signed_linear_with_recorded_units(tmp_path,monkeypatch):
+    import qcl_negf_results.render as render
+    from result_v2_fixture import ieee
+    import struct
+    captured=[];original=render._svg
+    def capture(*args,**kwargs):captured.append((args,kwargs));return original(*args,**kwargs)
+    monkeypatch.setattr(render,'_svg',capture)
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        batch=history_batch(selected)
+        for record,row,current in zip(batch.records,batch.rows,(-2.,0.,3.),strict=True):
+            tag=ieee(struct.pack('>d',current).hex());record['core']['fields']['row']['fields']['J']=tag
+            row['cells']['J']=dict(tagged=tag,value=current,invalid_reason=None,units='A/m^2',missing_reason=None)
+        result=materialize(analysis,tmp_path/'views',selections={'density':[slice(None)]},history=(batch,))
+        figure=next(v for v in result['figures'] if v['id']=='history-J-scba')
+        assert figure['units']['y']=='A/m^2'
+        args,kwargs=next(v for v in captured if v[0][0]=='J: scba')
+        assert not kwargs.get('logarithmic',False)
+        assert args[3]==[('J',[1.,2.,3.],[-2.,0.,3.])]
+
+
+def test_native5_cache_publication_rechecks_owner_after_cached_asset_read(tmp_path,monkeypatch):
+    with native_render(tmp_path/'source') as (analysis,_,artifact,_):
+        destination=tmp_path/'views';selections={'density':[slice(None)]}
+        view=materialize(analysis,destination,selections=selections)
+        asset=destination/view['figures'][0]['path'];changed=[]
+        def read_then_tamper():
+            if not changed:
+                with (tmp_path/'source'/artifact['path']).open('r+b') as raw:
+                    raw.seek(-1,2);cell=raw.read(1);raw.seek(-1,2);raw.write(bytes([cell[0]^1]))
+                changed.append(True)
+        _track_cache_reads(monkeypatch,asset,lambda:None,after_read=read_then_tamper)
+        with pytest.raises(ContractError) as failure:materialize(analysis,destination,selections=selections)
+        assert failure.value.code=='source_changed' and changed==[True]
+
+
+@pytest.mark.parametrize('field',['acceptance','quality','identity','empty_figures','source','units','native_range','selection'])
+def test_b1_f1_warm_cache_metadata_has_no_authority_over_qualified_render(tmp_path,monkeypatch,field):
+    with native_render(tmp_path/'source') as (analysis,_,_,_):
+        destination=tmp_path/'views';selections={'density':[slice(None)]}
+        expected=materialize(analysis,destination,selections=selections)
+        index=destination/expected['cache_key']/'index.json'
+        bad=json.loads(json.dumps(expected))
+        if field=='acceptance':bad['scientific_accepted']=True
+        elif field=='quality':bad['quality']='strict'
+        elif field=='identity':bad['identity']['run_id']='foreign'
+        elif field=='empty_figures':bad['figures']=[]
+        elif field=='source':bad['figures'][0]['source_state']['identity']['run_id']='foreign'
+        elif field=='units':bad['figures'][0]['units']['y']='A/m^2'
+        elif field=='native_range':bad['figures'][0]['native_range']=[123,456]
+        else:bad['figures'][0]['raw_selections'][0]['selection']=[dict(start=1,stop=2,step=1)]
+        assert bad['source_binding']==expected['source_binding']
+        index.write_text(json.dumps(bad))
+        original=h5py.Dataset.__getitem__
+        def no_numeric(dataset,key):
+            assert '/arrays/' not in dataset.name,'corrupt warm cache must reject without numeric reconstruction'
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        with pytest.raises(ContractError,match='cache|metadata'):
+            materialize(analysis,destination,selections=selections)
+
+
+def test_b1_f1_public_return_mutation_cannot_rewrite_memo_and_new_facade_is_warm(tmp_path,monkeypatch):
+    with native_render(tmp_path/'source') as (analysis,_,artifact,_):
+        destination=tmp_path/'views';selections={'density':[slice(None)]}
+        public=materialize(analysis,destination,selections=selections)
+        expected=json.loads(json.dumps(public))
+        public['scientific_accepted']=True;public['figures'].clear()
+        public['source_binding']['identity']['run_id']='foreign'
+        original=h5py.Dataset.__getitem__
+        def no_numeric(dataset,key):
+            assert '/arrays/' not in dataset.name,'same-owner new facade must keep a healthy warm hit'
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        with AnalysisReader(analysis.reader,artifact_ref=artifact) as next_facade:
+            assert materialize(next_facade,destination,selections=selections)==expected
+
+
+@pytest.mark.parametrize('field',['units','missing_reason'])
+def test_b1_f1_history_projection_cannot_contradict_raw_pairs(tmp_path,field):
+    from result_v2_fixture import ieee
+    import struct
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        batch=history_batch(selected)
+        for record,row,current in zip(batch.records,batch.rows,(-2.,0.,3.),strict=True):
+            tag=ieee(struct.pack('>d',current).hex());record['core']['fields']['row']['fields']['J']=tag
+            row['cells']['J']=dict(tagged=tag,value=current,invalid_reason=None,units='A/m^2',missing_reason=None)
+        for row in batch.rows:row['cells']['J'][field]='mA/m^2' if field=='units' else 'invented missing'
+        with pytest.raises(ContractError,match='units|missing|projection'):
+            materialize(analysis,tmp_path/'views',selections={'density':[slice(None)]},history=(batch,))
+
+
+def test_b1_f1_healthy_history_cache_is_warm_without_numeric_or_full_hash_reads(tmp_path,monkeypatch):
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        batch=history_batch(selected)
+        destination=tmp_path/'views';selections={'density':[slice(None)]}
+        expected=materialize(analysis,destination,selections=selections,history=(batch,))
+        original=h5py.Dataset.__getitem__
+        def no_numeric(dataset,key):
+            assert '/arrays/' not in dataset.name
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        actual=materialize(analysis,destination,selections=selections,history=(batch,))
+        assert actual==json.loads(json.dumps(expected))
+        assert analysis.reader.io_counters['sha_bytes']==0
+
+
+def test_b1_f1_new_owner_recreates_unqualified_disk_metadata(tmp_path,monkeypatch):
+    source=tmp_path/'source';destination=tmp_path/'views';selections={'density':[slice(None)]}
+    with native_render(source) as (analysis,selected,artifact,_):
+        expected=materialize(analysis,destination,selections=selections)
+    index=destination/expected['cache_key']/'index.json'
+    bad=json.loads(json.dumps(expected));bad['scientific_accepted']=True;bad['figures']=[]
+    index.write_text(json.dumps(bad))
+    reads=[];original=h5py.Dataset.__getitem__
+    def numeric(dataset,key):
+        if '/arrays/' in dataset.name:reads.append(dataset.name)
+        return original(dataset,key)
+    monkeypatch.setattr(h5py.Dataset,'__getitem__',numeric)
+    with StateReader(source,state_ref=selected,expected_identity=selected['identity']) as owner:
+        with AnalysisReader(owner,artifact_ref=artifact) as next_view:
+            assert materialize(next_view,destination,selections=selections)==expected
+    assert reads and all(name.rsplit('/',1)[1] in {'density_per_m3','z_nm','wX'} for name in reads)
+    assert json.loads(index.read_text())['scientific_accepted'] is None
+
+
+def test_b1_f1_one_entry_replacement_and_warm_workspace_admission(tmp_path,monkeypatch):
+    from dataclasses import replace
+    with native_render(tmp_path/'source') as (analysis,_,_,_):
+        destination=tmp_path/'views'
+        first=materialize(analysis,destination,selections={'density':[slice(None)]})
+        old=analysis.reader._materialized_point_memo
+        second=materialize(analysis,destination,selections={'density':[slice(0,2)]})
+        memo=analysis.reader._materialized_point_memo
+        assert type(memo) is tuple and type(memo[1]) is bytes and memo[0]==second['cache_key']!=first['cache_key']
+        assert memo is not old and old not in tuple(analysis.reader.__dict__.values())
+        # The private allowance uses the tighter actual owner selected-byte cap.
+        # Same facade limits/key: the retained memo plus decode containers must
+        # refuse before any selected payload, then admit after restoring space.
+        analysis.reader.limits=replace(analysis.reader.limits,maximum_array_bytes=4096)
+        original=h5py.Dataset.__getitem__
+        def no_numeric(dataset,key):
+            assert '/arrays/' not in dataset.name
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        with pytest.raises(ContractError,match='memo') as error:
+            materialize(analysis,destination,selections={'density':[slice(0,2)]})
+        assert error.value.code=='budget_exceeded' and analysis.reader._materialized_point_memo is memo
+        analysis.reader.limits=replace(analysis.reader.limits,maximum_array_bytes=131072)
+        assert materialize(analysis,destination,selections={'density':[slice(0,2)]})==second
+
+
+def test_b1_f1_matching_raw_missing_and_varying_units_remain_signed_gaps(tmp_path,monkeypatch):
+    import math
+    import struct
+    from importlib.resources import files
+    import qcl_negf_results.render as render
+    from result_v2_fixture import ieee,symbol
+    nodes=json.loads(files('qcl_negf_contracts').joinpath('core_layout.json').read_text())['graph']['nodes']
+    pair=next(name for name,node in nodes.items() if node.get('fields')==[
+        {'name':'first','type':'Symbol'},{'name':'second','type':'Symbol'}])
+    captured=[];original=render._svg
+    def capture(*args,**kwargs):captured.append((args,kwargs));return original(*args,**kwargs)
+    monkeypatch.setattr(render,'_svg',capture)
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        batch=history_batch(selected,sequence=(1,2,3,4),residual=(.1,.01,.001,.0001))
+        for i,(record,row,value) in enumerate(zip(batch.records,batch.rows,(-2.,-0.,3.,-4.),strict=True)):
+            tag=ieee(struct.pack('>d',value).hex());core=record['core']['fields'];core['row']['fields']['J']=tag
+            unit='A/m^2' if i<3 else 'mA/m^2'
+            core['units'][0]['fields']['second']=unit
+            missing='no_previous_iteration' if i==1 else None
+            if missing:core['missing_reasons']=[dict(type=pair,fields=dict(first=symbol('J'),second=symbol(missing)))]
+            row['cells']['J']=dict(tagged=tag,value=value,invalid_reason=None,units=unit,missing_reason=missing)
+        result=materialize(analysis,tmp_path/'views',selections={'density':[slice(None)]},history=(batch,))
+        figure=next(v for v in result['figures'] if v['id']=='history-J-scba')
+        assert figure['units']['y']=='stored units vary'
+        args,kwargs=next(v for v in captured if v[0][0]=='J: scba')
+        assert not kwargs.get('logarithmic',False)
+        _,xs,ys=args[3][0]
+        assert xs[:3]==[1.,2.,3.] and math.isnan(xs[3]) and xs[4]==4.
+        assert ys[0]==-2. and math.isnan(ys[1]) and ys[2]==3. and math.isnan(ys[3]) and ys[4]==-4.
+        assert batch.rows[1]['cells']['J']['tagged']['bits']=='8000000000000000'
+
+
+def _track_cache_reads(monkeypatch,target,before_read,*,after_read=lambda:None):
+    """Observe real FileIO/Path.open reads at the shared Python I/O boundary."""
+    import io
+    import os
+    calls=[];streams=[];opened=io.open
+    class Tracked:
+        def __init__(self,stream):self.stream=stream
+        def __getattr__(self,name):return getattr(self.stream,name)
+        def __enter__(self):return self
+        def __exit__(self,*args):return self.stream.__exit__(*args)
+        def read(self,size=-1):
+            before_read()
+            value=self.stream.read(size);calls.append((size,len(value)))
+            after_read()
+            return value
+    def tracked(file,*args,**kwargs):
+        stream=opened(file,*args,**kwargs)
+        path=Path(os.readlink('/proc/self/fd/'+str(file))) if isinstance(file,int) else Path(file)
+        if path==target:
+            streams.append(stream)
+            return Tracked(stream)
+        return stream
+    monkeypatch.setattr(io,'open',tracked)
+    return calls,streams
+
+
+def _cache_role(analysis,selected,destination,role):
+    analysis.limits=SavedViewLimits(maximum_selected_bytes=262144,maximum_cells=16)
+    selections={'spatial_energy_density':[slice(None),slice(None)]} if role=='png' else {'density':[slice(None)]}
+    history=(history_batch(selected,sequence=(1,),residual=(.1,)),) if role=='monitor' else ()
+    expected=materialize(analysis,destination,selections=selections,history=history)
+    if role=='index':target=destination/expected['cache_key']/'index.json'
+    else:
+        key='raw_path' if role=='png' else 'monitor_path' if role=='monitor' else 'path'
+        target=destination/next(f[key] for f in expected['figures'] if key in f)
+    return selections,history,expected,target
+
+
+@pytest.mark.parametrize('role',['svg','png','monitor'])
+def test_b1_f2_actual_asset_growth_is_bounded_before_allocation(tmp_path,monkeypatch,role):
+    import os
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        destination=tmp_path/'views'
+        selections,history,expected,target=_cache_role(analysis,selected,destination,role)
+        assert materialize(analysis,destination,selections=selections,history=history)==json.loads(json.dumps(expected))
+        admitted=target.stat().st_size;workspace=16*262144+8*16;changed=[]
+        def grow():
+            if changed:return
+            # Real growth after the read descriptor has been opened/qualified;
+            # sparse extension avoids an adversarial fixture allocation.
+            with target.open('ab',buffering=0) as stream:os.ftruncate(stream.fileno(),workspace+1024)
+            changed.append(True)
+        calls,streams=_track_cache_reads(monkeypatch,target,grow)
+        with pytest.raises(ContractError):materialize(analysis,destination,selections=selections,history=history)
+        assert changed==[True] and calls
+        assert all(0<size<=65536 and actual<=size for size,actual in calls)
+        assert sum(actual for _,actual in calls)<=admitted+1
+        assert all(stream.closed for stream in streams)
+
+
+@pytest.mark.parametrize('role',['svg','png','monitor','index'])
+def test_b1_f2_same_size_path_replacement_during_actual_read_is_rejected(tmp_path,monkeypatch,role):
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        destination=tmp_path/'views'
+        selections,history,_,target=_cache_role(analysis,selected,destination,role)
+        replacement=target.with_suffix(target.suffix+'.replacement');replacement.write_bytes(target.read_bytes());changed=[]
+        def replace():
+            if not changed:replacement.replace(target);changed.append(True)
+        calls,streams=_track_cache_reads(monkeypatch,target,replace)
+        with pytest.raises(ContractError):materialize(analysis,destination,selections=selections,history=history)
+        assert changed==[True] and calls and all(stream.closed for stream in streams)
+
+
+@pytest.mark.parametrize('kind',['fifo','directory'])
+def test_b1_f2_warm_index_nonregular_refuses_before_numeric_read(tmp_path,monkeypatch,kind):
+    import os
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        destination=tmp_path/'views'
+        selections,history,_,target=_cache_role(analysis,selected,destination,'index')
+        target.unlink()
+        if kind=='fifo':os.mkfifo(target)
+        else:target.mkdir()
+        original=h5py.Dataset.__getitem__
+        def no_numeric(dataset,key):
+            assert '/arrays/' not in dataset.name,'nonregular warm index cannot trigger a cold scientific read'
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        with pytest.raises(ContractError):materialize(analysis,destination,selections=selections,history=history)
+
+
+@pytest.mark.parametrize('role',['svg','index'])
+def test_b1_f2_symlink_swap_at_actual_open_refuses_without_following(tmp_path,monkeypatch,role):
+    import os
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        selections,history,_,target=_cache_role(analysis,selected,tmp_path/'views',role)
+        other=target.with_suffix('.other');other.write_bytes(target.read_bytes())
+        real_open=os.open;changed=[]
+        def swap(path,*args,**kwargs):
+            if Path(path)==target and not changed:
+                target.unlink();target.symlink_to(other.name);changed.append(True)
+            return real_open(path,*args,**kwargs)
+        monkeypatch.setattr(os,'open',swap)
+        with pytest.raises(ContractError,match='without following links'):
+            materialize(analysis,tmp_path/'views',selections=selections,history=history)
+        assert changed==[True]
+
+
+@pytest.mark.parametrize('role',['svg','index'])
+@pytest.mark.parametrize('exception',[RuntimeError,KeyboardInterrupt])
+def test_b1_f2_actual_read_failure_closes_descriptor_and_preserves_primary(tmp_path,monkeypatch,role,exception):
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        selections,history,_,target=_cache_role(analysis,selected,tmp_path/'views',role)
+        def fail():raise exception('primary read cancellation')
+        calls,streams=_track_cache_reads(monkeypatch,target,fail)
+        with pytest.raises(exception,match='primary read cancellation'):
+            materialize(analysis,tmp_path/'views',selections=selections,history=history)
+        assert calls==[] and streams and all(stream.closed for stream in streams)
+
+
+def test_b1_f2_opened_oversize_asset_refuses_before_actual_read(tmp_path,monkeypatch):
+    import os
+    with native_render(tmp_path/'source') as (analysis,selected,_,_):
+        selections,history,_,target=_cache_role(analysis,selected,tmp_path/'views','svg')
+        os.truncate(target,16*262144+8*16+1024)
+        def forbidden():pytest.fail('opened size admission must precede every asset read')
+        calls,streams=_track_cache_reads(monkeypatch,target,forbidden)
+        with pytest.raises(ContractError) as failure:
+            materialize(analysis,tmp_path/'views',selections=selections,history=history)
+        assert failure.value.code=='budget_exceeded' and calls==[]
+        assert streams and all(v.closed for v in streams)
+
+
+def test_b1_f2_healthy_multichunk_hash_is_bounded_without_source_payload_or_sha_rescan(tmp_path,monkeypatch):
+    with native_render(tmp_path/'source',ne=2049,selected_bytes=2*1024*1024) as (analysis,_,_,_):
+        selections={'spectral_trace':[slice(None),slice(None)]};destination=tmp_path/'views'
+        expected=materialize(analysis,destination,selections=selections)
+        target=destination/expected['figures'][0]['path'];size=target.stat().st_size
+        assert size>65536
+        calls,streams=_track_cache_reads(monkeypatch,target,lambda:None)
+        original=h5py.Dataset.__getitem__
+        def no_numeric(dataset,key):
+            assert '/arrays/' not in dataset.name
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        assert materialize(analysis,destination,selections=selections)==expected
+        assert len(calls)>2 and all(0<n<=65536 and count<=n for n,count in calls)
+        assert sum(count for _,count in calls)==size
+        assert analysis.reader.io_counters['sha_bytes']==0 and all(v.closed for v in streams)
