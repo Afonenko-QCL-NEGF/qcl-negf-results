@@ -1,24 +1,22 @@
-"""36 manufactured native-v4 cases; no solver or production archive input.
+"""Preserved independent equilibrium literals, emitted as canonical native5; no solver or production archive input.
 
 Oracles use a closed two-by-two inverse and literal weighted full-matrix sums.
 The arithmetic bounds below are engineering roundoff bounds, not S01 acceptance.
 """
 import hashlib
+from copy import deepcopy
+from contextlib import contextmanager, nullcontext
+from unittest.mock import patch
 import importlib
 import json
 import math
-from pathlib import Path
 
 import h5py
 import numpy as np
 import pytest
 
-from qcl_negf_contracts.artifacts import CONTRACT_SET
 from qcl_negf_contracts.messages import ContractError
-from qcl_negf_results.commits import artifact_row, json_bytes
-from qcl_negf_results.model import canonical_bytes
 from qcl_negf_results.state import StateReader
-from native_result_fixtures import declare_native
 from source_ownership import assert_source_ownership
 
 IDENTITY = {"execution_id": "manufactured", "point_id": "analytic", "attempt": 1,
@@ -86,13 +84,8 @@ def number(values, we=WE, wk=WK):
 
 
 def publish(root, commit):
-    commit['artifacts'][0] = artifact_row(root / 'physics.h5', relative='physics.h5',
-        role='physics.full', media_type='application/x-hdf5', profile='full-state', schema='qcl-negf-physics-v4')
-    payload = json_bytes(commit)
-    (root / 'commit.json').write_bytes(payload)
-    (root / 'receipt.json').write_bytes(json_bytes(dict(schema='qcl-negf-recovery-receipt-v1',
-        status='verified', publication_scope='local_filesystem', identity=IDENTITY,
-        state_id=IDENTITY['state_id'], state_sequence=1, commit_sha256=hashlib.sha256(payload).hexdigest())))
+    from equilibrium_native5_fixture import publish as native_publish
+    return native_publish(root, commit)
 
 
 def matrix(handle, path, value):
@@ -113,8 +106,6 @@ def archive(tmp_path):
     data = analytic()
     target = number(-1j * data['GL'])
     with h5py.File(root / 'physics.h5', 'w') as handle:
-        declare_native(handle, 'qcl-negf-physics-v4', 'physics.full', scba_rows=0)
-        handle['metadata/point_identity_json'] = json.dumps(IDENTITY)
         scalars = {'scales/E0_eV': (0.1, 'eV'), 'scales/L0_m': (1e-8, 'm'),
             'scales/J0_A_per_m2': (13.0, 'A/m^2'), 'inputs/F_bias_V_per_m': (0.0, 'V/m'),
             'inputs/V_period_V': (0.0, 'V'), 'inputs/T_L_K': (70.0, 'K'), 'inputs/T_LO_K': (70.0, 'K'),
@@ -133,22 +124,10 @@ def archive(tmp_path):
         for n, fraction in [(n, 0.1) for n in FAMILIES] + [('embedding_total', 0.5), ('embedding_plus', 0.25), ('embedding_minus', 0.25)]:
             for part in ['SL', 'SG']:
                 matrix(handle, f'selfenergy_dimensionless/{n}/{part}', fraction * data[part])
-    history = root / 'history.h5'
-    with h5py.File(history, 'w') as handle:
-        declare_native(handle, 'qcl-negf-scientific-history-v4', 'science.history', scba_rows=0)
-    configuration = {'manufactured': True}
-    model = root / 'resolved_configuration.json'
-    model.write_bytes(json_bytes(dict(schema='qcl-negf-resolved-configuration-v3', contract_set=CONTRACT_SET,
-        configuration=configuration, hash_encoding='qcl-negf-canonical-bytes-v1',
-        configuration_hash=hashlib.sha256(canonical_bytes(configuration)).hexdigest())))
     context = dict(boundary_condition='stationary_field_periodic_embedding',
         basis_contract='orthonormal finite projected basis', enabled_scattering=list(FAMILIES),
         physical_models=dict(lo_population='thermal', electron_electron=dict(mode='none')))
-    commit = dict(schema='qcl-negf.artifact-commit.v2', contract_set=CONTRACT_SET, generation=1,
-        identity=IDENTITY, state_id=IDENTITY['state_id'], state_sequence=1, storage_class='archive',
-        stationary_assessment=dict(model_context=context, fixture_solver_status='not_run'), artifacts=[{},
-            artifact_row(history, relative=history.name, role='science.history', media_type='application/x-hdf5', schema='qcl-negf-scientific-history-v4'),
-            artifact_row(model, relative=model.name, role='model', media_type='application/json', schema='qcl-negf-resolved-configuration-v3')])
+    commit = dict(stationary_assessment=dict(model_context=context, fixture_solver_status='not_run'),_complete_context=deepcopy(context))
     publish(root, commit)
     return root, commit, data
 
@@ -166,16 +145,16 @@ def replace_complex(handle, path, value):
 
 
 def diagnose(archive, **kwargs):
-    root, _, _ = archive
+    root, commit, _ = archive
     a = api()
     limits = kwargs.pop('limits', a.EquilibriumReadLimits(maximum_io_bytes=32 * 1024 * 1024))
-    report = a.diagnose_stored_equilibrium(root / 'commit.json', expected_identity=IDENTITY,
-        limits=limits, **kwargs)
+    selected=commit['_selected']
+    with StateReader(commit['_native_root'], state_ref=selected, expected_identity=selected['identity']) as reader:
+        report = a.diagnose_stored_equilibrium(reader, observations_ref=commit['_observations'], limits=limits, **kwargs)
     json.dumps(report, allow_nan=False)
     assert 'scientific_accepted' not in report and 'pass' not in report
-    assert report['source']['commit_sha256'] == hashlib.sha256((root / 'commit.json').read_bytes()).hexdigest()
-    assert report['source']['identity'] == IDENTITY
-    assert report['budgets']['sha_bytes'] == (root / 'physics.h5').stat().st_size
+    assert report['source']==selected
+    assert report['budgets']['sha_bytes']==sum((commit['_native_root']/n).stat().st_size for n in ('full.h5','observations.h5','analysis.h5'))
     return report
 
 
@@ -184,6 +163,27 @@ def error(archive, code, **kwargs):
         diagnose(archive, **kwargs)
     assert caught.value.code == code
     return str(caught.value)
+
+
+
+@contextmanager
+def missing_context_oracle(archive):
+    """Unit branch proof; not an admissible missing-context native5 source.
+
+    First exercise the actual schema refusal. A complete literal context then
+    permits the unchanged numerical code to exercise _applicability(None),
+    preserving the former missing-mu/current-bound oracle without bypassing the
+    production metadata guard or inventing defaults for any real input.
+    """
+    with pytest.raises(ContractError) as caught:diagnose(archive)
+    assert caught.value.code=='corrupt_result' and 'physical_models' in str(caught.value)
+    root,commit,_=archive
+    commit['stationary_assessment']['model_context']=deepcopy(commit['_complete_context'])
+    publish(root,commit)
+    original=api()._applicability
+    with patch.object(api(),'_applicability',side_effect=lambda context,inputs,requested:original(None,inputs,requested)):
+        yield
+    del commit['stationary_assessment']['model_context']
 
 
 def test_R01_known_mu_nonunit_weights(archive):
@@ -265,7 +265,7 @@ def test_R04_transpose_one_family(archive):
 
 def test_R05_wrong_matrix_axis_labels(archive):
     mutate(archive, lambda h: h['state_dimensionless/GR/real'].attrs.__setitem__('logical_axis_order', 'E,k,b,a'))
-    error(archive, 'unsupported_layout')
+    error(archive, 'corrupt_result')
 
 
 def test_R06_weights_changed_target_retained(archive):
@@ -342,13 +342,13 @@ def test_R12_nan_weight(archive):
 
 def test_R13_missing_enabled_family(archive):
     mutate(archive, lambda h: h.__delitem__('selfenergy_dimensionless/alloy'))
-    assert 'inconsistent_scattering_inventory' in error(archive, 'invalid_data')
+    assert 'actual five-family projection differs' in error(archive, 'corrupt_result')
 
 
 def test_R14_extra_known_family(archive):
     archive[1]['stationary_assessment']['model_context']['enabled_scattering'].remove('alloy')
     mutate(archive, lambda h: h['numerical_inputs/scattering_alloy'].__setitem__((), 0))
-    assert 'inconsistent_scattering_inventory' in error(archive, 'invalid_data')
+    assert 'actual five-family projection differs' in error(archive, 'corrupt_result')
 
 
 def test_R15_requested_zero_kernel_absent(archive):
@@ -367,23 +367,24 @@ def test_R15_requested_zero_kernel_absent(archive):
 def test_R16_unknown_enabled_name(archive):
     archive[1]['stationary_assessment']['model_context']['enabled_scattering'].append('mystery')
     mutate(archive, lambda h: h.copy('selfenergy_dimensionless/LO', 'selfenergy_dimensionless/mystery'))
-    error(archive, 'unsupported_context')
+    error(archive, 'corrupt_result')
 
 
 def test_R17_duplicate_enabled_name(archive):
     archive[1]['stationary_assessment']['model_context']['enabled_scattering'].append('LO')
     publish(archive[0], archive[1])
-    error(archive, 'invalid_data')
+    error(archive, 'corrupt_result')
 
 
 def test_R18_missing_model_context(archive):
     del archive[1]['stationary_assessment']['model_context']
     publish(archive[0], archive[1])
-    r = diagnose(archive)
-    assert r['applicability']['status'] == 'not_measured'
-    assert r['fdr']['raw']['value'] is None
-    assert r['numbers']['raw']['status'] == 'measured'
-    assert r['currents']['plus']['raw_outward_A_per_m2'] is not None
+    with missing_context_oracle(archive):
+        r = diagnose(archive)
+        assert r['applicability']['status'] == 'not_measured'
+        assert r['fdr']['raw']['value'] is None
+        assert r['numbers']['raw']['status'] == 'measured'
+        assert r['currents']['plus']['raw_outward_A_per_m2'] is not None
 
 
 def test_R19_finite_drive(archive):
@@ -456,41 +457,56 @@ def test_R26_mu_iteration_limit_one(archive):
 
 
 def test_R27_public_scalar_producer_layout(archive):
-    api()
-    with StateReader(archive[0] / 'commit.json', expected_identity=IDENTITY, maximum_io_bytes=32 * 1024 * 1024) as reader:
-        value = reader.read_scalar('inputs/T_L_K')
-        assert value.value == 70 and value.units == 'K' and value.source_identity == IDENTITY
-        before = reader.io_counters['logical_selected_bytes']
-        with pytest.raises(ContractError) as caught:
-            reader.read_scalar('inputs/T_L_K', maximum_bytes=7)
-        assert caught.value.code == 'budget_exceeded'
-        assert reader.io_counters['logical_selected_bytes'] == before
+    from qcl_negf_results.final_observations import FinalObservationsReader
+    import struct
+    a=api();commit=archive[1];selected=commit['_selected']
+    with StateReader(commit['_native_root'],state_ref=selected,expected_identity=selected['identity']) as reader:
+        with FinalObservationsReader(reader,artifact_ref=commit['_observations']) as view:
+            desc=view.describe();tagged=desc.declaration['context']['inputs']['T_L_K']
+            assert tagged==dict(kind='ieee',type='f64',bits=struct.pack('>d',70.).hex())
+            assert desc.source['identity']==selected['identity']
+        with reader._consumer_operation():
+            before=reader.io_counters['logical_selected_bytes']
+            with pytest.raises(ContractError) as caught:
+                a.diagnose_stored_equilibrium(reader,observations_ref=commit['_observations'],
+                    limits=a.EquilibriumReadLimits(maximum_io_bytes=32*1024*1024,maximum_single_read_bytes=7))
+            assert caught.value.code=='budget_exceeded'
+            assert reader.io_counters['logical_selected_bytes']==before
 
 
 def test_R28_public_vectors_producer_layout(archive):
-    api()
-    with StateReader(archive[0] / 'commit.json', expected_identity=IDENTITY) as reader:
-        for name, want in [('energy', E), ('k', [0.2, 0.7]), ('state_index', [0, 1]), ('wE', WE), ('wk', WK)]:
-            value = reader.read_vector(f'grids_dimensionless/{name}', maximum_bytes=128)
-            np.testing.assert_array_equal(value.values, want)
-            assert value.units == '1' and value.source_identity == IDENTITY
+    from qcl_negf_results.final_observations import FinalObservationsReader
+    commit=archive[1];selected=commit['_selected']
+    with StateReader(commit['_native_root'],state_ref=selected,expected_identity=selected['identity']) as reader:
+        with FinalObservationsReader(reader,artifact_ref=commit['_observations']) as view:
+            for name,want in [('energy_scaled',E),('momentum_scaled',[.2,.7]),('state_index',[0,1]),('wE',WE),('wk',WK)]:
+                block=view.read_array(name,(slice(None),),maximum_bytes=128)
+                np.testing.assert_array_equal(block.values,want)
+                assert block.declaration['units']=='1' and block.source['identity']==selected['identity']
+                assert not block.values.flags.writeable
 
 
 def test_R29_public_matrix_reader_regression(archive):
-    api()
-    with StateReader(archive[0] / 'commit.json', expected_identity=IDENTITY) as reader:
-        selection = (slice(1, 3), slice(0, 1), slice(None), slice(None))
-        block = reader.read('state_dimensionless/GR/real', selection)
-        np.testing.assert_array_equal(block.values, archive[2]['GR'][1:3, 0:1].real)
-        assert block.axes == ('E', 'k', 'a', 'b') and block.units == '1' and block.source_identity == IDENTITY
-        np.testing.assert_array_equal(block.coordinates['E'], E[1:3])
-        np.testing.assert_array_equal(block.coordinates['k'], [0.2])
-        np.testing.assert_array_equal(block.coordinates['a'], [0, 1])
-        np.testing.assert_array_equal(block.weights['E'], WE[1:3])
-        np.testing.assert_array_equal(block.weights['k'], WK[:1])
-        with pytest.raises(ContractError) as caught:
-            reader.read('state_dimensionless/GR/real', selection, maximum_bytes=1)
-        assert caught.value.code == 'budget_exceeded'
+    from qcl_negf_results.final_observations import FinalObservationsReader
+    commit=archive[1];selected=commit['_selected']
+    with StateReader(commit['_native_root'],state_ref=selected,expected_identity=selected['identity']) as reader:
+        with FinalObservationsReader(reader,artifact_ref=commit['_observations']) as view:
+            desc=view.describe();declaration=desc.declaration['state_bindings']['green']['retarded']
+            selection=(slice(1,3),slice(0,1),slice(None),slice(None))
+            block=reader.read_array(declaration,selection)
+            np.testing.assert_array_equal(block.values,archive[2]['GR'][1:3,0:1])
+            np.testing.assert_array_equal(block.values.real,archive[2]['GR'][1:3,0:1].real)
+            np.testing.assert_array_equal(block.values.imag,archive[2]['GR'][1:3,0:1].imag)
+            assert block.declaration['order']=='F' and block.declaration['eltype']=='ComplexF64'
+            assert block.source['identity']==selected['identity'] and not block.values.flags.writeable
+            for name,selection,want in [('energy_scaled',(slice(1,3),),E[1:3]),('momentum_scaled',(slice(0,1),),[.2]),
+                    ('state_index',(slice(None),),[0,1]),('wE',(slice(1,3),),WE[1:3]),('wk',(slice(0,1),),WK[:1])]:
+                np.testing.assert_array_equal(view.read_array(name,selection).values,want)
+            with reader._consumer_operation():
+                before=reader.io_counters['logical_selected_bytes']
+                with pytest.raises(ContractError) as caught:reader.read_array(declaration,(slice(1,3),slice(0,1),slice(None),slice(None)),maximum_bytes=1)
+                assert caught.value.code=='budget_exceeded'
+                assert reader.io_counters['logical_selected_bytes']==before
 
 
 def test_R30_energy_axis_cap(archive):
@@ -551,21 +567,30 @@ def test_R33_io_hdf_phase_after_integrity(archive, monkeypatch):
         return record('readinto', stream, len(target), lambda: original_readinto(stream, target))
     monkeypatch.setattr(state._BudgetStream, 'read', read)
     monkeypatch.setattr(state._BudgetStream, 'readinto', readinto)
-    path = archive[0] / 'commit.json'
-    with StateReader(path, expected_identity=IDENTITY, maximum_io_bytes=32 * 1024 * 1024) as reader:
-        assert reader.source['native_verified'] and reader.source['receipt_verified']
-        assert reader.io_counters['sha_bytes'] == archive[1]['artifacts'][0]['bytes']
-        marker = len(records)
-        reader.read('state_dimensionless/GR/real', (slice(4, 5), slice(1, 2), slice(None), slice(None)))
-        selected = next(row for row in records[marker:] if row[0] == 'hdf' and row[3] > 0)
-        cap = selected[1] + selected[2] - 1
+    from qcl_negf_results.final_observations import FinalObservationsReader
+    from qcl_negf_results.state import ResultReadLimits
+    commit=archive[1];ref=commit['_selected']
+    def prepare(reader):
+        with FinalObservationsReader(reader,artifact_ref=commit['_observations']) as view:description=view.describe()
+        declaration=description.declaration['state_bindings']['green']['retarded']
+        reader.describe_array(declaration)
+        assert reader.source.integrity['manifest_verified']
+        assert reader.io_counters['sha_bytes']==sum((commit['_native_root']/n).stat().st_size for n in ('full.h5','observations.h5','analysis.h5'))
+        return declaration
+    with StateReader(commit['_native_root'],state_ref=ref,expected_identity=ref['identity']) as reader, reader._consumer_operation():
+        declaration=prepare(reader)
+        marker=len(records)
+        reader.read_array(declaration,(slice(4,5),slice(1,2),slice(None),slice(None)))
+        selected=next(row for row in records[marker:] if row[0]=='hdf' and row[3]>0)
+        cap=selected[1]+selected[2]-1
     records.clear()
     raw_reads.clear()
-    with StateReader(path, expected_identity=IDENTITY, maximum_io_bytes=cap) as reader:
-        assert reader.source['native_verified'] and reader.source['receipt_verified']
-        assert reader.io_counters['sha_bytes'] == archive[1]['artifacts'][0]['bytes']
-        with pytest.raises(ContractError) as caught:
-            reader.read('state_dimensionless/GR/real', (slice(4, 5), slice(1, 2), slice(None), slice(None)))
+    with StateReader(commit['_native_root'],state_ref=ref,expected_identity=ref['identity'],limits=ResultReadLimits(maximum_io_bytes=cap)) as reader:
+        records.clear();raw_reads.clear()
+        with reader._consumer_operation():
+            declaration=prepare(reader)
+            with pytest.raises(ContractError) as caught:
+                reader.read_array(declaration,(slice(4,5),slice(1,2),slice(None),slice(None)))
         assert caught.value.code == 'budget_exceeded'
         assert reader.io_counters['bytes_read_total'] == sum(row[3] for row in records)
         assert reader.io_counters['bytes_read_total'] == sum(count for _, count in raw_reads)
@@ -574,23 +599,23 @@ def test_R33_io_hdf_phase_after_integrity(archive, monkeypatch):
 
 
 def test_R34_owner_bytes_corrupt(archive):
-    with (archive[0] / 'physics.h5').open('ab') as stream:
+    with (archive[1]['_native_root'] / 'full.h5').open('ab') as stream:
         stream.write(b'corrupt')
     error(archive, 'corrupt_result')
 
 
 def test_R35_expected_attempt_mismatch(archive):
-    a = api()
+    commit=archive[1];selected=commit['_selected'];wrong=dict(selected['identity'],attempt='2')
     with pytest.raises(ContractError) as caught:
-        a.diagnose_stored_equilibrium(archive[0] / 'commit.json', expected_identity={**IDENTITY, 'attempt': 2}, limits=a.EquilibriumReadLimits(maximum_io_bytes=32 * 1024 * 1024))
-    assert caught.value.code == 'corrupt_result'
+        StateReader(commit['_native_root'],state_ref=selected,expected_identity=wrong)
+    assert caught.value.code=='identity_mismatch'
 
 
 def test_R36_receipt_commit_hash_mismatch(archive):
-    receipt = json.loads((archive[0] / 'receipt.json').read_text())
-    receipt['commit_sha256'] = '0' * 64
-    (archive[0] / 'receipt.json').write_bytes(json_bytes(receipt))
-    error(archive, 'corrupt_result')
+    commit=archive[1];selected=deepcopy(commit['_selected']);selected['manifest']['sha256']='0'*64
+    with pytest.raises(ContractError) as caught:
+        StateReader(commit['_native_root'],state_ref=selected,expected_identity=selected['identity'])
+    assert caught.value.code=='corrupt_result'
 
 
 # SCI03-M1: manufactured measurement controls, not a solver equilibrium claim.
@@ -820,7 +845,8 @@ def test_M1_04_missing_mu_precedes_zero_boundary(archive, unavailable, status, r
         mutate(archive, lambda h: replace_complex(h, 'state_dimensionless/A', np.zeros((1, 2, 2, 2), complex)))
     else:
         options['mu_max_iterations'] = 1
-    report = diagnose(archive, **options)
+    with missing_context_oracle(archive) if unavailable=='missing_context' else nullcontext():
+        report = diagnose(archive, **options)
     assert report['mu']['status'] == status and report['mu']['reason'] == reason
     assert report['mu']['value_relative_eV'] is None
     bound = m1_bound_namespace(report)
@@ -839,26 +865,26 @@ def test_M1_04_missing_mu_precedes_zero_boundary(archive, unavailable, status, r
 
 def test_M1_05_additive_healthy_compatibility_and_no_extra_matrix_reads(archive, monkeypatch):
     # Existing nonuniform 5E fixture and its helper arithmetic are unchanged.
-    reads = []
-    original = StateReader.read
-    def read(reader, path, *args, **kwargs):
-        if path.startswith(('state_dimensionless/', 'selfenergy_dimensionless/')):
-            reads.append(path)
-        return original(reader, path, *args, **kwargs)
-    monkeypatch.setattr(StateReader, 'read', read)
-    report = diagnose(archive, mu_algorithm_abs_tol_eV=1e-12)
-    bound = m1_bound_namespace(report)
-    assert bound['spectral_norm']['status'] == 'measured'
-    assert report['fdr']['raw']['value'] < 2e-10
-    assert report['fdr']['normalized']['value'] < 2e-10
-    # Two k planes, one tile; A in both passes, all other matrices once.
-    expected = {f'state_dimensionless/{name}/{part}': (4 if name == 'A' else 2)
-                for name in ('A', 'GR', 'GL', 'GG') for part in ('real', 'imag')}
-    expected.update({f'selfenergy_dimensionless/{family}/{component}/{part}': 2
-                     for family in FAMILIES+BOUNDARIES for component in ('SL', 'SG') for part in ('real', 'imag')})
-    assert set(reads) == set(expected)
-    for path, count in expected.items():
-        assert reads.count(path) == count
+    reads=[]
+    original=StateReader.read_array
+    def read(reader,declaration,*args,**kwargs):
+        path=declaration['dataset']
+        if path.startswith(('/arrays/state_dimensionless/','/arrays/selfenergy_dimensionless/')):reads.append(path)
+        return original(reader,declaration,*args,**kwargs)
+    monkeypatch.setattr(StateReader,'read_array',read)
+    report=diagnose(archive,mu_algorithm_abs_tol_eV=1e-12)
+    bound=m1_bound_namespace(report)
+    assert bound['spectral_norm']['status']=='measured'
+    assert report['fdr']['raw']['value']<2e-10
+    assert report['fdr']['normalized']['value']<2e-10
+    # ComplexF64 carries both components in one actual public read; two k
+    # planes, A in both passes, every other full matrix exactly once.
+    expected={f'/arrays/state_dimensionless/{name}':(4 if name=='A' else 2) for name in ('A','GR','GL','GG')}
+    expected.update({f'/arrays/selfenergy_dimensionless/{family}/{component}':2
+        for family in FAMILIES+BOUNDARIES for component in ('SL','SG')})
+    assert set(reads)==set(expected)
+    for path,count in expected.items():assert reads.count(path)==count
+    assert report['budgets']['logical_two_pass_forecast_bytes']==report['budgets']['logical_selected_bytes']
 
 
 def test_M1_06_bound_scalar_overflow_rejected(archive):
@@ -888,7 +914,7 @@ def test_M1_07_bound_report_cap_is_not_truncated(archive):
 def test_M1_08_missing_boundary_dataset_is_not_zero(archive):
     m1_archive(archive, zero_boundary=True)
     mutate(archive, lambda h: h.__delitem__('selfenergy_dimensionless/embedding_plus'))
-    assert 'incomplete embedding inventory' in error(archive, 'invalid_data')
+    assert 'native array dataset missing' in error(archive, 'corrupt_result')
 
 
 def test_M1_09_literal_f0_table_from_scalar_entries():
@@ -977,3 +1003,274 @@ def test_arithmetic_public_minimum_subnormal_not_false_zero(archive):
     for variant in ('raw', 'normalized'):
         row = result['rows']['plus'][variant]
         assert row['current_real']['upper'] > 0 and row['rhs']['upper'] > 0
+
+
+# New native5 I/O controls: independent literal operands remain above unchanged.
+def test_B2_asymmetric_complex_E_k_a_b_binding_NB1(archive):
+    data=archive[2];gr=data['GR'].copy();gr[:,1,0,1]+=.07+.13j;gr[::2,0,1,0]-=.02j
+    mutate(archive,lambda h:replace_complex(h,'state_dimensionless/GR',gr))
+    expected_n=-1j*(gr@data['SL']@gr.conj().swapaxes(-1,-2))
+    expected_p=1j*(gr@data['SG']@gr.conj().swapaxes(-1,-2))
+    report=diagnose(archive,mu_algorithm_abs_tol_eV=1e-12)
+    assert report['numbers']['raw']['value_dimensionless']==pytest.approx(number(expected_n),abs=3e-15)
+    assert report['numbers']['raw_empty']['value_dimensionless']==pytest.approx(number(expected_p),abs=3e-15)
+    expected=norm2(expected_n+1j*data['GL'])+norm2(expected_p-1j*data['GG'])
+    assert report['fdr']['raw']['numerator_squared']==pytest.approx(expected,rel=2e-10)
+    assert abs(number(expected_n)-number(expected_n[:,::-1]))>1e-6
+
+
+def test_B2_actual_nonlexicographic_family_order_and_EE_cap(archive,monkeypatch):
+    commit=archive[1];order=['alloy','electron_electron','IFR','impurity','LO','acoustic']
+    commit['_family_order']=order
+    commit['stationary_assessment']['model_context']['enabled_scattering']=[n for n in order if n!='electron_electron']
+    commit['stationary_assessment']['model_context']['physical_models']['electron_electron']['mode']='closure'
+    mutate(archive,lambda h:h.copy('selfenergy_dimensionless/LO','selfenergy_dimensionless/electron_electron'))
+    assert 'channel cap' in error(archive,'budget_exceeded')
+    reads=[];original=StateReader.read_array
+    def read(reader,declaration,*args,**kwargs):
+        path=declaration['dataset']
+        if path.endswith('/SL') and '/selfenergy_dimensionless/' in path:reads.append(path.split('/')[-2])
+        return original(reader,declaration,*args,**kwargs)
+    monkeypatch.setattr(StateReader,'read_array',read)
+    report=diagnose(archive,limits=api().EquilibriumReadLimits(maximum_io_bytes=32*1024*1024,maximum_channels=6))
+    assert report['source_context']['enabled_scattering']==order
+    assert reads==(order+['embedding_total','embedding_plus','embedding_minus'])*2
+    expected=-1j*(archive[2]['GR']@(1.1*archive[2]['SL'])@archive[2]['GR'].conj().swapaxes(-1,-2))
+    assert report['numbers']['raw']['value_dimensionless']==pytest.approx(number(expected),abs=3e-15)
+    assert report['applicability']==dict(status='unsupported_context',reason='unsupported_electron_electron_closure')
+    assert report['mu']['value_relative_eV'] is None
+
+
+@pytest.mark.parametrize('kind', ['single','chunk'])
+def test_B2_complex_plane_and_chunk_admission_before_numeric_read(archive,kind):
+    commit=archive[1];ref=commit['_selected'];a=api()
+    options={'maximum_single_read_bytes':127} if kind=='single' else {'maximum_chunk_uncompressed_bytes':63}
+    with StateReader(commit['_native_root'],state_ref=ref,expected_identity=ref['identity']) as reader:
+        previous=reader.limits
+        with pytest.raises(ContractError) as caught:a.diagnose_stored_equilibrium(reader,observations_ref=commit['_observations'],
+            limits=a.EquilibriumReadLimits(maximum_io_bytes=32*1024*1024,**options))
+        assert caught.value.code=='budget_exceeded'
+        assert reader.io_counters['logical_selected_bytes']==0
+        assert reader.limits is previous and reader._shared_budget is None and not reader._closed
+
+
+def test_B2_contiguous_storage_streams_under_tiny_chunk_cap(archive):
+    archive[1]['_chunks']=None;publish(archive[0],archive[1])
+    report=diagnose(archive,limits=api().EquilibriumReadLimits(maximum_io_bytes=32*1024*1024,
+        maximum_chunk_uncompressed_bytes=1,maximum_single_read_bytes=128))
+    assert report['budgets']['energy_tile_nodes']==1
+    assert report['numbers']['raw']['value_dimensionless']==pytest.approx(number(-1j*archive[2]['GL']),abs=2e-15)
+    assert report['budgets']['logical_two_pass_forecast_bytes']==report['budgets']['logical_selected_bytes']
+
+
+def test_B2_Int64_spin_tag_cannot_exceed_actual_domain(archive):
+    from consumer_context_fixture import change
+    c=archive[1]
+    change(c['_native_root'],c['_selected'],c['_observations'],lambda v:v['context']['inputs']['g_s'].update(decimal=str(2**63)))
+    # Published exact Int64 schema rejects before numeric payload selection.
+    error(archive,'corrupt_result')
+
+
+@pytest.mark.parametrize('mode', ['cancel','after_last_read','during_read'])
+def test_B2_operation_source_guard_cleanup_and_cancellation(archive,monkeypatch,mode):
+    c=archive[1];ref=c['_selected'];a=api();fired=[]
+    def mutate_owner():
+        path=c['_native_root']/'full.h5';data=bytearray(path.read_bytes());data[-1]^=1;path.write_bytes(data);fired.append(True)
+    if mode=='after_last_read':
+        original=a._represented_current_bound
+        def bound(*args,**kwargs):
+            result=original(*args,**kwargs);mutate_owner();return result
+        monkeypatch.setattr(a,'_represented_current_bound',bound)
+    else:
+        original=h5py.Dataset.__getitem__
+        def read(dataset,key):
+            if dataset.name=='/arrays/state_dimensionless/GR':
+                if mode=='cancel':fired.append(True);raise KeyboardInterrupt('literal cancellation')
+                value=original(dataset,key);mutate_owner();return value
+            return original(dataset,key)
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',read)
+    with StateReader(c['_native_root'],state_ref=ref,expected_identity=ref['identity']) as reader:
+        previous=reader.limits
+        if mode=='cancel':
+            with pytest.raises(KeyboardInterrupt,match='literal cancellation'):
+                a.diagnose_stored_equilibrium(reader,observations_ref=c['_observations'],limits=a.EquilibriumReadLimits(maximum_io_bytes=32*1024*1024))
+        else:
+            with pytest.raises(ContractError) as caught:
+                a.diagnose_stored_equilibrium(reader,observations_ref=c['_observations'],limits=a.EquilibriumReadLimits(maximum_io_bytes=32*1024*1024))
+            assert caught.value.code=='source_changed'
+        assert fired and reader.limits is previous and reader._shared_budget is None and not reader._closed
+
+
+def test_B2_parent_metadata_and_numeric_reads_share_one_owner_allowance(tmp_path,monkeypatch):
+    from test_native_provenance import _completed_fixture
+    from qcl_negf_results import state
+    ref,observations,_,_,_,_=_completed_fixture(tmp_path)
+    with StateReader(tmp_path,state_ref=ref,expected_identity=ref['identity']) as reader:
+        deliveries=[];budgets=set();account=state._IOBudget.account
+        def counted(budget,count):
+            account(budget,count);budgets.add(id(budget));deliveries.append(count)
+        monkeypatch.setattr(state._IOBudget,'account',counted)
+        result=api().diagnose_stored_equilibrium(reader,observations_ref=observations,
+            limits=api().EquilibriumReadLimits(maximum_io_bytes=32*1024*1024))
+        assert len(budgets)==1 and result['budgets']['bytes_read_total']==sum(deliveries)
+        assert result['source_evidence']['restoration']['parent_state']['identity']['attempt']=='1'
+        assert result['source_evidence']['original']['fields']['original_status']['value']=='invalid'
+        assert result['source_evidence']['current']['scientific_accepted'] is None
+        required=result['budgets']['bytes_read_total']
+    with StateReader(tmp_path,state_ref=ref,expected_identity=ref['identity']) as reader:
+        with pytest.raises(ContractError) as caught:api().diagnose_stored_equilibrium(reader,observations_ref=observations,
+            limits=api().EquilibriumReadLimits(maximum_io_bytes=required-1))
+        assert caught.value.code=='budget_exceeded'
+        assert reader.io_counters['bytes_read_total']<=required-1
+
+
+@pytest.mark.parametrize('cap', [1,8])
+@pytest.mark.parametrize('target,fault', [('observations','replace'),('diagnostics','unlink'),
+    ('checkpoint','modify'),('manifest','replace'),('plan','unlink'),('model','modify'),
+    ('parent_manifest','replace'),('parent_checkpoint','unlink')])
+def test_B2_F1_all_consumed_bindings_survive_owner_eviction(tmp_path,monkeypatch,cap,target,fault):
+    from qcl_negf_results.state import ResultReadLimits
+    if target.startswith('parent_'):
+        from test_native_provenance import _completed_fixture
+        root=tmp_path/'completed';selected,observations,value,_,_,parent=_completed_fixture(root)
+        parent_manifest=json.loads((root/parent['manifest']['path']).read_bytes())
+        paths={'parent_manifest':parent['manifest']['path'],'parent_checkpoint':parent_manifest['checkpoint']['path']}
+    else:
+        fixture=archive.__wrapped__(tmp_path);c=fixture[1]
+        root,selected,observations,value=c['_native_root'],c['_selected'],c['_observations'],c['_value']
+        paths={'observations':observations['path'],'diagnostics':value['diagnostics']['path'],
+            'checkpoint':value['checkpoint']['path'],'manifest':selected['manifest']['path'],
+            'plan':value['request']['plan']['path'],'model':value['request']['model']['path']}
+    path=root/paths[target];events=[];original=api()._represented_current_bound
+    def bound(*args,**kwargs):
+        result=original(*args,**kwargs)
+        before=path.stat();payload=path.read_bytes()
+        if fault=='replace':path.rename(path.with_name(path.name+'.retained'));path.write_bytes(payload)
+        elif fault=='unlink':path.unlink()
+        else:
+            changed=bytearray(payload);changed[-1]^=1;path.write_bytes(changed)
+        events.append((before.st_ino,None if not path.exists() else path.stat().st_ino))
+        return result
+    monkeypatch.setattr(api(),'_represented_current_bound',bound)
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity'],limits=ResultReadLimits(maximum_open_files=cap)) as reader:
+        # Exercise the actual cached checkpoint/ancestor proof, not a cold-only fix.
+        reader.checkpoint();previous=reader.limits
+        with pytest.raises(ContractError) as caught:
+            api().diagnose_stored_equilibrium(reader,observations_ref=observations,
+                limits=api().EquilibriumReadLimits(maximum_io_bytes=32*1024*1024))
+        assert caught.value.code=='source_changed'
+        assert events and len(reader._handles)<=cap
+        assert reader.limits is previous and reader._shared_budget is None and not reader._closed
+        assert getattr(reader._budget,'_source_guard',None) is None
+
+
+@pytest.mark.parametrize('cap', [1,8])
+def test_B2_F1_healthy_coldwarm_and_cancellation_keep_one_owner(tmp_path,monkeypatch,cap):
+    from qcl_negf_results.state import ResultReadLimits
+    fixture=archive.__wrapped__(tmp_path);c=fixture[1];selected=c['_selected'];a=api()
+    with StateReader(c['_native_root'],state_ref=selected,expected_identity=selected['identity'],limits=ResultReadLimits(maximum_open_files=cap)) as reader:
+        previous=reader.limits
+        def call():return a.diagnose_stored_equilibrium(reader,observations_ref=c['_observations'],limits=a.EquilibriumReadLimits(maximum_io_bytes=32*1024*1024))
+        cold=call();warm=call()
+        for key in ('source','source_evidence','mu','fdr','numbers','currents','represented_current_bound','corrections','spectral'):
+            assert cold[key]==warm[key]
+        assert cold['numbers']['raw']['value_dimensionless']==pytest.approx(number(-1j*fixture[2]['GL']),abs=2e-15)
+        assert len(reader._handles)<=cap and reader.limits is previous and reader._shared_budget is None
+        original=a._represented_current_bound
+        def cancel(*args,**kwargs):original(*args,**kwargs);raise KeyboardInterrupt('F1 final cancellation')
+        with monkeypatch.context() as patcher:
+            patcher.setattr(a,'_represented_current_bound',cancel)
+            with pytest.raises(KeyboardInterrupt,match='F1 final cancellation'):call()
+        assert reader.limits is previous and reader._shared_budget is None and not reader._closed
+        assert getattr(reader._budget,'_source_guard',None) is None
+        assert call()['numbers']==cold['numbers']
+
+
+@pytest.mark.parametrize('cap', [1,8])
+def test_B2_F1_binding_workspace_and_cache_metadata_are_charged_before_numeric_read(tmp_path,monkeypatch,cap):
+    from qcl_negf_results.state import ResultReadLimits, _metadata_weight
+    fixture=archive.__wrapped__(tmp_path);c=fixture[1];selected=c['_selected'];a=api();samples=[]
+    with StateReader(c['_native_root'],state_ref=selected,expected_identity=selected['identity'],limits=ResultReadLimits(maximum_open_files=cap)) as reader:
+        previous=reader.limits;original=a._represented_current_bound
+        def inspect_guard(*args,**kwargs):
+            guard=reader._budget._source_guard;book=reader._metadata_bindings
+            assert _metadata_weight(guard)<=guard['weight']
+            assert _metadata_weight(book)<=book['weight']
+            samples.append(reader._source_stability_bytes())
+            return original(*args,**kwargs)
+        monkeypatch.setattr(a,'_represented_current_bound',inspect_guard)
+        result=a.diagnose_stored_equilibrium(reader,observations_ref=c['_observations'],limits=a.EquilibriumReadLimits(
+            maximum_io_bytes=32*1024*1024,energy_tile_nodes=1))
+        assert samples and 0<samples[0]<result['budgets']['workspace_forecast_bytes']
+        # Admit more than the old numeric-only minimum, but less than the
+        # complete plane plus its trace. A margin avoids incidental Python int
+        # aliasing changes when the limit itself changes the guard header.
+        with pytest.raises(ContractError) as caught:
+            a.diagnose_stored_equilibrium(reader,observations_ref=c['_observations'],limits=a.EquilibriumReadLimits(
+                maximum_io_bytes=32*1024*1024,energy_tile_nodes=1,
+                maximum_workspace_bytes=result['budgets']['workspace_forecast_bytes']-samples[0]//2))
+        assert caught.value.code=='budget_exceeded' and reader.io_counters['logical_selected_bytes']==0
+        assert reader.limits is previous and reader._shared_budget is None and reader._budget._source_guard is None
+        assert not reader._closed and len(reader._handles)<=cap
+
+
+from result_v2_fixture import producer_root as producer_root
+
+
+@pytest.mark.parametrize('cap', [1,8])
+@pytest.mark.parametrize('dependency', ['ancestor_record','ancestor_catalog'])
+def test_B2_F1_cached_actual_parent_witness_keeps_original_read_binding(tmp_path,producer_root,cap,dependency):
+    from qcl_negf_results.state import ResultReadLimits
+    from result_v2_fixture import producer_state, copy_constructor_closure
+    selected=producer_state(producer_root,'child');root=tmp_path/'copied-closure'
+    copy_constructor_closure(producer_root,root,selected)
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity'],limits=ResultReadLimits(maximum_open_files=cap)) as reader:
+        checkpoint=reader.checkpoint();assert checkpoint['witness_targets']
+        if dependency=='ancestor_record':path=root/checkpoint['witness_targets'][0]['locator']['leaf']['path']
+        else:
+            manifest=json.loads((root/selected['manifest']['path']).read_bytes())
+            parent=manifest['lineage']['parent_state'];parent_manifest=json.loads((root/parent['manifest']['path']).read_bytes())
+            path=root/parent_manifest['history']['head']['path']
+        previous=reader.limits;before=path.stat();payload=path.read_bytes()
+        with pytest.raises(ContractError) as caught:
+            with reader._consumer_operation(32*1024*1024,verify_source_stability=True,maximum_stability_bytes=32*1024*1024):
+                assert reader.checkpoint()==checkpoint
+                assert reader.io_counters['bytes_read_total']==0, 'cached proof must not trigger prefix/hash replay'
+                assert reader._source_stability_bytes(seal=True)>0
+                path.rename(path.with_name(path.name+'.original'));path.write_bytes(payload)
+                assert path.stat().st_ino!=before.st_ino
+        assert caught.value.code=='source_changed'
+        assert reader.limits is previous and reader._shared_budget is None and reader._budget._source_guard is None
+        assert not reader._closed and len(reader._handles)<=cap
+
+
+@pytest.mark.parametrize('cap', [1,8])
+@pytest.mark.parametrize('target', ['plan','parent_manifest'])
+def test_B2_F1_actual_FD_binding_precedes_postread_path_replacement(tmp_path,monkeypatch,cap,target):
+    import os
+    from qcl_negf_results import state
+    from qcl_negf_results.state import ResultReadLimits
+    if target=='parent_manifest':
+        from test_native_provenance import _completed_fixture
+        root=tmp_path/'completed';selected,observations,value,_,_,parent=_completed_fixture(root)
+        path=root/parent['manifest']['path']
+    else:
+        fixture=archive.__wrapped__(tmp_path);c=fixture[1]
+        root,selected,observations,value=c['_native_root'],c['_selected'],c['_observations'],c['_value']
+        path=root/value['request']['plan']['path']
+    original=state._BudgetStream.read;inode=path.stat().st_ino;events=[]
+    def read(stream,size=-1):
+        bound=os.fstat(stream._raw.fileno()).st_ino
+        payload=original(stream,size)
+        if bound==inode and not events:
+            path.rename(path.with_name(path.name+'.original'));path.write_bytes(payload)
+            events.append((bound,path.stat().st_ino))
+        return payload
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity'],limits=ResultReadLimits(maximum_open_files=cap)) as reader:
+        previous=reader.limits;monkeypatch.setattr(state._BudgetStream,'read',read)
+        with pytest.raises(ContractError) as caught:
+            api().diagnose_stored_equilibrium(reader,observations_ref=observations,limits=api().EquilibriumReadLimits(maximum_io_bytes=32*1024*1024))
+        assert caught.value.code=='source_changed' and events and events[0][0]!=events[0][1]
+        assert reader.io_counters['logical_selected_bytes']==0
+        assert reader.limits is previous and reader._shared_budget is None and reader._budget._source_guard is None
+        assert not reader._closed

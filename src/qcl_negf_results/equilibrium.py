@@ -7,16 +7,18 @@ No solver, Julia import, inferred model defaults or scientific tolerance.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass, fields
+from dataclasses import dataclass, fields, replace
+from contextlib import contextmanager
 import json
 import math
-from pathlib import Path
+import struct
 from typing import Any, Mapping
 
 import numpy as np
 
 from qcl_negf_contracts.messages import ContractError
-from .state import StateReader
+from .state import StateReader, Document
+from .final_observations import FinalObservationsReader
 from ._equilibrium_arithmetic import (
     EquilibriumArithmeticLimits, _Enclosure, _Budget, _Invalid, _report as _arithmetic_report,
 )
@@ -199,35 +201,41 @@ def _plain(value: Any) -> Any:
     return value
 
 
-def _layout(reader: StateReader, path: str, limits: EquilibriumReadLimits) -> Any:
-    desc = reader.describe(path)
-    if desc.object_kind != 'dataset' or desc.dtype.hasobject or desc.dtype.kind not in 'biuf':
-        _error(f'fixed-width real numeric storage required: {path}', 'unsupported_layout')
-    if desc.filters and any(filter_id not in (1, 2, 3) for filter_id in desc.filters):
-        _error(f'unsupported HDF5 filter: {path}', 'unsupported_layout')
-    if desc.chunks is not None and math.prod(desc.chunks) * desc.itemsize > limits.maximum_chunk_uncompressed_bytes:
-        _error(f'uncompressed HDF5 chunk exceeds byte cap: {path}', 'budget_exceeded')
-    return desc
-
-
-def _scalar(reader: StateReader, path: str, units: str, limits: EquilibriumReadLimits,
-            *, integer: bool = False, flag: bool = False) -> float | int | bool:
-    desc = _layout(reader, path, limits)
-    if desc.shape != () or desc.units != units:
-        _error(f'scalar rank/units mismatch: {path}', 'unsupported_layout')
-    if integer and desc.dtype.kind not in 'iu':
-        _error(f'exact integer storage required: {path}')
-    value = reader.read_scalar(path, maximum_bytes=min(64, limits.maximum_single_read_bytes)).value
-    _finite(value, path)
-    if flag:
-        if type(value) not in (bool, int) or value not in (0, 1):
-            _error(f'boolean/0-or-1 scalar required: {path}')
-        return bool(value)
+def _tag_number(value, locator, *, integer=False):
+    """Decode only the mandatory public O1 numeric grammar, without defaults."""
     if integer:
-        return int(value)
-    if type(value) is bool:
-        _error(f'physical scalar cannot be boolean: {path}')
-    return float(value)
+        if not isinstance(value,Mapping) or value.get('kind')!='integer' or value.get('type')!='Int64':
+            _error('exact Int64 required: '+locator)
+        spelling=value['decimal']
+        if not isinstance(spelling,str) or len(spelling)>20:
+            _error('exact Int64 outside actual domain: '+locator)
+        result=int(spelling)
+        if not -2**63<=result<2**63:
+            _error('exact Int64 outside actual domain: '+locator)
+        return result
+    if not isinstance(value,Mapping) or value.get('kind')!='ieee' or value.get('type')!='f64':
+        _error('exact Float64 tag required: '+locator)
+    return float(_finite(struct.unpack('>d',bytes.fromhex(value['bits']))[0],locator))
+
+
+def _chunk_layout(dataset, limits, locator):
+    # Geometry comes from the already authenticated same-owner dataset. Values
+    # are still read exclusively through the existing public raw reader APIs.
+    if dataset.chunks is not None and math.prod(dataset.chunks)*dataset.dtype.itemsize > limits.maximum_chunk_uncompressed_bytes:
+        _error('uncompressed HDF5 chunk exceeds byte cap: '+locator, 'budget_exceeded')
+
+
+@contextmanager
+def _stored_source(reader, observations_ref, limits):
+    previous=reader.limits
+    with reader._consumer_operation(limits.maximum_io_bytes, verify_source_stability=True,
+                                    maximum_stability_bytes=limits.maximum_workspace_bytes):
+        try:
+            reader.limits=replace(previous,maximum_array_bytes=min(previous.maximum_array_bytes,limits.maximum_single_read_bytes))
+            with FinalObservationsReader(reader,artifact_ref=observations_ref) as view:
+                yield view,view.describe()
+        finally:
+            reader.limits=previous
 
 
 def _applicability(context: Any, inputs: Mapping[str, Any], requested: Mapping[str, bool]) -> dict[str, Any]:
@@ -341,103 +349,73 @@ def _fit_mu(q: np.ndarray, energies: np.ndarray, target: float, kt: float, e0: f
     return report
 
 
-def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: Mapping[str, Any],
+def diagnose_stored_equilibrium(reader: StateReader, *, observations_ref: Document,
         limits: EquilibriumReadLimits, mu_algorithm_abs_tol_eV: float | None = None,
         mu_max_iterations: int = 128,
         arithmetic_limits: EquilibriumArithmeticLimits | None = None) -> dict[str, Any]:
-    """Two bounded passes over stored full matrices; no acceptance inference.
+    """Two bounded passes over exact O1-bound native5 full matrices.
 
-    Raw correlations use exactly the stored dictionary plus embedding_total.
-    Each boundary flux has an outward sign (electron flow, not charge current).
-    The finite common-mu fit is a construction, not an equilibrium verdict.
+    Every actual CP family plus embedding.total is used exactly once; stored
+    observables or a requested flag never replace the independent arithmetic.
     """
-    raise ContractError('native5 equilibrium view requires owning analysis followup', 'capability_unavailable')
+    if not isinstance(reader,StateReader):
+        raise TypeError('explicit selected StateReader required')
     if not isinstance(limits, EquilibriumReadLimits):
         raise TypeError('limits must be EquilibriumReadLimits')
-    if not isinstance(expected_identity, Mapping) or not expected_identity:
-        raise ValueError('explicit nonempty expected_identity is required')
     if type(mu_max_iterations) is not int or not 1 <= mu_max_iterations <= 128:
         raise ValueError('mu_max_iterations must be an integer from 1 to 128')
     if mu_algorithm_abs_tol_eV is not None and (type(mu_algorithm_abs_tol_eV) not in (int, float)
             or not math.isfinite(mu_algorithm_abs_tol_eV) or mu_algorithm_abs_tol_eV <= 0):
         raise ValueError('mu_algorithm_abs_tol_eV must be finite and positive')
-    with StateReader(commit_path, expected_identity=expected_identity, maximum_io_bytes=limits.maximum_io_bytes) as reader:
-        source = reader.source
-        if (source['storage_class'] != 'archive' or source['owner']['schema'] != 'qcl-negf-physics-v4'
-                or not source['receipt_verified'] or source['state_id'] is None):
-            _error('requires immutable final archive physics.full and local receipt', 'unsupported_context')
-        dimensions = {name: _scalar(reader, 'numerical_inputs/' + name, '1', limits, integer=True) for name in ('NE', 'Nk', 'Nb')}
-        ne, nk, nb = (dimensions[name] for name in ('NE', 'Nk', 'Nb'))
-        for size, maximum in ((ne, limits.maximum_energy_nodes), (nk, limits.maximum_momentum_nodes), (nb, limits.maximum_basis_states)):
-            if size < 1:
-                _error('nonpositive represented dimension')
-            if size > maximum:
-                _error('represented dimension exceeds engineering cap', 'budget_exceeded')
-        scalar_units = {'E0_eV': 'eV', 'L0_m': 'm', 'J0_A_per_m2': 'A/m^2'}
-        scales = {name: _scalar(reader, 'scales/' + name, units, limits) for name, units in scalar_units.items()}
-        if any(value <= 0 for value in scales.values()):
-            _error('scales must be finite and positive')
-        input_units = {'F_bias_V_per_m': 'V/m', 'V_period_V': 'V', 'T_L_K': 'K', 'T_LO_K': 'K',
-            'E_ref_eV': 'eV', 'N_dop_2D_per_m2': 'm^-2', 'f_ion': '1'}
-        inputs = {name: _scalar(reader, 'inputs/' + name, units, limits) for name, units in input_units.items()}
-        gs = _scalar(reader, 'inputs/spin_degeneracy', '1', limits, integer=True)
-        if gs < 1 or inputs['T_L_K'] <= 0:
-            _error('positive spin degeneracy and lattice temperature required')
-        requested = {name: _scalar(reader, 'numerical_inputs/scattering_' + name, '1', limits, flag=True) for name in _SCATTERING}
-        assessment = reader.commit.get('stationary_assessment')
-        context = assessment.get('model_context') if isinstance(assessment, Mapping) else None
-        inventory = reader.describe('selfenergy_dimensionless', maximum_children=16)
-        if inventory.object_kind != 'group':
-            _error('selfenergy inventory must be a group', 'unsupported_layout')
-        stored = set(inventory.child_names)
-        if stored - set(_SCATTERING + _EMBEDDING):
-            _error('unknown stored selfenergy family', 'unsupported_context')
-        if not set(_EMBEDDING) <= stored:
-            _error('incomplete embedding inventory')
-        enabled = sorted(stored - set(_EMBEDDING))
-        if isinstance(context, Mapping):
-            explicit = context.get('enabled_scattering')
-            if explicit is None:
-                context = None  # missing context remains unavailable, never default-inferred
-            else:
-                if not isinstance(explicit, list) or any(not isinstance(name, str) for name in explicit):
-                    _error('invalid enabled scattering list')
-                if len(set(explicit)) != len(explicit):
-                    _error('duplicate enabled scattering name')
-                if set(explicit) - set(_SCATTERING):
-                    _error('unknown enabled scattering family', 'unsupported_context')
-                if set(enabled) != set(explicit) or any(not requested[name] for name in explicit):
-                    _error('inconsistent_scattering_inventory')
-                enabled = list(explicit)
-        if len(enabled) > limits.maximum_channels:
-            _error('channel cap exceeded', 'budget_exceeded')
-        # Even without model context, a stored known family cannot contradict a
-        # false requested flag. Its actual dictionary is used for raw numbers.
-        if any(not requested[name] for name in enabled):
-            _error('inconsistent_scattering_inventory')
-        applicability = _applicability(context, inputs, requested)
-        vector_sizes = {'energy': ne, 'wE': ne, 'k': nk, 'wk': nk, 'state_index': nb}
-        descriptions = {}
-        for name, count in vector_sizes.items():
-            path = 'grids_dimensionless/' + name
-            desc = _layout(reader, path, limits)
-            if desc.shape != (count,) or desc.units != '1':
-                _error(f'grid/weight rank or units mismatch: {path}', 'unsupported_layout')
-            if name == 'state_index' and desc.dtype.kind not in 'iu':
-                _error('state_index must have integer storage', 'unsupported_layout')
-            if desc.itemsize != 8:
-                _error('grid/weight requires binary64 or int64 storage', 'unsupported_layout')
-            descriptions[path] = desc
-        complex_paths = ['state_dimensionless/' + name for name in ('A', 'GR', 'GL', 'GG')]
-        complex_paths += [f'selfenergy_dimensionless/{name}/{part}' for name in (*enabled, *_EMBEDDING) for part in ('SL', 'SG')]
-        for base in complex_paths:
-            for component in ('real', 'imag'):
-                path = base + '/' + component
-                desc = _layout(reader, path, limits)
-                if (desc.shape != (ne, nk, nb, nb) or desc.dtype.kind != 'f' or desc.itemsize != 8
-                        or desc.axes != ('E', 'k', 'a', 'b') or desc.units != '1' or desc.coordinate_paths != _COORDINATES):
-                    _error(f'unsupported matrix shape/dtype/axes/units/coordinate linkage: {path}', 'unsupported_layout')
-                descriptions[path] = desc
+    with _stored_source(reader,observations_ref,limits) as (observations,description):
+        value=description.declaration;context_raw=value['context']
+        dimensions={name:int(context_raw['dimensions'][name]) for name in ('NE','Nk','Nb')}
+        ne,nk,nb=(dimensions[name] for name in ('NE','Nk','Nb'))
+        for size,maximum in ((ne,limits.maximum_energy_nodes),(nk,limits.maximum_momentum_nodes),(nb,limits.maximum_basis_states)):
+            if size<1:_error('nonpositive represented dimension')
+            if size>maximum:_error('represented dimension exceeds engineering cap','budget_exceeded')
+        scales={name:_tag_number(context_raw['scales'][name],name) for name in ('E0_eV','L0_m','J0_A_per_m2')}
+        if any(n<=0 for n in scales.values()):_error('scales must be finite and positive')
+        inputs={name:_tag_number(context_raw['inputs'][name],name) for name in
+            ('F_bias_V_per_m','V_period_V','T_L_K','T_LO_K','E_ref_eV','N_dop_2D_per_m2','f_ion')}
+        gs=_tag_number(context_raw['inputs']['g_s'],'g_s',integer=True)
+        if gs<1 or inputs['T_L_K']<=0:_error('positive spin degeneracy and lattice temperature required')
+        requested=dict(value['request']['scattering_requested'])
+        models=context_raw['physical_models']['fields']
+        context=dict(boundary_condition=context_raw['boundary_condition'],
+            basis_contract='orthonormal finite projected basis' if context_raw['basis_contract']=='orthonormal_finite_projected' else context_raw['basis_contract'],
+            physical_models=dict(lo_population=models['lo_population']['value'],
+                electron_electron=dict(mode=models['electron_electron']['fields']['mode']['value'])),
+            enabled_scattering=[row['family'] for row in value['state_bindings']['scattering']])
+        enabled=context['enabled_scattering']
+        if len(enabled)>limits.maximum_channels:_error('channel cap exceeded','budget_exceeded')
+        applicability=_applicability(context,inputs,requested)
+        assessment=value['summary']
+        stored_evidence=dict(original=_plain(description.original_evidence),current=_plain(value['summary']),restoration=_plain(value['restoration']))
+        vector_sizes={'energy':ne,'wE':ne,'k':nk,'wk':nk,'state_index':nb}
+        vector_names=dict(energy='energy_scaled',wE='wE',k='momentum_scaled',wk='wk',state_index='state_index')
+        descriptions={}
+        for name,count in vector_sizes.items():
+            stored=vector_names[name];desc=observations.describe_array(stored)
+            if desc.logical_shape!=(count,) or desc.eltype!=('Int64' if name=='state_index' else 'Float64'):
+                _error('grid/weight shape or type differs: '+stored,'unsupported_layout')
+            _,dataset=observations._array(stored)
+            _chunk_layout(dataset,limits,stored)
+            descriptions[stored]=desc
+        bindings=value['state_bindings']
+        matrices={'state_dimensionless/'+name:bindings['green'][field] for name,field in
+            [('A','spectral'),('GR','retarded'),('GL','lesser'),('GG','greater')]}
+        for row in bindings['scattering']:
+            for part,field in [('SL','lesser'),('SG','greater')]:matrices['selfenergy_dimensionless/'+row['family']+'/'+part]=row[field]
+        for side,family in [('total','embedding_total'),('plus','embedding_plus'),('minus','embedding_minus')]:
+            for part,field in [('SL','lesser'),('SG','greater')]:matrices['selfenergy_dimensionless/'+family+'/'+part]=bindings['embedding'][side][field]
+        for name,declaration in matrices.items():
+            desc=reader.describe_array(declaration)
+            if desc.logical_shape!=(ne,nk,nb,nb) or desc.eltype!='ComplexF64' or desc.element_bytes!=16:
+                _error('complete ComplexF64[E,k,a,b] required: '+name,'unsupported_layout')
+            _,dataset=reader._array(declaration)
+            _chunk_layout(dataset,limits,name)
+            descriptions[name]=desc
         # Conservative live-array/scratch forecast. Adaptive tiles retain a
         # complete basis plane; no diagonal-only fallback is permitted.
         vector_scratch = 4096 + 32 * nk + 16 * nb + 512 * len(descriptions)
@@ -445,6 +423,7 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         # accounting covers numeric scratch, not Python/HDF caches or total RSS.
         bound_scratch = 4096 + 8 * 1024
         fixed_workspace = 10 * 8 * ne + vector_scratch + bound_scratch
+        fixed_workspace += reader._source_stability_bytes(seal=True)
         # Eight extra complex tile slots cover at most three live state-defect
         # buffers, or four side-coefficient buffers, plus O(tile) f/1-f and
         # finite-check scratch. State defects are released before side reads;
@@ -454,7 +433,7 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
             _error('complete matrix plane and scratch exceed workspace cap', 'budget_exceeded')
         available_tile = (limits.maximum_workspace_bytes-fixed_workspace) // per_energy_workspace
         single_fixed = 8 * (2 + 2 * nb)
-        available_single = (limits.maximum_single_read_bytes-single_fixed) // (8 * (nb * nb+2))
+        available_single = (min(limits.maximum_single_read_bytes,reader.limits.maximum_array_bytes)-single_fixed) // (16 * (nb * nb+1))
         tile_nodes = min(ne, limits.energy_tile_nodes, available_tile, available_single,
                          1 if arithmetic_limits is not None else ne)
         if tile_nodes < 1:
@@ -480,18 +459,10 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
             except (_Budget, _Invalid) as error:
                 arithmetic_status = 'budget_exceeded' if isinstance(error, _Budget) else 'invalid_data'
                 arithmetic_reason = str(error)
-        # Logical forecast includes duplicate coordinates/weights for each real
-        # and imaginary read, A twice, every other required matrix once.
-        matrix_components = 2 * (5 + 2 * len(enabled) + 6)
-        logical_forecast = reader.io_counters['logical_selected_bytes'] + sum(count * 8 for count in vector_sizes.values())
-        for k in range(nk):
-            for start in range(0, ne, tile_nodes):
-                count = min(tile_nodes, ne-start)
-                logical_forecast += matrix_components * 8 * (count * nb * nb + 2 * count + 2 + 2 * nb)
-        # Logical bytes are a separate forecast; only the physical callback
-        # guard decides actual total I/O admission (including compression).
-        vectors = {name: reader.read_vector('grids_dimensionless/' + name,
-            maximum_bytes=limits.maximum_single_read_bytes).values for name in vector_sizes}
+        # Actual complex bytes: A in both passes, every other matrix once.
+        logical_forecast = reader.io_counters['logical_selected_bytes'] + sum(count*8 for count in vector_sizes.values()) + 16*ne*nk*nb*nb*(11+2*len(enabled))
+        vectors={name:observations.read_array(vector_names[name],(slice(None),),
+            maximum_bytes=reader.limits.maximum_array_bytes).values for name in vector_sizes}
         for name, value in vectors.items():
             _finite(value, name)
         energy, we, momentum, wk, states = (vectors[name] for name in ('energy', 'wE', 'k', 'wk', 'state_index'))
@@ -519,10 +490,9 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
                     yield start, stop, selection, weight
 
         def read_complex(base: str, selection: tuple[slice, ...]) -> np.ndarray:
-            real = reader.read(base + '/real', selection, maximum_bytes=limits.maximum_single_read_bytes).values
-            imag = reader.read(base + '/imag', selection, maximum_bytes=limits.maximum_single_read_bytes).values
-            values = real[:, 0] + 1j * imag[:, 0]
-            return _finite(values, base)
+            values=reader.read_array(matrices[base],selection,
+                maximum_bytes=reader.limits.maximum_array_bytes).values
+            return _finite(values[:,0],base)
 
         # Pass one retains just the energy number weights (compensated over k).
         qtotal = np.zeros(ne, dtype=np.float64)
@@ -652,7 +622,8 @@ def diagnose_stored_equilibrium(commit_path: str | Path, *, expected_identity: M
         budgets = dict(reader.io_counters)
         budgets.update(workspace_forecast_bytes=workspace_forecast, logical_two_pass_forecast_bytes=logical_forecast,
                        energy_tile_nodes=tile_nodes, workspace_scope='numeric arrays and scratch; not total process RSS')
-        report = dict(schema='qcl-negf-stored-equilibrium-diagnostics-v1', source=_plain(reader.source),
+        report = dict(schema='qcl-negf-stored-equilibrium-diagnostics-v1', source=_plain(description.source),
+            source_evidence=stored_evidence,
             source_context=_plain(context), recorded_solver_status={name: _plain(assessment[name]) for name in (
                 'iterative_converged', 'fixed_hartree_converged', 'outer_confirmation_count', 'fixture_solver_status'
                 ) if isinstance(assessment, Mapping) and name in assessment},

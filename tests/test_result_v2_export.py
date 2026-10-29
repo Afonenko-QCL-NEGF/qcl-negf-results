@@ -58,10 +58,12 @@ def test_native5_domain_views_report_capability_without_opening_old_layout(tmp_p
         AnalysisReader(tmp_path/'not-a-native4-layout',expected_identity=IDENTITY)
     with pytest.raises(TypeError,match='StateReader'):
         AnalysisReader(tmp_path/'not-a-native4-layout',artifact_ref=artifact)
-    equilibrium = lambda path, **kw: diagnose_stored_equilibrium(path, limits=EquilibriumReadLimits(maximum_io_bytes=1024*1024), **kw)
-    with pytest.raises(ContractError) as error:
-        equilibrium(tmp_path / 'not-a-native4-layout', expected_identity=IDENTITY)
-    assert error.value.code == 'capability_unavailable'
+    equilibrium = lambda owner, **kw: diagnose_stored_equilibrium(owner, observations_ref={}, limits=EquilibriumReadLimits(maximum_io_bytes=1024*1024), **kw)
+    with pytest.raises(TypeError, match='StateReader'):
+        equilibrium(tmp_path / 'not-a-native4-layout')
+    with StateReader(root, state_ref=selected, expected_identity=selected['identity']) as reader:
+        with pytest.raises(ContractError):
+            equilibrium(reader)
     with pytest.raises(TypeError,match='StateReader'):
         DiagnosticReader(tmp_path / 'not-a-native4-layout')
 
