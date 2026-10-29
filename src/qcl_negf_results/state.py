@@ -91,6 +91,7 @@ class _IOBudget:
         self.hdf_bytes = 0
         self.metadata_bytes = 0
         self.logical_selected_bytes = 0
+        self._source_guard = None
 
     def require(self, count: int) -> None:
         if self.maximum is not None and count > self.maximum - self.bytes_read_total:
@@ -283,7 +284,8 @@ class StateReader:
         self._initialize(artifact_root, state_ref=state_ref, expected_identity=expected_identity, limits=limits)
 
     def _initialize(self, artifact_root, *, state_ref, expected_identity, limits=None,
-                    verified_manifest=None, budget=None, lineage_depth=0):
+                    verified_manifest=None, budget=None, lineage_depth=0, metadata_bindings=None,
+                    metadata_owner=None):
         self.limits = limits or ResultReadLimits()
         if not isinstance(self.limits, ResultReadLimits):
             raise TypeError('limits must be ResultReadLimits')
@@ -301,6 +303,13 @@ class StateReader:
         self._declarations, self._verified_refs = {}, {}
         self._pointer_path, self._pointer_raw = None, None
         self._shared_budget = budget
+        # FD stamps accompany already decoded metadata; they never supply bytes,
+        # resolve a FileRef or substitute for its original hash validation.
+        self._metadata_bindings = (metadata_bindings if metadata_bindings is not None
+            else dict(entries={}, weight=0))
+        if metadata_bindings is None:
+            self._metadata_bindings['weight'] = _metadata_weight(self._metadata_bindings)
+        self._metadata_context_owner = metadata_owner
         self._lineage_depth = lineage_depth
         if lineage_depth > self.limits.maximum_hdf_depth:
             _fail('lineage proof depth exceeds metadata limit', 'budget_exceeded')
@@ -340,26 +349,120 @@ class StateReader:
             item['stream']._budget = self._budget
 
     @contextmanager
-    def _consumer_operation(self, maximum_io_bytes=None, *, maximum_owner_bytes=None):
+    def _consumer_operation(self, maximum_io_bytes=None, *, maximum_owner_bytes=None,
+                            verify_source_stability=False, maximum_stability_bytes=None):
         """One allowance through nested checkpoint/catalog/ancestor operations."""
         self._operation()
         budget, prior = self._budget, self._shared_budget
         prior_owner = getattr(self, '_consumer_owner_limit', None)
-        self._consumer_owner_limit = (maximum_owner_bytes if prior_owner is None else prior_owner
-            if maximum_owner_bytes is None else min(prior_owner,maximum_owner_bytes))
+        prior_guard = budget._source_guard
         maximum = budget.maximum
-        if maximum_io_bytes is not None:
-            if type(maximum_io_bytes) is not int or maximum_io_bytes < 1:
-                raise ValueError('positive consumer I/O allowance required')
-            bound = budget.bytes_read_total + maximum_io_bytes
-            budget.maximum = bound if maximum is None else min(maximum, bound)
-        self._shared_budget = budget
         try:
+            self._consumer_owner_limit = (maximum_owner_bytes if prior_owner is None else prior_owner
+                if maximum_owner_bytes is None else min(prior_owner,maximum_owner_bytes))
+            if maximum_io_bytes is not None:
+                if type(maximum_io_bytes) is not int or maximum_io_bytes < 1:
+                    raise ValueError('positive consumer I/O allowance required')
+                bound = budget.bytes_read_total + maximum_io_bytes
+                budget.maximum = bound if maximum is None else min(maximum, bound)
+            self._shared_budget = budget
+            if verify_source_stability and prior_guard is None:
+                cap = self.limits.maximum_metadata_bytes
+                working = cap
+                if maximum_stability_bytes is not None:
+                    if type(maximum_stability_bytes) is not int or maximum_stability_bytes < 1:
+                        raise ValueError('positive source stability allowance required')
+                    cap = min(cap, maximum_stability_bytes)
+                    working = maximum_stability_bytes
+                header = dict(entries={}, weight=0, maximum=cap, working=working,
+                              source=self._state_ref, root=self._root_stamp)
+                weight = _metadata_weight(header)
+                if weight > cap or weight + self._metadata_bindings['weight'] > working:
+                    _fail('source binding header exceeds allowance', 'budget_exceeded')
+                budget._source_guard = dict(header, weight=weight, source=copy.deepcopy(self._state_ref))
+                del header  # No duplicate temporary header remains across yield.
+                for path, opened in self._metadata_bindings['entries'].items():
+                    self._note_source_binding(path, opened)
             yield budget
+            if verify_source_stability and prior_guard is None:
+                self._check_source_bindings()
         finally:
             self._shared_budget = prior
             self._consumer_owner_limit = prior_owner
             budget.maximum = maximum
+            budget._source_guard = prior_guard
+
+    def _note_source_binding(self, path, opened, *, metadata=False):
+        """Retain an actual authenticated FD stamp, never a later path snapshot."""
+        def charge(book, maximum):
+            old = book['entries'].get(path)
+            if old is not None:
+                if old != opened:
+                    _fail('consumed immutable source binding changed', 'source_changed')
+                return 0
+            # Deep row weight plus 128 B covers the dict slot/growth allowance.
+            # Paths/stamp tuples may be shared; counting them again is conservative.
+            addition = _metadata_weight((path, opened)) + 128
+            if (len(book['entries']) >= self.limits.maximum_catalog_entries
+                    or book['weight'] + addition > maximum):
+                _fail('source binding metadata exceeds allowance', 'budget_exceeded')
+            return addition
+        jobs = []
+        metadata_charge = 0
+        if metadata:
+            if not hasattr(self, '_metadata_bindings'):
+                self._metadata_bindings = dict(entries={}, weight=0)
+                self._metadata_bindings['weight'] = _metadata_weight(self._metadata_bindings)
+            context_owner = getattr(self, '_metadata_context_owner', None) or self
+            names = ('_index_weight', '_known_weight', '_pending_state_weight', '_catalog_size')
+            retained = max(sum(getattr(owner, name, 0) for name in names)
+                           for owner in (self, context_owner))
+            maximum = min(self.limits.maximum_catalog_bytes, context_owner.limits.maximum_catalog_bytes)
+            metadata_charge = charge(self._metadata_bindings, maximum-retained)
+            jobs.append((self._metadata_bindings, metadata_charge))
+        guard = self._budget._source_guard
+        if guard is not None:
+            guard_charge = charge(guard, guard['maximum'])
+            if (guard['weight'] + guard_charge + self._metadata_bindings['weight']
+                    + metadata_charge > guard['working']):
+                _fail('source binding workspace exceeds allowance', 'budget_exceeded')
+            jobs.append((guard, guard_charge))
+        for book, addition in jobs:
+            if addition:
+                book['entries'][path] = opened
+                book['weight'] += addition
+
+    def _source_stability_bytes(self, *, seal=False):
+        guard = self._budget._source_guard
+        if guard is None:
+            return 0
+        if seal:
+            # All matrix owners have already been described. No unforecast new
+            # trace allocation may appear while numerical buffers are retained.
+            guard['maximum'] = guard['weight']
+        return guard['weight'] + self._metadata_bindings['weight']
+
+    def _check_source_bindings(self):
+        from .commits import safe_path
+        guard = self._budget._source_guard
+        if guard is None:
+            return
+        if self._state_ref != guard['source']:
+            _fail('selected operation source changed', 'source_changed')
+        try:
+            if self._root_identity() != guard['root']:
+                _fail('artifact root replaced', 'source_changed')
+            for path, opened in guard['entries'].items():
+                current = safe_path(self.root, path).stat(follow_symlinks=False)
+                actual = (current.st_dev, current.st_ino, current.st_size,
+                          current.st_mtime_ns, current.st_ctime_ns)
+                if actual != opened:
+                    _fail('consumed source binding changed', 'source_changed')
+            for key, item in self._handles.items():
+                if key[0] in guard['entries']:
+                    self._check_hdf_owner(key, item)
+        except (OSError, ValueError, ContractError) as error:
+            raise ContractError('consumed source binding changed', 'source_changed') from error
 
     @classmethod
     def from_pointer(cls, artifact_root, *, expected_identity, pointer, limits=None):
@@ -388,7 +491,8 @@ class StateReader:
         ref['manifest'] = value['manifest']
         result = cls.__new__(cls)
         result._initialize(artifact_root, state_ref=ref, expected_identity=selected, limits=cap,
-                           verified_manifest=manifest, budget=budget)
+                           verified_manifest=manifest, budget=budget,
+                           metadata_bindings=temporary._metadata_bindings)
         result._shared_budget = None
         if manifest['generation'] != value['generation']:
             result.close()
@@ -430,15 +534,18 @@ class StateReader:
         if int(reference['bytes']) > self.limits.maximum_metadata_bytes:
             _fail('metadata exceeds read limit', 'budget_exceeded')
         with regular(beneath(self.root, reference['path']), size=int(reference['bytes'])) as raw:
-            before = stamp(raw)
+            before = stamp(raw, include_change=True)
             stream = _BudgetStream(raw, self._budget)
             phase, self._budget.phase = self._budget.phase, 'metadata'
             try:
                 payload = stream.read(int(reference['bytes']))
             finally:
                 self._budget.phase = phase
-            if stamp(raw) != before or hashlib.sha256(payload).hexdigest() != reference['sha256']:
+            if stamp(raw, include_change=True) != before:
+                _fail('metadata changed during authenticated read', 'source_changed')
+            if hashlib.sha256(payload).hexdigest() != reference['sha256']:
                 _fail('metadata differs from immutable reference')
+            self._note_source_binding(reference['path'], before, metadata=True)
         return decode_json(payload, reference['path'])
 
     def _register(self, reference, *, table=None):
@@ -452,7 +559,7 @@ class StateReader:
         if target is self._index:
             changed_weight = _metadata_weight(value) - (_metadata_weight(old) if old is not None else 0)
             if (self._index_weight + changed_weight + self._known_weight + self._pending_state_weight
-                    + self._catalog_size > self.limits.maximum_catalog_bytes):
+                    + self._catalog_size + self._metadata_bindings['weight'] > self.limits.maximum_catalog_bytes):
                 _fail('retained metadata context exceeds limit', 'budget_exceeded')
             self._index_weight += changed_weight
         target[simple['path']] = value
@@ -468,7 +575,7 @@ class StateReader:
         digest = self._state_ref['manifest']['sha256']
         if digest not in self._known_states:
             weight = _metadata_weight(self._state_ref) + _metadata_weight(self._manifest)
-            if self._known_weight + weight + self._index_weight + self._catalog_size > self.limits.maximum_catalog_bytes:
+            if self._known_weight + weight + self._index_weight + self._catalog_size + self._metadata_bindings['weight'] > self.limits.maximum_catalog_bytes:
                 _fail('retained metadata context exceeds limit', 'budget_exceeded')
             self._known_states[digest] = (self._state_ref, self._manifest)
             self._known_weight += weight
@@ -531,7 +638,7 @@ class StateReader:
             if len(self._index) + len(added_paths) > self.limits.maximum_catalog_entries:
                 _fail('imported reference inventory exceeds limit', 'budget_exceeded')
             if (size + self._index_weight + index_change + self._known_weight
-                    + self._pending_state_weight > self.limits.maximum_catalog_bytes):
+                    + self._pending_state_weight + self._metadata_bindings['weight'] > self.limits.maximum_catalog_bytes):
                 _fail('retained catalog/context metadata exceeds limit', 'budget_exceeded')
         anchors = self._parent_anchors()
         for reference in anchors.values():
@@ -542,7 +649,7 @@ class StateReader:
             seen.add(ref['path'])
             page = self._json(ref)
             size += _metadata_weight(page) + _metadata_weight(ref)
-            if size + self._index_weight + self._known_weight + self._pending_state_weight > self.limits.maximum_catalog_bytes:
+            if size + self._index_weight + self._known_weight + self._pending_state_weight + self._metadata_bindings['weight'] > self.limits.maximum_catalog_bytes:
                 _fail('decoded catalog inventory exceeds limit', 'budget_exceeded')
             pending.append((copy.deepcopy(ref), page))
             # Syntax is checked before following an untrusted predecessor.
@@ -669,6 +776,7 @@ class StateReader:
         from .native import native_metadata
         native_metadata(handle, identity=identity, invocation=invocation,
                         representation=representation, maximum_bytes=self.limits.maximum_metadata_bytes)
+        self._note_source_binding(reference['path'], item['stamp'])
         return handle
 
     def _record(self, leaf, offset, *, identity, invocation, page=None):
@@ -686,6 +794,8 @@ class StateReader:
             _fail('record identity/epoch/ordinal differs from native coordinates')
         if page is not None and not int(page['range']['first_record']) <= ordinal <= int(page['range']['last_record']):
             _fail('record ordinal outside containing page')
+        item = next(item for item in self._handles.values() if item['handle'] is handle)
+        self._note_source_binding(leaf['path'], item['stamp'], metadata=True)
         return record
 
     def _record_count(self, handle):
@@ -907,7 +1017,9 @@ class StateReader:
     def _parent_reader(self, reference):
         parent = StateReader.__new__(StateReader)
         parent._initialize(self.root, state_ref=reference, expected_identity=reference['identity'],
-            limits=self.limits, budget=self._budget, lineage_depth=self._lineage_depth + 1)
+            limits=self.limits, budget=self._budget, lineage_depth=self._lineage_depth + 1,
+            metadata_bindings=self._metadata_bindings,
+            metadata_owner=self._metadata_context_owner or self)
         parent._consumer_owner_limit = getattr(self, '_consumer_owner_limit', None)
         return parent
 

@@ -167,6 +167,7 @@ class FinalObservationsReader:
             if (reader._root_identity()!=reader._root_stamp or stamp(raw,include_change=True)!=before or bound!=before
                     or hashlib.sha256(payload).hexdigest()!=reference['sha256']):
                 raise ContractError('original input immutable binding changed','source_changed')
+            reader._note_source_binding(reference['path'], before)
         return payload
 
     def _load(self):

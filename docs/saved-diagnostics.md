@@ -76,9 +76,79 @@ report that capability reason instead of fabricating zero arrays. Core payload v
 physics, discretization and experimental acceptance are separate. Actual new JuliaHDF5 producer
 interoperability remains a separate gate from the small Python constructor fixtures.
 
-Stored equilibrium and full saved physical views still require the published actual-grid/scales/
-basis/model context carrier. This mandatory followup preserves independent arithmetic and
-applicability oracles; the four final-diagnostic integrals do not replace it. Export/process
-completion and byte consistency do not assess physical convergence or validate a model.
+## Independent stored equilibrium diagnostics
+
+```python
+from qcl_negf_results.state import StateReader
+from qcl_negf_results.equilibrium import (
+    EquilibriumReadLimits,
+    diagnose_stored_equilibrium,
+)
+
+with StateReader(root, state_ref=state_ref, expected_identity=identity) as reader:
+    report = diagnose_stored_equilibrium(
+        reader,
+        observations_ref=exact_observations_file_ref,
+        limits=EquilibriumReadLimits(maximum_io_bytes=128 * 1024 * 1024),
+    )
+```
+
+The keyword-only `observations_ref` selects the complete O1 FileRef. Paths and
+`expected_identity` are no longer arguments to this operation. The borrowed
+`FinalObservationsReader` authenticates the O1 context, original inputs, selected
+checkpoint and declared parent evidence through that same StateReader. Missing
+mandatory context is corrupt input; it does not authorize inferred defaults.
+
+Scales, physical inputs, quadrature and model applicability come from that exact
+context. The computation reads the declared checkpoint's complete
+ComplexF64 `[E,k,a,b]` matrices through public reader selections, preserving
+complex off-diagonal coherences and actual family order. Every stored scattering
+family, including electron-electron when present, contributes once; embedding
+`total` contributes once, while `plus` and `minus` remain separate current
+observations. Requested scattering flags never select the stored kernels.
+
+The existing independent number, FDR, normalization, current and arithmetic
+calculations retain two bounded passes and their missing/undefined statuses.
+Original stored evidence, current summary and restoration are reported separately
+under `source_evidence`; none replaces an independent arithmetic oracle. The
+optional `mu_algorithm_abs_tol_eV`, `mu_max_iterations=128` and
+`arithmetic_limits` retain their numerical meaning. No acceptance tolerance is
+introduced.
+
+`EquilibriumReadLimits` retains defaults of 32 MiB numerical workspace, 1 MiB
+single selection and decoded chunk, 64 KiB report and five scattering channels.
+The channel ceiling is an engineering limit: explicitly admit six when the
+actual stored inventory includes a sixth family; no family is dropped to fit.
+A complete matrix plane must fit. Contiguous datasets stream in bounded tiles;
+compressed chunk geometry is checked before numeric reads. These limits do not
+promise a process RSS or HDF5/native scratch bound.
+
+One shared physical allowance covers metadata, parent evidence, hashes, vectors
+and both matrix passes. The operation restores the caller's limits on all exits,
+including cancellation, and leaves the caller-owned reader open. Source FD/path
+stability is checked after the final numeric/arithmetic phase before report
+publication. This includes consumed O1, D1, checkpoint, original plan/model and
+ancestor metadata even when their handles have been closed or evicted under
+`maximum_open_files=1`. Witnesses originate from the authenticated read FD;
+the final path comparison does not invent an earlier FD proof. Cached metadata
+retains its original read binding, so the final guard needs no catalog-prefix or
+additional whole-payload hash replay. Existing LRU reopen verification still
+applies. Source changes are errors, never partial reports.
+
+Binding bookkeeping is deduplicated by immutable path and bounded by the existing
+catalog entry/byte allowances. The operation trace has a metadata ceiling and
+shares the numerical workspace allowance, including retained metadata witnesses.
+Its complete footprint is reserved before numeric buffers; new unforecast trace
+entries then refuse the operation. No extra witness FDs remain open. Normal,
+error and cancellation exits release the operation trace and restore the caller's
+allowances. The witnesses neither resolve new refs nor authorize metadata or
+array values; original FileRef, hash, identity and dependency validation remain
+required.
+
+Constructor fixtures and preserved independent formulas qualify this I/O bridge;
+actual producer/runtime interoperability and scientific acceptance are separate
+claims. Provider ownership, full physical-view transport and the new optics
+codec retain their owning gates. Export/process completion and byte consistency
+do not assess physical convergence or validate a model.
 
 See [reader, cursor, reduction and export examples](../README.md).
