@@ -574,7 +574,7 @@ def test_native5_independent_analysis_is_explicitly_unavailable(tmp_path):
     selected = source(tmp_path)
     with StateReader(tmp_path, state_ref=selected, expected_identity=SELECTED) as reader:
         assert reader.source.capabilities['stored_observables'] == dict(
-            available=False, reason='independent_analysis_not_published')
+            available=False, reason='explicit_final_observations_ref_required')
 
 
 @pytest.mark.parametrize('field,value', [('missing', None), ('attempt', 2),

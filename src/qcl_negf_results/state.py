@@ -488,13 +488,11 @@ class StateReader:
         capabilities = dict(history_read=cap(ready, 'catalog_import_required'),
             array_slice=cap(bool(self._declarations), 'verified_array_declaration_required'),
             exact_checkpoint=cap(checkpoint, 'checkpoint_verification_required' if self._manifest['checkpoint'] else 'selected_state_has_no_checkpoint'),
-            exact_restore=cap(False, 'core_owned'), saved_views=cap(False, 'native5_view_not_implemented'),
-            stored_observables=cap(False, 'independent_analysis_not_published'),
-            stored_final_diagnostics=cap(any(row['role'] == 'physics.analysis' and
-                row['schema'] == 'qcl-negf-physics-analysis-v5' for row in self._manifest['artifacts']),
-                'selected_state_has_no_final_diagnostics'),
+            exact_restore=cap(False, 'core_owned'), saved_views=cap(False, 'explicit_final_observations_ref_required'),
+            stored_observables=cap(False, 'explicit_final_observations_ref_required'),
+            stored_final_diagnostics=cap(False, 'explicit_final_diagnostics_ref_required'),
             streaming_export=cap(history or self._manifest['checkpoint'], 'no_selected_scientific_data'),
-            science_export=cap(history, 'independent_analysis_not_published'),
+            science_export=cap(history, 'history_or_explicit_analysis_ref_required'),
             full_state_export=cap(self._manifest['checkpoint'] is not None, 'selected_state_has_no_checkpoint'),
             scalar_derive=cap(ready, 'catalog_import_required'))
         return ResultDescription(copy.deepcopy(self._state_ref), copy.deepcopy(self._manifest['invocation']),

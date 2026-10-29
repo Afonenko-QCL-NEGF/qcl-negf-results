@@ -5,6 +5,7 @@ from collections.abc import Callable
 import copy
 import hashlib
 import os
+import sys
 from pathlib import Path
 import tempfile
 
@@ -15,11 +16,30 @@ from .commits import json_bytes, atomic_write
 from ._atomic_io import fsync_directory
 from ._capture_io import beneath, copy_closed
 from .export_budget import ExportBudget, validate_options
-from .state import StateReader, _ref, _internal_storage
+from .state import StateReader, Document, _ref, _internal_storage
 from .native import validate_native_handle
 
 
-def _selection(reader, profile):
+def _analysis_context(reader, observations_ref, diagnostics_ref):
+    """Named exact references select representations, never schema inventory."""
+    from .final_observations import FinalObservationsReader
+    from .final_diagnostics import FinalDiagnosticsReader
+    observations = diagnostics = None
+    if observations_ref is not None:
+        with FinalObservationsReader(reader, artifact_ref=observations_ref) as view:
+            observations = view.describe()
+        if diagnostics_ref is not None and diagnostics_ref != observations.diagnostics:
+            raise ContractError('selected diagnostics FileRef differs from observations diagnostics', 'corrupt_result')
+    if diagnostics_ref is not None:
+        with FinalDiagnosticsReader(reader, artifact_ref=diagnostics_ref) as view:
+            diagnostics = view.describe()
+    for key,item in reader._handles.items():
+        reader._check_hdf_owner(key,item)
+    return observations, diagnostics
+
+
+def _selection(reader, profile, *, analysis=(None, None)):
+
     if not isinstance(reader, StateReader):
         raise TypeError('explicit selected StateReader required')
     if profile not in ('science', 'full-state'):
@@ -69,6 +89,14 @@ def _selection(reader, profile):
                     omitted.append(dict(source_state=copy.deepcopy(current._state_ref),
                         source_path=artifact['path'], role=artifact['role'],
                         reason='optional_full_state_excluded_from_science'))
+            if current is reader:
+                for description in analysis:
+                    if description is not None:
+                        reference = description.artifact
+                        row = declared.get(reference['path'])
+                        if row is None or _ref(row) != reference:
+                            raise ContractError('selected analysis FileRef differs from canonical inventory', 'corrupt_result')
+                        add(row, row['role'], row['dependencies'])
             parent = manifest['lineage']['parent_state']
             if parent is not None:
                 child = current._parent_reader(parent)
@@ -99,51 +127,85 @@ def _selection(reader, profile):
                     row = declared[dependency]
                     add(row, row['role'], row['dependencies'])
                 pending.append(dependency)
-        if profile == 'science' and not any(row['role'] == 'science.history' for row in selected.values()):
+        if profile == 'science' and not any(analysis) and not any(row['role'] == 'science.history' for row in selected.values()):
             raise ContractError('no published history or independent analysis representation', 'capability_unavailable')
         omitted = [row for row in omitted if row['source_path'] not in selected]
         return selected, omitted, records
     finally:
+        primary = sys.exception()
+        first = None
         for session in sessions:
-            session.close()
+            try:
+                session.close()
+            except BaseException as error:
+                if first is None: first = error
+                else: first.add_note('another lineage cleanup raised '+type(error).__name__)
+        if first is not None:
+            if primary is None: raise first
+            primary.add_note('lineage cleanup also raised '+type(first).__name__)
 
 
-def preview(reader: StateReader, *, profile: str) -> dict:
-    selected, omitted, _ = _selection(reader, profile)
+def _bound_capabilities(reader, profile, analysis):
     capabilities = copy.deepcopy(reader.source.capabilities)
-    capabilities['exact_restore'] = dict(available=False, reason='core_owned' if profile == 'full-state' else 'science_subset')
-    return dict(profile=profile, source=copy.deepcopy(reader.source.state), files=len(selected),
-        bytes=sum(int(row['bytes']) for row in selected.values()), omitted_by_policy=omitted,
-        capabilities=capabilities, integrity_scope='declared_metadata_availability',
-        canonical_source_complete=profile == 'full-state', scientific_accepted=None)
+    observations, diagnostics = analysis
+    if observations is not None:
+        for name in ('saved_views', 'stored_observables', 'stored_final_diagnostics'):
+            capabilities[name] = dict(available=True, reason=None)
+    elif diagnostics is not None:
+        capabilities['stored_final_diagnostics'] = dict(available=True, reason=None)
+    if any(analysis):
+        capabilities['science_export'] = dict(available=True, reason=None)
+    capabilities['exact_restore'] = dict(available=False,
+        reason='core_owned' if profile == 'full-state' else 'science_subset')
+    return capabilities
+
+
+def preview(reader: StateReader, *, profile: str,
+            observations_ref: Document | None = None, diagnostics_ref: Document | None = None) -> dict:
+    if not isinstance(reader, StateReader):
+        raise TypeError('explicit selected StateReader required')
+    with reader._consumer_operation():
+        analysis = _analysis_context(reader, observations_ref, diagnostics_ref)
+        selected, omitted, _ = _selection(reader, profile, analysis=analysis)
+        return dict(profile=profile, source=copy.deepcopy(reader.source.state), files=len(selected),
+            bytes=sum(int(row['bytes']) for row in selected.values()), omitted_by_policy=omitted,
+            capabilities=_bound_capabilities(reader, profile, analysis),
+            integrity_scope='selected_analysis_metadata_verified' if any(analysis) else 'declared_metadata_availability',
+            canonical_source_complete=profile == 'full-state', scientific_accepted=None)
 
 
 def export_snapshot(reader: StateReader, destination: str | Path, *, profile: str,
                     byte_budget: int, reserve_bytes: int,
-                    progress: Callable[[dict], None] | None = None) -> dict:
+                    progress: Callable[[dict], None] | None = None,
+                    observations_ref: Document | None = None, diagnostics_ref: Document | None = None) -> dict:
     if not isinstance(reader, StateReader):
         raise TypeError('explicit selected StateReader required')
-    reader._operation()
-    previous = reader._shared_budget
-    reader._shared_budget = reader._budget
-    try:
+    with reader._consumer_operation():
+        analysis = _analysis_context(reader, observations_ref, diagnostics_ref)
         return _export_snapshot(reader, destination, profile=profile,
-            byte_budget=byte_budget, reserve_bytes=reserve_bytes, progress=progress)
-    finally:
-        reader._shared_budget = previous
+            byte_budget=byte_budget, reserve_bytes=reserve_bytes, progress=progress, analysis=analysis)
 
 
-def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes, progress):
+def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes, progress, analysis):
     validate_options(byte_budget, reserve_bytes)
-    selected, omitted, records = _selection(reader, profile)
+    selected, omitted, records = _selection(reader, profile, analysis=analysis)
     if profile == 'full-state':
         from .archive import _verify_source_tree
-        _verify_source_tree(reader.root, reader.source.state, limits=reader.limits, budget=reader._budget)
+        _verify_source_tree(reader.root, reader.source.state, limits=reader.limits, budget=reader._budget, selected_reader=reader)
+    # Capture qualified source bindings before any progress callback can mutate
+    # them. Copies hash their actual FD; final publication also requires paths
+    # and the selected root to remain the same immutable source.
+    from ._capture_io import regular, stamp
+    bindings = {}
+    for path,row in selected.items():
+        with regular(beneath(reader.root,path), size=int(row['bytes'])) as stream:
+            bindings[path] = stamp(stream, include_change=True)
     destination = Path(destination)
     destination.mkdir(parents=True, exist_ok=True)
     snapshot_identity = hashlib.sha256(json_bytes(dict(schema=EXPORT_SCHEMA, contract_set=CONTRACT_SET,
         profile=profile, source_state=reader.source.state, selected=[selected[k] for k in sorted(selected)],
-        omitted_by_policy=omitted, native_format='5.0', exporter_revision=9))).hexdigest()
+        omitted_by_policy=omitted, selected_analysis=[None if d is None else d.artifact for d in analysis],
+        native_format='5.0', exporter_revision=10))).hexdigest()
     report = progress or (lambda event: None)
     def transport_report(phase, **values):
         report(dict(phase=phase, **values))
@@ -177,8 +239,21 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
             for path, row in sorted(selected.items())]
         # Export selection describes the complete chosen object set, while
         # original canonical source manifests remain unchanged provenance.
-        records = [dict(source_state=copy.deepcopy(reader.source.state), included=included, omitted_by_policy=omitted)]
-        capabilities = ['complete_exact_source_graph'] if profile == 'full-state' else ['raw_scientific_history', 'stored_diagnostic_witnesses']
+        from .provenance import _selected_source_provenance
+        provenance = _selected_source_provenance(reader, observations=analysis[0])
+        # Every row below has just been copied/hash-checked and its native
+        # header validated. Reader cache warming is not archive authority or
+        # selected-analysis qualification and must not alter serialized bytes.
+        provenance['native_verified_references'] = [_ref(row) for _,row in sorted(selected.items())
+            if row['media_type'] == 'application/x-hdf5']
+        provenance['native_verified_references_scope'] = 'captured_native_bytes_and_headers'
+        records = [dict(source_state=copy.deepcopy(reader.source.state), included=included, omitted_by_policy=omitted,
+            native_provenance=provenance)]
+        capabilities = ['complete_exact_source_graph'] if profile == 'full-state' else []
+        if any(row['role']=='science.history' for row in selected.values()):
+            capabilities += ['raw_scientific_history', 'stored_diagnostic_witnesses']
+        if analysis[0] is not None: capabilities.append('selected_final_observations_metadata')
+        if any(analysis): capabilities.append('selected_final_diagnostics_metadata')
         manifest = dict(schema=EXPORT_SCHEMA, contract_set=CONTRACT_SET, profile=profile,
             snapshot_identity=snapshot_identity, records=records, files=[objects[k][1] for k in sorted(objects)],
             omitted_by_policy=omitted, capabilities=capabilities,
@@ -188,7 +263,8 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
             canonical_source_complete=profile == 'full-state', scientific_accepted=None,
             snapshot_consistent=True, complete=profile == 'full-state',
             coverage=dict(scope='explicit_selected_state', uncommitted_tail='not_included',
-                          stored_observables='independent_analysis_not_published'))
+                          stored_observables='selected_metadata_verified' if analysis[0] is not None else 'explicit_final_observations_ref_required',
+                          stored_final_diagnostics='selected_metadata_verified' if any(analysis) else 'explicit_final_diagnostics_ref_required'))
         metadata = {'manifest.json': json_bytes(manifest),
                     'README.md': ('# QCL-NEGF selected snapshot\n\nProfile: ' + profile +
                         '\nScientific acceptance is not assessed by export.\n').encode()}
@@ -213,6 +289,17 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
         archive_existed = archive_path.exists()
         previous_receipt = receipt_path.read_bytes() if receipt_path.exists() else None
         receipt_published = False
+        try:
+            for path,before in bindings.items():
+                with regular(beneath(reader.root,path), size=int(selected[path]['bytes'])) as stream:
+                    if stamp(stream, include_change=True) != before:
+                        raise ContractError('export source binding changed before publication', 'source_changed')
+            if reader._root_identity() != reader._root_stamp:
+                raise ContractError('export source root changed before publication', 'source_changed')
+            for key,item in reader._handles.items():
+                reader._check_hdf_owner(key,item)
+        except (OSError, ValueError, ContractError) as error:
+            raise ContractError('export source changed before publication', 'source_changed') from error
         os.replace(temporary, archive_path)
         try:
             os.replace(receipt_file, receipt_path)
