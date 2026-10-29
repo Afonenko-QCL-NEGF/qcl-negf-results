@@ -179,3 +179,37 @@ def test_scientific_record_relations_not_just_schema_are_checked(tmp_path, chang
         reader.import_history()
         with pytest.raises(ContractError):
             reader.history_batch()
+
+
+@pytest.mark.parametrize('error_type',[RuntimeError,KeyboardInterrupt])
+def test_native_close_attempts_every_owned_stack_when_one_cleanup_raises(tmp_path,error_type):
+    from consumer_context_fixture import fixture
+    from qcl_negf_results.final_observations import FinalObservationsReader
+    selected,artifact,_,_,_=fixture(tmp_path)
+    reader=state.StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity'])
+    FinalObservationsReader(reader,artifact_ref=artifact).describe()
+    handles=[item['handle'] for item in reader._handles.values()]
+    assert len(handles)==2
+    def raised():raise error_type('literal cleanup failure')
+    next(iter(reader._handles.values()))['stack'].callback(raised)
+    with pytest.raises(error_type,match='literal cleanup failure'):reader.close()
+    assert all(not handle.id.valid for handle in handles)
+    with pytest.raises(ValueError,match='closed'):reader.history_batch()
+    reader.close()
+
+
+def test_state_context_cleanup_preserves_body_cancellation_and_other_owners(tmp_path):
+    from consumer_context_fixture import fixture
+    from qcl_negf_results.final_observations import FinalObservationsReader
+    selected,artifact,_,_,_=fixture(tmp_path)
+    reader=state.StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity'])
+    handles=[]
+    def raised():raise RuntimeError('literal secondary close failure')
+    with pytest.raises(KeyboardInterrupt,match='literal primary') as caught:
+        with reader:
+            FinalObservationsReader(reader,artifact_ref=artifact).describe()
+            handles=[item['handle'] for item in reader._handles.values()]
+            next(iter(reader._handles.values()))['stack'].callback(raised)
+            raise KeyboardInterrupt('literal primary')
+    assert all(not handle.id.valid for handle in handles)
+    assert any('cleanup' in note for note in caught.value.__notes__)
