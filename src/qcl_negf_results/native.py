@@ -187,7 +187,10 @@ def _native_header(group, maximum_bytes, *, with_size=False):
             consumed += datatype.get_size()
             if consumed > maximum_bytes:
                 raise ContractError('aggregate native header exceeds metadata limit', 'budget_exceeded')
-            result[name] = _text(group.attrs[name])
+            try:
+                result[name] = _text(group.attrs[name])
+            except UnicodeError as error:
+                raise ContractError('native5 header requires valid UTF-8', 'corrupt_result') from error
         finally:
             space.close()
             datatype.close()
@@ -233,10 +236,11 @@ def native_metadata(handle, *, identity=None, invocation=None, representation=No
     group = handle["metadata"]
     attrs = _native_header(group, maximum_bytes)
     if attrs['artifact_role'] == 'physics.analysis' and attrs['schema'] == 'qcl-negf-physics-analysis-v5':
-        if representation not in (None, 'final_diagnostics'):
+        actual = attrs['representation']
+        if actual not in ('final_diagnostics', 'final_observations') or representation not in (None, actual):
             fail('native representation differs from owning declaration')
-        return final_diagnostics_metadata(handle, identity=identity, invocation=invocation,
-                                          maximum_bytes=maximum_bytes)
+        guard = final_diagnostics_metadata if actual == 'final_diagnostics' else final_observations_metadata
+        return guard(handle, identity=identity, invocation=invocation, maximum_bytes=maximum_bytes)
     layout = json.loads(files("qcl_negf_contracts").joinpath("core_layout.json").read_text())["layout_sha256"]
     if attrs['core_layout_sha256'] != layout:
         raise ContractError("unsupported Core layout", "unsupported_format")
@@ -567,3 +571,138 @@ def _read_final_fixed_point_audit(handle: Any) -> bytes | None:
     if not raw or b"\0" in raw:
         _audit_error("empty record or embedded NUL")
     return raw
+
+
+def _observation_profiles():
+    """Closed local array vocabulary from the published owning schema."""
+    import json
+    from importlib.resources import files
+    definitions=json.loads(files('qcl_negf_contracts').joinpath('schemas/final-observations.schema.json').read_text())['$defs']
+    result={}
+    for key,value in definitions.items():
+        if key.startswith('Array_'):
+            props=value['properties']
+            descriptor={name:item['const'] for name,item in props.items() if 'const' in item}
+            for name in ('axes','coordinate_fields','weight_fields'):
+                descriptor[name]=[item['const'] for item in props[name]['prefixItems']]
+            result[key[6:]]=descriptor
+    return result
+
+
+def final_observations_metadata(handle, *, identity, invocation, maximum_bytes):
+    """Exact closed O1 tree and fixed UTF8 metadata; no numeric value reads."""
+    import h5py
+    import json
+    from importlib.resources import files
+    from qcl_negf_contracts.messages import ContractError
+    from .commits import decode_json
+    def fail(message,code='corrupt_result'):raise ContractError(message,code)
+    if set(handle)!={'metadata','final_observations'} or len(handle.attrs):fail('observations root layout differs')
+    for path,names in (('metadata',{'identity_json','invocation_json'}),
+                       ('final_observations',{'declaration_json','arrays'})):
+        group=handle[path]
+        if not isinstance(group,h5py.Group) or set(group)!=names:fail('observations closed group layout differs')
+    if (set(handle['metadata'].attrs)!={'schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'}
+            or len(handle['final_observations'].attrs)):
+        fail('observations group attributes differ')
+    attrs,consumed=_native_header(handle['metadata'],maximum_bytes,with_size=True)
+    layout=json.loads(files('qcl_negf_contracts').joinpath('core_layout.json').read_text())['layout_sha256']
+    if attrs!={'schema':'qcl-negf-physics-analysis-v5','schema_version':'5.0','contract_set':CONTRACT_SET,
+               'artifact_role':'physics.analysis','representation':'final_observations','core_layout_sha256':layout}:
+        fail('observations native5 schema/role/layout/representation differs')
+    result=dict(representation='final_observations');addresses=set()
+    for path,key,expected in (('metadata/identity_json','identity_json',identity),
+                              ('metadata/invocation_json','invocation_json',invocation),
+                              ('final_observations/declaration_json','declaration',None)):
+        if not isinstance(handle.get(path,getlink=True),h5py.HardLink):fail('observations metadata link forbidden')
+        dataset=handle[path]
+        if not isinstance(dataset,h5py.Dataset) or len(dataset.attrs):fail('observations scalar metadata layout differs')
+        datatype,space=dataset.id.get_type(),dataset.id.get_space()
+        try:
+            if (space.get_simple_extent_type()!=h5py.h5s.SCALAR or space.get_simple_extent_npoints()!=1
+                    or datatype.get_class()!=h5py.h5t.STRING or datatype.is_variable_str()
+                    or datatype.get_cset()!=h5py.h5t.CSET_UTF8 or datatype.get_size()<1):
+                fail('observations metadata requires fixed UTF8 scalar strings')
+            consumed+=datatype.get_size()
+            if consumed>maximum_bytes:fail('aggregate observations metadata exceeds limit','budget_exceeded')
+        finally:space.close();datatype.close()
+        value=decode_json(bytes(dataset[()]),path)
+        if expected is not None and value!=expected:fail('observations source identity/epoch differs')
+        result[key]=value;addresses.add(h5py.h5o.get_info(dataset.id).addr)
+    value=result['declaration']
+    if not isinstance(value,dict) or not isinstance(value.get('context'),dict) or not isinstance(value.get('views'),dict):
+        fail('observations declaration missing closed array contexts')
+    profiles=_observation_profiles();expected={name for name in profiles if (value['context'] if name in value['context'] else value['views']).get(name) is not None}
+    group=handle['final_observations/arrays']
+    if not isinstance(group,h5py.Group) or len(group.attrs) or len(group)>26 or set(group)!=expected:
+        fail('observations array inventory differs')
+    for path in ('metadata','final_observations','final_observations/arrays'):
+        if not isinstance(handle.get(path,getlink=True),h5py.HardLink):fail('observations group link forbidden')
+        address=h5py.h5o.get_info(handle[path].id).addr
+        if address in addresses:fail('observations object alias forbidden')
+        addresses.add(address)
+    for name in group:
+        if not isinstance(group.get(name,getlink=True),h5py.HardLink):fail('observations array link forbidden')
+        dataset=group[name]
+        if not isinstance(dataset,h5py.Dataset) or len(dataset.attrs) or dataset.external or dataset.is_virtual:
+            fail('observations array storage/attributes differ')
+        address=h5py.h5o.get_info(dataset.id).addr
+        if address in addresses:fail('observations object alias forbidden')
+        addresses.add(address)
+    result['metadata_bytes']=consumed
+    return result
+
+
+def validate_final_observations_array(handle,declaration):
+    """Exactly 26 O1 descriptors; does not register new Core array ranks."""
+    import h5py
+    import numpy as np
+    from qcl_negf_contracts.messages import ContractError
+    def fail(message):raise ContractError(message,'corrupt_result')
+    path=declaration.get('dataset');prefix='/final_observations/arrays/'
+    name=path.removeprefix(prefix) if isinstance(path,str) else None
+    profile=_observation_profiles().get(name)
+    if (profile is None or set(declaration)!=set(profile)|{'shape'}
+            or any(declaration.get(key)!=value for key,value in profile.items())):
+        fail('unsupported observations array descriptor')
+    shape=declaration['shape']
+    if (not isinstance(shape,list) or len(shape)!=len(profile['axes']) or any(type(v) is not str
+            or not v.isascii() or not v.isdecimal() or v.startswith('0') or int(v)>2**63-1 for v in shape)):
+        fail('observations shape requires positive actual Int64 dimensions')
+    if not isinstance(handle.get(path,getlink=True),h5py.HardLink):fail('observations array link forbidden')
+    dataset=handle[path]
+    if (not isinstance(dataset,h5py.Dataset) or dataset.shape!=tuple(map(int,shape)) or dataset.external
+            or dataset.is_virtual or len(dataset.attrs)):
+        fail('observations array logical shape/storage differs')
+    kind=dataset.id.get_type()
+    try:
+        eltype=profile['eltype']
+        if eltype=='ComplexF64':
+            if (kind.get_class()!=h5py.h5t.COMPOUND or kind.get_nmembers()!=2 or kind.get_size()!=16
+                    or [kind.get_member_name(i) for i in range(2)]!=[b'r',b'i']
+                    or [kind.get_member_offset(i) for i in range(2)]!=[0,8] or dataset.dtype!=np.dtype('<c16')):
+                fail('observations complex requires exact LE r/i compound')
+            for i in range(2):
+                member=kind.get_member_type(i)
+                try:
+                    if not member.equal(h5py.h5t.IEEE_F64LE):fail('observations complex component is not exact IEEE Float64')
+                finally:member.close()
+        elif eltype=='Bool':
+            if kind.get_class()!=h5py.h5t.ENUM or kind.get_nmembers()!=2 or dataset.dtype!=np.dtype('bool'):
+                fail('observations Bool requires exact FALSE/TRUE enum')
+            base=kind.get_super()
+            try:
+                if not base.equal(h5py.h5t.STD_U8LE):fail('observations Bool base differs')
+            finally:base.close()
+            if {kind.get_member_name(i):kind.get_member_value(i) for i in range(2)}!={b'FALSE':0,b'TRUE':1}:
+                fail('observations Bool enum differs')
+        elif not kind.equal(h5py.h5t.IEEE_F64LE if eltype=='Float64' else h5py.h5t.STD_I64LE):
+            fail('observations array requires exact LE Float64/Int64')
+    finally:kind.close()
+    plist=dataset.id.get_create_plist()
+    try:
+        if (plist.get_layout() not in (h5py.h5d.CONTIGUOUS,h5py.h5d.CHUNKED) or plist.get_nfilters()>2
+                or any(plist.get_filter(i)[0] not in (1,2) for i in range(plist.get_nfilters()))):
+            fail('observations unsupported/lossy storage filter/layout')
+    finally:plist.close()
+    return dataset

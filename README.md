@@ -128,6 +128,43 @@ events; vectors and matrices stay lazy. Numeric source attempts, transport UUID 
 full-history consolidation are not alternative source selectors. See
 [diagnostic APIs](docs/saved-diagnostics.md).
 
+## Raw stored final observations
+
+```python
+from qcl_negf_results.final_observations import FinalObservationsReader
+
+# observations_ref is an exact manifest FileRef, not a guessed HDF path.
+with FinalObservationsReader(reader, artifact_ref=observations_ref) as final:
+    description = final.describe()
+    energy = final.read_array("energy_eV", (slice(0, 3),))
+    wavefunction = final.read_array("localized_wavefunctions_per_sqrt_nm",
+                                    (slice(0, 4), 0), maximum_bytes=1024)
+```
+
+The `qcl-negf.final-observations.v1` declaration uses the explicit analysis-v5 `final_observations`
+representation. The borrowed StateReader verifies its checkpoint, linked final diagnostics, original
+plan/model bytes and, for completed restore, the exact immediate parent and history cutoff. The
+model file SHA and canonical configuration digest are checked independently. Original JSON or
+bounded portable nested YAML remains the input authority; caller dictionaries and hash decoding
+cannot supply missing inputs.
+
+`describe()` returns detached source, declaration, plan/model, original evidence, integrity and
+counters. It authenticates complete owner bytes and array storage metadata but reads no numeric
+array values or full checkpoint tensors. The 26 local arrays have closed dtype/shape/axes/units and
+coordinate/weight descriptors; they do not widen the Core graph. `describe_array(name)` and
+`read_array(name, selection, maximum_bytes=...)` preserve logical h5py axes without transpose and
+raw IEEE/complex/integer/Boolean values. Optional null output carries its stored issue reason;
+unknown names are errors. All operations share the reader's metadata, physical I/O, chunk and
+selected-buffer limits. Borrowed view close leaves the StateReader usable; StateReader close
+attempts all owned handles even under cancellation.
+
+This raw API does not implement semantic SavedAnalysis, renderer, equilibrium adapter, transport
+association or analysis-export selection. Those mandatory migrations remain separate staged work.
+Python literal fixtures do not establish actual Julia 26+4-array interoperability. The production
+Python YAML parser's 21 literal portable trees, scalar types and Float64 bits have a separate
+comparison against exact Julia1.13/YAML0.4.17 output; this does not qualify every original plan. See
+[saved views](docs/saved-views.md).
+
 ## Explicit reduction and export
 
 ```python
@@ -183,21 +220,22 @@ qcl-negf-results export /data/result /data/exports --identity identity.json --po
 ## Staged research capabilities
 
 This P06 stage provides native5 records, slices, scalar diagnostic projections, stored final
-diagnostics, reductions and selected exports. Full saved physical views and stored equilibrium views
-still require the actual-grid/scales/basis/model context carrier. Their older entrypoints return
-`capability_unavailable`; the source description reports exact reasons. This is a staged migration,
-**not permanent removal of research functionality**. Required owning Runner/Results context, view
-and export followup must pass before final Portal/research release acceptance. Scientific statuses
-are copied as separate process/convergence/physics/ discretization/experimental evidence; `recorded`
-does not mean pass and `not_measured` never becomes zero or success. Existing technical capture
-lifecycle and telemetry migration are owned separately by P29/P30.
+diagnostics, raw stored final observations, reductions and selected exports. Full semantic saved
+physical views and stored equilibrium views still require their consumer adapters to the published
+actual-grid/scales/basis/model carrier. Their older entrypoints return `capability_unavailable`; the
+source description reports exact reasons. This is a staged migration, **not permanent removal of
+research functionality**. Required owning Runner/Results context, view and export followup must pass
+before final Portal/research release acceptance. Scientific statuses are copied as separate
+process/convergence/physics/ discretization/experimental evidence; `recorded` does not mean pass and
+`not_measured` never becomes zero or success. Existing technical capture lifecycle and telemetry
+migration are owned separately by P29/P30.
 
 ## Verification
 
 Use a prepared environment, without bootstrap inside checks:
 
 ```console
-python -m pytest -q tests/test_result_v2_reader.py tests/test_result_v2_cursor.py tests/test_result_v2_export.py tests/test_final_diagnostics_reader.py tests/test_diagnostic_views.py
+python -m pytest -q tests/test_result_v2_reader.py tests/test_result_v2_cursor.py tests/test_result_v2_export.py tests/test_final_diagnostics_reader.py tests/test_final_observations_reader.py tests/test_diagnostic_views.py
 ```
 
 Portable tests manufacture tiny transport sources. To additionally check actual constructor-only

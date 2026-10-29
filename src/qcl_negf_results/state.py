@@ -400,13 +400,30 @@ class StateReader:
         return self
 
     def __exit__(self, *args):
-        self.close()
+        try:
+            self.close()
+        except BaseException as cleanup_error:
+            if len(args) < 2 or args[1] is None:
+                raise
+            args[1].add_note('native owner cleanup also raised ' + type(cleanup_error).__name__)
 
     def close(self):
-        for value in self._handles.values():
-            value['stack'].close()
+        # Mark closed and detach first: cancellation in one stack must not leak
+        # another verified owner or make a second close repeat its callbacks.
+        owners = tuple(self._handles.values())
         self._handles.clear()
         self._closed = True
+        first = None
+        for value in owners:
+            try:
+                value['stack'].close()
+            except BaseException as error:
+                if first is None:
+                    first = error
+                else:
+                    first.add_note('another native owner cleanup raised ' + type(error).__name__)
+        if first is not None:
+            raise first
 
     def _json(self, reference):
         from ._capture_io import beneath, regular, stamp
