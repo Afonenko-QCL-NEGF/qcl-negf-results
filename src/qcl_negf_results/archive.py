@@ -324,7 +324,7 @@ def verify_archive(path: Path, *, report: Callable[..., None] = _quiet) -> dict[
     return _read_archive(path, None, report)
 
 
-def _verify_source_tree(root, state_ref, *, limits=None, budget=None):
+def _verify_source_tree(root, state_ref, *, limits=None, budget=None, selected_reader=None):
     """Explicit full-source metadata/dtype proof with the same bounded reader.
 
     The operation streams integrity hashes; no numerical tensor is materialized.
@@ -339,10 +339,13 @@ def _verify_source_tree(root, state_ref, *, limits=None, budget=None):
         if digest in seen:
             continue
         seen.add(digest)
-        reader = StateReader.__new__(StateReader)
-        reader._initialize(root, state_ref=state, expected_identity=state['identity'], limits=limits,
-                           budget=budget)
-        with reader:
+        from contextlib import nullcontext
+        reader = selected_reader if selected_reader is not None and selected_reader._state_ref == state else None
+        if reader is None:
+            reader = StateReader.__new__(StateReader)
+            reader._initialize(root, state_ref=state, expected_identity=state['identity'], limits=limits,
+                               budget=budget)
+        with (nullcontext(reader) if reader is selected_reader else reader):
             if len(seen) > reader.limits.maximum_catalog_pages:
                 raise ContractError('restored lineage exceeds metadata limit', 'budget_exceeded')
             reader.import_history()

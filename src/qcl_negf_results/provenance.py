@@ -1,34 +1,100 @@
-"""Read-only comparison of embedded native metadata with its owning commit."""
+"""Provenance of an explicitly selected canonical native5 source.
+
+Original request coordinates remain tagged observations; transport identifiers,
+field/period reconstruction and scientific acceptance are never inferred.
+"""
 from __future__ import annotations
 
 import copy
-import math
 from pathlib import Path
 from typing import Any, Mapping
 
 import h5py
-
 from qcl_negf_contracts.artifacts import digest_value
 from qcl_negf_contracts.messages import ContractError
 from .commits import decode_json
 
-IDENTITY_FIELDS = ("point_id", "execution_id", "attempt", "plan_fingerprint")
-COORDINATE_PATHS = {
-    "temperature_K": ("/metadata/temperature_K", "/inputs/T_L_K"),
-    "voltage_per_period_V": ("/metadata/voltage_per_period_V", "/inputs/V_period_V"),
-}
+from .state import StateReader, Document, ResultReadLimits, _IOBudget, _BudgetStream, _internal_storage
 
 
-def _selected_source_provenance(reader):
-    """Canonical manifest proof only; no path reopen or coordinate inference."""
+def _selected_source_provenance(reader, *, observations=None):
+    """Manifest proof, optionally enriched by the verified O1 description."""
     source = reader.source
-    return dict(source=source.state,invocation=source.invocation,lineage=source.lineage,
+    result = dict(source=source.state, invocation=source.invocation, lineage=source.lineage,
         git_graph=copy.deepcopy(reader._manifest['provenance']),
-        identity=dict(status='matched',scope='verified_selected_manifest',
+        identity=dict(status='matched', scope='verified_selected_manifest',
             fields={name:'matched' for name in source.state['identity']}),
         native_verified_references=source.integrity['selected_payloads_verified'],
-        coordinates=dict(status='not_available',reason='bound_physical_context_not_published'),
-        transport_provenance=dict(status='not_recorded',reason='not_scientific_identity'))
+        coordinates=dict(status='not_available', reason='explicit_final_observations_ref_required'),
+        transport_provenance=dict(status='not_recorded', reason='not_scientific_identity'))
+    if observations is not None:
+        value = observations.declaration
+        checks = value['request']['coordinate_checks']
+        result.update(coordinates={name:dict(copy.deepcopy(checks[key]),
+                source='final_observations.request.coordinate_checks.'+key)
+            for name,key in (('temperature_K','temperature'), ('voltage_per_period_V','voltage'))},
+            request=copy.deepcopy(value['request']),
+            original_evidence=copy.deepcopy(observations.original_evidence),
+            current_evidence=copy.deepcopy(value['summary']),
+            restoration=copy.deepcopy(value['restoration']),
+            original_inputs=dict(plan=copy.deepcopy(value['request']['plan']),
+                                 model=copy.deepcopy(value['request']['model'])))
+    return result
+
+
+def verify_native_provenance(reader: StateReader, *, observations_ref: Document | None = None) -> dict:
+    """Verify an exact O1 context, or report a manifest-only unbound context."""
+    if not isinstance(reader, StateReader):
+        raise TypeError('explicit selected StateReader required')
+    from .final_observations import FinalObservationsReader
+    with reader._consumer_operation():
+        observations = None
+        if observations_ref is not None:
+            with FinalObservationsReader(reader, artifact_ref=observations_ref) as view:
+                observations = view.describe()
+        for key,item in reader._handles.items():
+            reader._check_hdf_owner(key,item)
+        return _selected_source_provenance(reader, observations=observations)
+
+
+# Optical-v4 has its own existing embedded receipt contract. This narrow API
+# never admits retired generic native containers or claims a native5 binding.
+IDENTITY_FIELDS = ("point_id", "execution_id", "attempt", "plan_fingerprint")
+
+
+def verify_optical_provenance(path: str | Path, owner: Mapping[str, Any]) -> dict:
+    """Validate only embedded optical-v4 receipt/quality declarations.
+
+    The bounded same-open file is not a canonical source or scientific oracle.
+    Ownership still requires the separate published optics/source integration.
+    """
+    from ._capture_io import regular, stamp
+    limit = ResultReadLimits().maximum_metadata_bytes
+    with regular(Path(path)) as raw:
+        before = stamp(raw, include_change=True)
+        if before[2] > limit:
+            raise ContractError('optical container exceeds metadata allowance', 'budget_exceeded')
+        stream = _BudgetStream(raw, _IOBudget(limit))
+        with h5py.File(stream, 'r', rdcc_nbytes=1024*1024) as handle:
+            _internal_storage(handle)
+            if 'metadata' not in handle or not isinstance(handle['metadata'],h5py.Group):
+                raise ContractError('optical container metadata required', 'corrupt_result')
+            attrs = handle['metadata'].attrs
+            def text(value):return value.decode('utf-8') if isinstance(value,bytes) else value
+            if (text(attrs.get('schema')) != 'qcl-negf-optical-v4'
+                    or text(attrs.get('schema_version')) != '4.0'
+                    or text(attrs.get('artifact_role')) != 'physics.analysis'
+                    or text(attrs.get('contract_set')) != 'qcl-negf.results.v2'):
+                raise ContractError('optical container schema differs', 'unsupported_format')
+            result = _optical_provenance(handle, owner)
+        if stamp(raw, include_change=True) != before:
+            raise ContractError('optical container changed during metadata read', 'source_changed')
+        with regular(Path(path), size=before[2]) as current:
+            if stamp(current, include_change=True) != before:
+                raise ContractError('optical container path changed', 'source_changed')
+    result['integrity'] = dict(scope='embedded_optical_v4_receipt_metadata',
+        native5_source_verified=False, scientific_acceptance='not_assessed')
+    return result
 
 
 def _json_scalar(handle: Any, path: str) -> Any:
@@ -62,86 +128,9 @@ def _identity_fields(source: Any, owner: Mapping[str, Any], *, cumulative: bool 
     return matched
 
 
-def _identity_report(matched: set[str], **extra: Any) -> dict[str, Any]:
-    return {"status": "matched" if len(matched) == len(IDENTITY_FIELDS) else
-            "partial" if matched else "not_available",
-            "fields": {field: "matched" if field in matched else "not_available" for field in IDENTITY_FIELDS},
-            **extra}
-
-
 def _state_identity(source: Any, owner: Mapping[str, Any]) -> None:
     if "state_id" in owner and (not isinstance(source, dict) or source != owner):
         raise ContractError("native state identity differs from its owning commit", "corrupt_result")
-
-
-def verify_native_provenance(path: Path, owner: Mapping[str, Any],
-                             plan: Mapping[str, Any] | None) -> dict[str, Any]:
-    """Check captured original bytes before export derivations; never rewrite them."""
-    with h5py.File(path, "r") as handle:
-        sources: list[str] = []
-        matched: set[str] = set()
-        for name in ("/metadata/identity_json", "/metadata/point_identity_json"):
-            if name in handle:
-                source = _json_scalar(handle, name)
-                _state_identity(source, owner)
-                matched |= _identity_fields(source, owner)
-                sources.append(name)
-        if "/metadata/state_identity_json" in handle:
-            _state_identity(_json_scalar(handle, "/metadata/state_identity_json"), owner)
-        result = {"identity": _identity_report(matched, sources=sources, scope="owning_commit")}
-        schema = handle["metadata"].attrs.get("schema", "") if "metadata" in handle else ""
-        if isinstance(schema, bytes):
-            schema = schema.decode("utf-8")
-        if schema == "qcl-negf-optical-v4":
-            result.update(_optical_provenance(handle, owner))
-        if "/metadata/source_segments_json" in handle:
-            segments = _json_scalar(handle, "/metadata/source_segments_json")
-            if not isinstance(segments, list):
-                raise ContractError("native history identity inventory must be a list", "corrupt_result")
-            all_fields = set(IDENTITY_FIELDS) if segments else set()
-            for segment in segments:
-                if not isinstance(segment, dict):
-                    raise ContractError("native history identity segment must be an object", "corrupt_result")
-                all_fields &= _identity_fields(segment.get("identity"), owner, cumulative=True)
-            result["history_segments"] = _identity_report(all_fields, count=len(segments),
-                source="/metadata/source_segments_json", attempt_policy="1..owning_commit.attempt")
-        point = next((item for item in (plan or {}).get("points", [])
-                      if item["id"] == owner.get("point_id")), None)
-        coordinates: dict[str, Any] = {}
-        for field, aliases in COORDINATE_PATHS.items():
-            observations: list[dict[str, Any]] = []
-            for name in aliases:
-                if name not in handle:
-                    continue
-                dataset = handle[name]
-                if (not isinstance(dataset, h5py.Dataset) or dataset.shape != ()
-                        or dataset.dtype.kind != "f" or dataset.dtype.itemsize != 8):
-                    raise ContractError(f"native {field} must be a Float64 scalar", "corrupt_result")
-                observed = float(dataset[()])
-                if not math.isfinite(observed):
-                    raise ContractError(f"native {field} must be finite", "corrupt_result")
-                observation = {"source": name, "observed": observed}
-                if point is None:
-                    observation.update(status="not_available", reason="frozen_plan_point_not_available")
-                else:
-                    expected = float(point[field])
-                    observation["expected"] = expected
-                    if observed.hex() == expected.hex():
-                        observation["status"] = "matched"
-                    elif field == "voltage_per_period_V":
-                        observation.update(status="not_verified", reason=
-                            "producer reconstructs voltage from F_bias * period_length; roundtrip comparison policy is not established")
-                    else:
-                        raise ContractError(f"native {field} differs from the frozen plan point", "corrupt_result")
-                observations.append(observation)
-            if not observations:
-                coordinates[field] = {"status": "not_available", "reason": "native_scalar_absent"}
-            else:
-                coordinates[field] = dict(next((value for value in observations if value["status"] != "matched"), observations[0]))
-                if len(observations) > 1:
-                    coordinates[field]["aliases"] = observations
-        result["coordinates"] = coordinates
-        return result
 
 
 def _optical_provenance(handle: Any, owner: Mapping[str, Any]) -> dict[str, Any]:

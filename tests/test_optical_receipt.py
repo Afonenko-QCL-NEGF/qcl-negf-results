@@ -4,7 +4,7 @@ import h5py
 import pytest
 
 from qcl_negf_contracts.messages import ContractError
-from qcl_negf_results.provenance import verify_native_provenance
+from qcl_negf_results.provenance import verify_optical_provenance
 from native_result_fixtures import declare_native
 
 
@@ -32,7 +32,7 @@ def test_optical_unknown_quality_remains_unknown_in_embedded_receipt(tmp_path):
                "discretization_verified": "not_measured", "scientific_accepted": False,
                "experimental_validation": "not_evaluated"}
     optical(path, source=receipt(), quality=quality)
-    report = verify_native_provenance(path, OWNER, None)
+    report = verify_optical_provenance(path, OWNER)
     assert report["source_state"]["state_sequence"] == 4
     assert report["stationary_quality"] == quality
 
@@ -52,4 +52,14 @@ def test_optical_cannot_claim_quality_or_ownership_from_sidecar(tmp_path, change
     path = tmp_path / "optical.h5"
     optical(path, source=source, quality=quality)
     with pytest.raises(ContractError, match="optical|quality|identity"):
-        verify_native_provenance(path, OWNER, None)
+        verify_optical_provenance(path, OWNER)
+
+
+@pytest.mark.parametrize('schema', ['qcl-negf-physics-analysis-v5', 'qcl-negf-checkpoint-v4', 'other'])
+def test_optical_provenance_refuses_other_container_schema(tmp_path, schema):
+    path = tmp_path / 'other.h5'
+    optical(path, source=receipt(), quality={'scientific_accepted':False})
+    with h5py.File(path, 'r+') as handle:
+        handle['metadata'].attrs['schema'] = schema
+    with pytest.raises(ContractError, match='optical.*schema|optical.*container'):
+        verify_optical_provenance(path, OWNER)

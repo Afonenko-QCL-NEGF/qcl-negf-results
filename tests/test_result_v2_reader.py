@@ -213,3 +213,21 @@ def test_state_context_cleanup_preserves_body_cancellation_and_other_owners(tmp_
             raise KeyboardInterrupt('literal primary')
     assert all(not handle.id.valid for handle in handles)
     assert any('cleanup' in note for note in caught.value.__notes__)
+
+
+def test_explicit_analysis_discovery_is_hdf_free_before_and_after_binding(tmp_path, monkeypatch):
+    from consumer_context_fixture import fixture
+    from qcl_negf_results.final_observations import FinalObservationsReader
+    selected, artifact, _, _, _ = fixture(tmp_path)
+    expected = {name: dict(available=False, reason=reason) for name, reason in (
+        ('saved_views', 'explicit_final_observations_ref_required'),
+        ('stored_observables', 'explicit_final_observations_ref_required'),
+        ('stored_final_diagnostics', 'explicit_final_diagnostics_ref_required'))}
+    with state.StateReader(tmp_path, state_ref=selected, expected_identity=selected['identity']) as reader:
+        for bound in (False, True):
+            if bound:
+                with FinalObservationsReader(reader, artifact_ref=artifact) as view:
+                    view.describe()
+            with monkeypatch.context() as guard:
+                guard.setattr(h5py, 'File', lambda *a, **kw: pytest.fail('generic discovery opened HDF'))
+                assert {name: reader.source.capabilities[name] for name in expected} == expected
