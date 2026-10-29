@@ -15,13 +15,12 @@ SCHEMA = "qcl-negf.presentation-index.v3"
 def accepted_result(record: dict[str, Any]) -> bool:
     """Project the native point contract; acceptance is never inferred from readiness.
 
-    Native Julia result rows publish ``converged`` and ``quality``. The explicit
-    acceptance flag belongs to artifact commits and is optional on those rows.
-    An explicit rejection must nevertheless remain a rejection.
+    Native Julia result rows publish ``converged`` and ``quality``. Only an explicit true scientific acceptance flag permits connection.
+    Missing, unknown and rejected acceptance remain disconnected.
     """
     return (record.get("status") == "completed" and record.get("quality") == "strict"
             and record.get("converged") is True
-            and record.get("scientific_accepted", True) is True)
+            and record.get("scientific_accepted") is True)
 
 
 def acceptance_kind(record: dict[str, Any]) -> str:

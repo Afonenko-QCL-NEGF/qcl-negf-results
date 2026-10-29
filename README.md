@@ -158,7 +158,8 @@ unknown names are errors. All operations share the reader's metadata, physical I
 selected-buffer limits. Borrowed view close leaves the StateReader usable; StateReader close
 attempts all owned handles even under cancellation.
 
-This raw API does not implement semantic SavedAnalysis, renderer, equilibrium adapter, transport
+Semantic `SavedAnalysis` and explicit-selection rendering now borrow this same reader; see
+[stored semantic views](docs/saved-views.md). This raw API does not implement the equilibrium adapter, transport
 association or analysis-export selection. Those mandatory migrations remain separate staged work.
 Python literal fixtures do not establish actual Julia 26+4-array interoperability. The production
 Python YAML parser's 21 literal portable trees, scalar types and Float64 bits have a separate
@@ -220,9 +221,10 @@ qcl-negf-results export /data/result /data/exports --identity identity.json --po
 ## Staged research capabilities
 
 This P06 stage provides native5 records, slices, scalar diagnostic projections, stored final
-diagnostics, raw stored final observations, reductions and selected exports. Full semantic saved
-physical views and stored equilibrium views still require their consumer adapters to the published
-actual-grid/scales/basis/model carrier. Their older entrypoints return `capability_unavailable`; the
+diagnostics, raw stored final observations, semantic saved views, explicit-selection rendering,
+reductions and selected exports. Stored equilibrium views still require their consumer adapter to
+the published actual-grid/scales/basis/model carrier. The equilibrium entrypoints still return
+`capability_unavailable`; the
 source description reports exact reasons. This is a staged migration, **not permanent removal of
 research functionality**. Required owning Runner/Results context, view and export followup must pass
 before final Portal/research release acceptance. Scientific statuses are copied as separate

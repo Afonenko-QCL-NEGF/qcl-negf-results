@@ -1,13 +1,10 @@
 """Literal saved-view oracles; no solver or state/full owner is needed."""
-import hashlib
-import json
 
 import h5py
 import numpy as np
 import pytest
 
 from qcl_negf_contracts.messages import ContractError
-from qcl_negf_results.commits import artifact_row, json_bytes
 from qcl_negf_results.saved_views import (AnalysisReader, SavedViewLimits, brief_result,
                                         describe_saved_views, read_saved_view)
 
@@ -101,154 +98,127 @@ def test_brief_legacy_absent_attempt_stays_unknown():
 
 
 def fixture(root, *, denominator=True):
-    root.mkdir()
-    path = root / "analysis.h5"
-    def attrs(obj, **values):
-        for key, value in values.items():
-            obj.attrs[key] = np.bytes_(value) if isinstance(value, str) else value
-    with h5py.File(path, "w") as h:
-        m = h.create_group("metadata")
-        attrs(m, schema="qcl-negf-physics-analysis-v4", schema_version="4.0",
-              artifact_role="physics.analysis", contract_set="qcl-negf.results.v1",
-              current_convention="positive electron flow toward +z", energy_reference="saved reference")
-        m["identity_json"] = np.bytes_(json.dumps(IDENTITY))
-        axes = {"z": ("axes/z_nm", [0., 2., 7.], "nm"),
-                "E": ("axes/energy_eV", [-.5, .25], "eV"),
-                "k": ("axes/k_per_nm", [0., .3], "nm^-1"),
-                "state": ("axes/state_index", [0, 1, 2], "1")}
-        for name, (native, values, units) in axes.items():
-            h[native] = values; attrs(h[native], units=units, logical_axis_order=name)
-        def data(native, values, names, units):
-            h[native] = np.asarray(values, dtype="f8")
-            attrs(h[native], units=units, logical_axis_order=",".join(names),
-                  axis_coordinate_paths_json=json.dumps([axes["state" if n == "state_prime" else n][0] for n in names]))
-        data("observables/spatial_energy_density", [[-11., 12., np.nan], [21., np.inf, -np.inf]], ["E", "z"], "m^-3/eV")
-        data("observables/density_per_m3", [0., -2., 8.], ["z"], "m^-3")
-        data("observables/spectral", [[101., 102.], [201., 202.]], ["E", "k"], "eV^-1")
-        data("basis/effective_wavefunctions/real", [[11., 12., 13.], [21., 22., 23.], [31., 32., 33.]], ["z", "state"], "nm^-1/2")
-        data("basis/effective_wavefunctions/imag", [[-11., -12., -13.], [-21., -22., -23.], [-31., -32., -33.]], ["z", "state"], "nm^-1/2")
-        data("basis/effective_density_matrix_per_m2/real", [[2., 11., 12.], [21., 4., 23.], [31., 32., 9.]], ["state", "state_prime"], "m^-2")
-        attrs(h["basis"], effective_gauge="saved gauge; degenerate states not matched")
-        h["axes/spatial_weights"] = [.1, .2, .7]
-        attrs(h["axes/spatial_weights"], units="dimensionless", integration_measure="dx", physical_measure_multiplier=1e-9, physical_measure_units="m")
-        if denominator:
-            h["inputs/N_dop_2D_per_m2"] = 10.
-            attrs(h["inputs/N_dop_2D_per_m2"], units="m^-2")
-            h["inputs/f_ion"] = .5
-            attrs(h["inputs/f_ion"], units="1")
-    owner = artifact_row(path, relative="analysis.h5", role="physics.analysis", media_type="application/x-hdf5", schema="qcl-negf-physics-analysis-v4")
-    commit = {"schema": "qcl-negf.artifact-commit.v2", "contract_set": "qcl-negf.results.v1", "generation": 1, "identity": IDENTITY,
-              "quality": "unconverged", "terminal_status": "failed", "scientific_accepted": False, "artifacts": [owner]}
-    commit_path = root / "commit.json"; commit_path.write_bytes(json_bytes(commit))
-    return commit_path
+    from consumer_context_fixture import semantic_fixture
+    root.mkdir(parents=True,exist_ok=True)
+    selected,artifact,_,_,_=semantic_fixture(root,denominator=denominator)
+    return root,selected,artifact
+
+
+from contextlib import contextmanager
+from qcl_negf_results.state import StateReader
+
+
+@contextmanager
+def selected_view(bundle, *, limits=None, expected_identity=None):
+    root,selected,artifact=bundle
+    with StateReader(root,state_ref=selected,expected_identity=expected_identity or selected['identity']) as owner:
+        with AnalysisReader(owner,artifact_ref=artifact,limits=limits) as view:
+            yield view,owner
+
+
+def semantic_read(bundle,view_id,selection,*,limits=None):
+    with selected_view(bundle,limits=limits) as (view,_): return view.read(view_id,selection)
+
+
+def semantic_describe(bundle,*,limits=None,expected_identity=None):
+    with selected_view(bundle,limits=limits,expected_identity=expected_identity) as (view,_): return view.describe()
+
 
 
 def test_manifest_never_reads_numeric_arrays_or_full_owner(tmp_path, monkeypatch):
-    commit = fixture(tmp_path / "record")
-    original = h5py.Dataset.__getitem__
-    def guarded(dataset, key):
-        if dataset.dtype.kind in "biufc":
-            pytest.fail("manifest read numeric payload")
-        return original(dataset, key)
-    monkeypatch.setattr(h5py.Dataset, "__getitem__", guarded)
-    manifest = describe_saved_views(commit, expected_identity=IDENTITY)
-    assert manifest["integrity"] == {"metadata_checked": True, "owner_sha_verified": False, "native_validation": "not_performed"}
-    heat = next(v for v in manifest["views"] if v["view_id"] == "spatial_energy_density")
-    assert heat["shape"] == [2, 3] and heat["axes"] == ["E", "z"]
-    assert manifest["files"][0]["role"] == "physics.analysis"
+    bundle=fixture(tmp_path/'record');original=h5py.Dataset.__getitem__
+    def guarded(dataset,key):
+        if dataset.dtype.kind in 'biufc': pytest.fail('manifest read numeric payload')
+        return original(dataset,key)
+    monkeypatch.setattr(h5py.Dataset,'__getitem__',guarded)
+    manifest=semantic_describe(bundle)
+    assert manifest['integrity']['observations_file_verified'] is True
+    assert manifest['integrity']['diagnostics_file_verified'] is True
+    assert manifest['integrity']['full_core_payloads_scope']=='not_assessed_by_this_operation'
+    heat=manifest['views']['spatial_energy_density']
+    assert heat['shape']==[2,3] and heat['axes']==['E','z']
+    assert manifest['artifact_ref']['schema']=='qcl-negf-physics-analysis-v5'
+
 
 
 def test_native_cells_axes_invalid_reasons_and_explicit_components(tmp_path):
-    commit = fixture(tmp_path / "record")
-    view = read_saved_view(commit, "spatial_energy_density", [{"start": 0, "stop": 2, "step": 1}, {"start": 0, "stop": 3, "step": 2}], expected_identity=IDENTITY)
-    assert view["values"] == [[-11., None], [21., None]]
-    assert view["invalid_mask"] == [[None, "nan"], [None, "negative_infinity"]]
-    assert view["axes"][1]["values"] == [0., 7.]
-    assert view["axes"][1]["weights"] == [.1, .7]
-    assert view["integrity"]["owner_sha_verified"] is True
-    assert read_saved_view(commit, "spectral_trace", [{"start": 0, "stop": 2, "step": 1}, 1], expected_identity=IDENTITY)["values"] == [102., 202.]
-    assert read_saved_view(commit, "effective_wavefunctions_imag", [1, 2], expected_identity=IDENTITY)["values"] == -23.
+    bundle=fixture(tmp_path/'record')
+    view=semantic_read(bundle,'spatial_energy_density',[dict(start=0,stop=2,step=1),dict(start=0,stop=3,step=2)])
+    assert view['values']==[[-11.,None],[21.,None]]
+    assert view['invalid_mask']==[[None,'nan'],[None,'negative_infinity']]
+    assert view['axes'][1]['values']==[0.,7.] and view['axes'][1]['weights']==[.1,.7]
+    assert view['integrity']['observations_file_verified'] is True
+    assert semantic_read(bundle,'spectral_trace',[slice(0,2),1])['values']==[102.,202.]
+    assert semantic_read(bundle,'effective_wavefunctions_imag',[1,2])['values']==-23.
+
 
 
 def test_population_target_doping_not_selected_subset_sum(tmp_path):
-    commit = fixture(tmp_path / "with")
-    data = read_saved_view(commit, "effective_populations", [{"start": 0, "stop": 2, "step": 1}], expected_identity=IDENTITY)
-    assert data["values"] == [2., 4.]
-    assert data["fractions"]["values"] == [.4, .8]
-    assert data["fractions"]["denominator"]["value"] == 5.
-    missing = read_saved_view(fixture(tmp_path / "without", denominator=False), "effective_populations", [0], expected_identity=IDENTITY)
-    assert missing["fractions"]["values"] is None
-    assert missing["fractions"]["reason"] == "saved_target_doping_unavailable"
+    data=semantic_read(fixture(tmp_path/'with'),'effective_populations',[slice(0,2)])
+    assert data['values']==[2.,4.]
+    assert data['fractions']['values']==[.4,.8]
+    assert data['fractions']['denominator']['value']==5.
+    missing=semantic_read(fixture(tmp_path/'without',denominator=False),'effective_populations',[0])
+    assert missing['fractions']['values'] is None
+    assert missing['fractions']['reason']=='saved_target_doping_nonpositive_or_invalid'
 
 
-def test_corrupt_sha_identity_and_budgets_refuse_before_payload(tmp_path, monkeypatch):
-    commit = fixture(tmp_path / "record")
-    with pytest.raises(ContractError):
-        describe_saved_views(commit, expected_identity={**IDENTITY, "attempt": 3})
-    with pytest.raises(ContractError):
-        read_saved_view(commit, "density", [slice(None)], expected_identity=IDENTITY, limits=SavedViewLimits(maximum_selected_bytes=1))
-    path = commit.parent / "analysis.h5"
-    declaration = json.loads(commit.read_bytes())
-    declaration["artifacts"][0]["sha256"] = "0"*64  # same-size healthy HDF5, wrong committed digest
-    commit.write_bytes(json_bytes(declaration))
-    with pytest.raises(ContractError):
-        read_saved_view(commit, "density", [0], expected_identity=IDENTITY)
-    monkeypatch.setattr(h5py, "File", lambda *a, **k: pytest.fail("over-cap owner opened"))
-    with pytest.raises(ContractError):
-        describe_saved_views(commit, expected_identity=IDENTITY, limits=SavedViewLimits(maximum_owner_bytes=1))
+
+def test_corrupt_sha_identity_and_budgets_refuse_before_payload(tmp_path,monkeypatch):
+    from copy import deepcopy
+    bundle=fixture(tmp_path/'record');root,selected,artifact=bundle
+    with pytest.raises(ContractError): semantic_describe(bundle,expected_identity={**selected['identity'],'attempt':'3'})
+    with pytest.raises(ContractError): semantic_read(bundle,'density',[slice(None)],limits=SavedViewLimits(maximum_selected_bytes=1))
+    bad=deepcopy(artifact);bad['sha256']='0'*64
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity']) as owner:
+        with pytest.raises(ContractError): AnalysisReader(owner,artifact_ref=bad).read('density',[0])
+    monkeypatch.setattr(h5py,'File',lambda *a,**k:pytest.fail('over-cap owner opened'))
+    with pytest.raises(ContractError): semantic_describe(bundle,limits=SavedViewLimits(maximum_owner_bytes=1))
 
 
-def test_selection_and_total_allocations_are_checked_before_numeric_reads(tmp_path, monkeypatch):
-    commit = fixture(tmp_path / "record")
-    original = h5py.Dataset.__getitem__
-    def no_numeric(dataset, key):
-        if dataset.dtype.kind in "biufc":
-            pytest.fail("refused selection read numeric array")
-        return original(dataset, key)
-    monkeypatch.setattr(h5py.Dataset, "__getitem__", no_numeric)
-    for selection, limits in (([slice(None)], SavedViewLimits(maximum_selected_bytes=24)),
-                              ([{"start": 0, "stop": 4, "step": 1}], SavedViewLimits()),
-                              ([{"start": 0, "stop": 3, "step": 0}], SavedViewLimits())):
-        with pytest.raises(ContractError):
-            read_saved_view(commit, "density", selection, expected_identity=IDENTITY, limits=limits)
-    with pytest.raises(ContractError):
-        read_saved_view(commit, "../../state_dimensionless/GR", [0], expected_identity=IDENTITY)
+
+def test_selection_and_total_allocations_are_checked_before_numeric_reads(tmp_path,monkeypatch):
+    bundle=fixture(tmp_path/'record');original=h5py.Dataset.__getitem__
+    def no_numeric(dataset,key):
+        if dataset.dtype.kind in 'biufc': pytest.fail('refused selection read numeric array')
+        return original(dataset,key)
+    monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+    for selection,limits in (([slice(None)],SavedViewLimits(maximum_selected_bytes=24)),
+        ([dict(start=0,stop=4,step=1)],SavedViewLimits()),([dict(start=0,stop=3,step=0)],SavedViewLimits())):
+        with pytest.raises(ContractError): semantic_read(bundle,'density',selection,limits=limits)
+    with pytest.raises(ContractError): semantic_read(bundle,'../../state_dimensionless/GR',[0])
+
 
 
 def test_missing_units_and_gauge_are_explicit_capabilities(tmp_path):
-    commit = fixture(tmp_path / "record")
-    path = commit.parent / "analysis.h5"
-    with h5py.File(path, "r+") as h:
-        del h["observables/density_per_m3"].attrs["units"]
-        del h["basis"].attrs["effective_gauge"]
-    declaration = json.loads(commit.read_bytes())
-    declaration["artifacts"] = [artifact_row(path, relative="analysis.h5", role="physics.analysis", media_type="application/x-hdf5", schema="qcl-negf-physics-analysis-v4")]
-    commit.write_bytes(json_bytes(declaration))
-    manifest = describe_saved_views(commit, expected_identity=IDENTITY)
-    rows = {row["view_id"]: row for row in manifest["views"]}
-    assert rows["density"]["availability"] == "unavailable"
-    assert rows["effective_wavefunctions_real"]["availability"] == "unavailable"
-    assert "units" in rows["density"]["reason"]
-    assert "gauge" in rows["effective_wavefunctions_real"]["reason"]
+    from consumer_context_fixture import change
+    for field in ('units','gauge'):
+        bundle=fixture(tmp_path/field);root,selected,artifact=bundle
+        def remove(value):
+            if field=='units': del value['views']['density_per_m3']['units']
+            else: del value['context']['effective_gauge']
+        change(root,selected,artifact,remove)
+        # Both are mandatory native5 contract fields, never optional capability.
+        with pytest.raises(ContractError): semantic_describe(bundle)
+
 
 
 def test_reader_closes_on_interrupted_view_and_reports_total_sha_delivery(tmp_path):
-    commit = fixture(tmp_path / "record")
+    bundle=fixture(tmp_path/'record')
     with pytest.raises(RuntimeError):
-        with AnalysisReader(commit, expected_identity=IDENTITY) as reader:
-            stream = reader._stream
-            raise RuntimeError("caller cancelled")
-    assert stream.closed
-    assert reader._handle is None
-    with AnalysisReader(commit, expected_identity=IDENTITY) as reader:
-        result = reader.read("density", [0])
-        counters = result["io_counters"]
-        assert counters["sha_bytes"] == reader.owner.size
-        assert counters["bytes_read_total"] >= reader.owner.size
-        assert counters["logical_selected_bytes"] == 24  # value + coordinate + weight
-        assert result["values"] == 0.
-        assert result["invalid_mask"] is None
-        assert result["axes"][0]["values"] == [0.]
+        with selected_view(bundle) as (view,owner):
+            result=view.read('density',[0]);handles=list(owner._handles.values())
+            raise RuntimeError('caller cancelled')
+    assert all(v['stream']._raw.closed and v['raw'].closed for v in handles)
+    assert not owner._handles
+    with selected_view(bundle) as (view,owner):
+        result=view.read('density',[0]);counters=result['io_counters']
+        assert counters['sha_bytes']>=int(bundle[2]['bytes'])
+        assert counters['bytes_read_total']>=int(bundle[2]['bytes'])
+        assert counters['logical_selected_bytes']==24
+        assert result['values']==0. and result['invalid_mask'] is None
+        assert result['axes'][0]['values']==[0.]
+
 
 
 def test_native_nested_assessment_positive_unknown_and_false_are_projected_verbatim(monkeypatch):
@@ -275,108 +245,68 @@ def test_native_nested_assessment_positive_unknown_and_false_are_projected_verba
         assert result["points"][1]["recorded_statuses"]["scientific_accepted"] is expected
 
 
-def test_attribute_datatype_and_scalar_fence_precedes_high_level_read(tmp_path, monkeypatch):
-    with h5py.File(tmp_path / "attributes.h5", "w") as h:
-        numeric = np.empty((), dtype=object)
-        numeric[()] = np.array([1, 2], dtype="i8")
-        h.attrs.create("vlen_numeric", numeric, dtype=h5py.vlen_dtype(np.dtype("i8")))
-        compound = np.empty((), dtype=np.dtype([("payload", h5py.vlen_dtype(np.dtype("i8")))]))
-        compound[()] = (np.array([3, 4], dtype="i8"),)
-        h.attrs.create("compound_vlen", compound, dtype=compound.dtype)
-        h.attrs["nonscalar"] = np.array([1., 2.])
-        h.attrs.create("healthy_utf8", "ν".encode(), dtype=h5py.string_dtype("utf-8", length=16))
-        h.attrs["healthy_float"] = np.float64(1.25)
-        manager = type(h.attrs)
-        original = manager.__getitem__
-        forbidden = {"vlen_numeric", "compound_vlen", "nonscalar"}
-        def fenced(attributes, name):
-            if name in forbidden:
-                pytest.fail("forbidden attribute reached high-level payload read")
-            return original(attributes, name)
-        monkeypatch.setattr(manager, "__getitem__", fenced)
-        reader = object.__new__(AnalysisReader)
-        reader.limits = SavedViewLimits()
-        reader._metadata_bytes = 0
-        for name in forbidden:
-            with pytest.raises(ContractError) as failure:
-                reader._attr(h, name)
-            assert failure.value.code == "unsupported_contract"
-        assert reader._metadata_bytes == 0
-        assert reader._attr(h, "healthy_utf8") == "ν"
-        assert reader._attr(h, "healthy_float") == 1.25
+def test_attribute_datatype_and_scalar_fence_precedes_high_level_read(tmp_path,monkeypatch):
+    from qcl_negf_results.native import _native_header
+    with h5py.File(tmp_path/'attributes.h5','w') as h:
+        for name in ('schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'):
+            h.attrs[name]=np.bytes_('healthy')
+        h.attrs.modify('schema',np.bytes_('healthy'))
+        assert _native_header(h,1024)['schema']=='healthy'
+        manager=type(h.attrs);original=manager.__getitem__
+        def fenced(attributes,name):
+            if name=='schema':pytest.fail('forbidden attribute reached high level read')
+            return original(attributes,name)
+        numeric=np.empty((),dtype=object);numeric[()]=np.array([1,2],dtype='i8')
+        compound=np.empty((),dtype=np.dtype([('payload',h5py.vlen_dtype(np.dtype('i8')))]));compound[()]=(np.array([3,4],dtype='i8'),)
+        for dtype,value in ((h5py.vlen_dtype(np.dtype('i8')),numeric),
+                            (compound.dtype,compound),(np.dtype('f8'),np.array([1.,2.])),(np.dtype('f8'),np.float64(1.25))):
+            del h.attrs['schema'];h.attrs.create('schema',value,dtype=dtype)
+            monkeypatch.setattr(manager,'__getitem__',fenced)
+            with pytest.raises(ContractError):_native_header(h,1024)
+            monkeypatch.setattr(manager,'__getitem__',original)
 
 
-def native_identity_fixture(root, extra):
-    commit = fixture(root)
-    path = root / "analysis.h5"
-    with h5py.File(path, "r+") as h:
-        del h["metadata/identity_json"]
-        h["metadata/identity_json"] = np.bytes_(json.dumps({**IDENTITY, **extra}))
-    declaration = json.loads(commit.read_bytes())
-    declaration["artifacts"] = [artifact_row(path, relative="analysis.h5", role="physics.analysis", media_type="application/x-hdf5", schema="qcl-negf-physics-analysis-v4")]
-    commit.write_bytes(json_bytes(declaration))
-    return commit
+
 
 
 @pytest.mark.parametrize("recorded,expected", [({"run_uuid": "A"}, {"run_uuid": "B"}),
     ({"calcjob_uuid": "job-A"}, {"calcjob_uuid": "job-B"}), ({"run_uuid": 1}, {"run_uuid": True})])
-def test_native_only_foreign_identity_cannot_be_relabelled(tmp_path, recorded, expected):
-    commit = native_identity_fixture(tmp_path / "record", recorded)
-    with pytest.raises(ContractError) as failure:
-        describe_saved_views(commit, expected_identity={**IDENTITY, **expected})
-    assert failure.value.code == "identity_mismatch"
-    # Matching recorded values remain readable even when the commit is legacy.
-    describe_saved_views(commit, expected_identity={**IDENTITY, **recorded})
+def test_native_only_foreign_identity_cannot_be_relabelled(tmp_path,recorded,expected):
+    bundle=fixture(tmp_path/'record');root,selected,artifact=bundle
+    # Native identity is closed: transport UUID extras are never aliases/proof.
+    with pytest.raises(ContractError): semantic_describe(bundle,expected_identity={**selected['identity'],**expected})
+    assert semantic_describe(bundle)['identity']==selected['identity']
+    from consumer_context_fixture import change
+    change(root,selected,artifact,lambda value:value['identity'].update(recorded))
+    with pytest.raises(ContractError): semantic_describe(bundle)
+
 
 
 def test_genuinely_absent_legacy_extra_identity_remains_unknown(tmp_path):
-    commit = fixture(tmp_path / "record")
-    expected = {**IDENTITY, "run_uuid": "provider-run", "calcjob_uuid": "provider-job"}
-    view = read_saved_view(commit, "density", [0], expected_identity=expected)
-    assert view["selection"]["run_uuid"] == "provider-run"
-    assert view["selection"]["calcjob_uuid"] == "provider-job"
-    assert view["identity_binding"]["native_recorded_fields"] == sorted(IDENTITY)
-    assert view["identity_binding"]["provider_only_fields"] == ["calcjob_uuid", "run_uuid"]
+    bundle=fixture(tmp_path/'record')
+    view=semantic_read(bundle,'density',[0])
+    assert view['identity']==bundle[1]['identity']
+    assert 'run_uuid' not in view['identity'] and 'calcjob_uuid' not in view['identity']
+    with pytest.raises(ContractError): semantic_describe(bundle,expected_identity={**bundle[1]['identity'],'run_uuid':'provider-run','calcjob_uuid':'provider-job'})
 
 
-def _with_json_dependency(commit):
-    from qcl_negf_results.model import canonical_bytes
-    dependency = commit.parent / "model.json"
-    configuration = {"fixture_only": True}
-    dependency.write_bytes(json_bytes({"schema": "qcl-negf-resolved-configuration-v3",
-        "contract_set": "qcl-negf.results.v1", "configuration": configuration,
-        "hash_encoding": "qcl-negf-canonical-bytes-v1",
-        "configuration_hash": hashlib.sha256(canonical_bytes(configuration)).hexdigest()}))
-    declaration = json.loads(commit.read_bytes())
-    declaration["artifacts"][0]["dependencies"] = ["model.json"]
-    declaration["artifacts"].append(artifact_row(dependency, relative="model.json",
-        role="model", media_type="application/json", schema="qcl-negf-resolved-configuration-v3"))
-    commit.write_bytes(json_bytes(declaration))
-    return dependency
+
 
 
 @pytest.mark.parametrize("target", ["commit", "owner", "dependency"])
-def test_final_symlink_swap_after_ancestry_check_is_rejected(tmp_path, monkeypatch, target):
+def test_final_symlink_swap_after_ancestry_check_is_rejected(tmp_path,monkeypatch,target):
     import os
-    import qcl_negf_results.saved_views as saved
-    commit = fixture(tmp_path / "record")
-    dependency = _with_json_dependency(commit)
-    selected = {"commit": commit, "owner": commit.parent / "analysis.h5",
-                "dependency": dependency}[target]
-    original_open = os.open
-    swapped = []
-    def swap_then_open(path, flags, *args, **kwargs):
-        if os.fspath(path) == str(selected) and not swapped:
-            held = selected.with_name(selected.name + ".held")
-            selected.rename(held)
-            selected.symlink_to(held.name)
-            swapped.append(True)
-        return original_open(path, flags, *args, **kwargs)
-    monkeypatch.setattr(saved.os, "open", swap_then_open)
-    with pytest.raises(ContractError) as failure:
-        describe_saved_views(commit, expected_identity=IDENTITY)
-    assert failure.value.code == "corrupt_result"
-    assert swapped == [True]  # Rejection must reach the final-component open.
+    bundle=fixture(tmp_path/'record');root,state,artifact=bundle
+    selected={'commit':root/state['manifest']['path'],'owner':root/artifact['path'],'dependency':root/'model.json'}[target]
+    original_open=os.open;swapped=[]
+    def swap_then_open(path,flags,*args,**kwargs):
+        if os.fspath(path) in (str(selected),selected.name) and not swapped:
+            held=selected.with_name(selected.name+'.held');selected.rename(held);selected.symlink_to(held.name);swapped.append(True)
+        return original_open(path,flags,*args,**kwargs)
+    monkeypatch.setattr(os,'open',swap_then_open)
+    with pytest.raises(ContractError):semantic_describe(bundle)
+    assert swapped==[True]
+
 
 
 @pytest.mark.parametrize("kind", ["fifo", "socket", "directory"])
@@ -460,133 +390,99 @@ def test_missing_required_nofollow_primitive_has_no_follow_fallback(tmp_path, mo
 
 
 @pytest.mark.parametrize("failure_type", [ContractError, KeyboardInterrupt])
-def test_constructor_metadata_failure_closes_owned_inode(tmp_path, monkeypatch, failure_type):
+def test_constructor_metadata_failure_closes_owned_inode(tmp_path,monkeypatch,failure_type):
     import os
-    import qcl_negf_results.saved_views as saved
-    commit = fixture(tmp_path / "record")
-    original_open = saved._open_regular
-    owned = []
-    def capture(path, **kwargs):
-        raw = original_open(path, **kwargs)
-        if str(path).endswith("analysis.h5"): owned.append((raw, raw.fileno()))
-        return raw
-    def broken_metadata(self):
-        if failure_type is ContractError: raise ContractError("literal metadata error", "corrupt_result")
-        raise KeyboardInterrupt("literal metadata interruption")
-    monkeypatch.setattr(saved, "_open_regular", capture)
-    monkeypatch.setattr(AnalysisReader, "_storage", broken_metadata)
-    with pytest.raises(failure_type):
-        AnalysisReader(commit, expected_identity=IDENTITY)
-    assert len(owned) == 1 and owned[0][0].closed
-    with pytest.raises(OSError): os.fstat(owned[0][1])
+    import qcl_negf_results.state as state
+    bundle=fixture(tmp_path/'record');root,selected,artifact=bundle;owned=[]
+    original=h5py.File
+    def capture(stream,*args,**kwargs):
+        if hasattr(stream,'_raw'): owned.append((stream._raw,stream._raw.fileno()))
+        return original(stream,*args,**kwargs)
+    def broken(*args,**kwargs):
+        if failure_type is ContractError:raise ContractError('literal metadata error','corrupt_result')
+        raise KeyboardInterrupt('literal metadata interruption')
+    monkeypatch.setattr(h5py,'File',capture);monkeypatch.setattr(state,'_internal_storage',broken)
+    with pytest.raises(failure_type):semantic_describe(bundle)
+    assert len(owned)==1 and owned[0][0].closed
+    with pytest.raises(OSError):os.fstat(owned[0][1])
+
 
 
 @pytest.mark.parametrize("failure_type", [RuntimeError, KeyboardInterrupt])
-def test_hdf_close_failure_still_closes_raw_and_repeated_close_is_safe(tmp_path, failure_type):
+def test_hdf_close_failure_still_closes_raw_and_repeated_close_is_safe(tmp_path,failure_type):
     import os
-    commit = fixture(tmp_path / "record")
-    reader = AnalysisReader(commit, expected_identity=IDENTITY)
-    handle, stream = reader._handle, reader._stream
-    descriptor = stream._raw.fileno()
-    class InterruptedClose:
-        def close(self):
-            handle.close()
-            raise failure_type("literal close failure")
-    reader._handle = InterruptedClose()
-    with pytest.raises(failure_type, match="literal close failure"):
-        reader.close()
-    assert stream.closed
-    with pytest.raises(OSError): os.fstat(descriptor)
-    reader.close()
-    assert reader._handle is reader._stream is None
+    bundle=fixture(tmp_path/'record');root,selected,artifact=bundle
+    owner=StateReader(root,state_ref=selected,expected_identity=selected['identity'])
+    view=AnalysisReader(owner,artifact_ref=artifact);view.describe();handles=list(owner._handles.values())
+    descriptors=[v['raw'].fileno() for v in handles]
+    def interrupted():raise failure_type('literal close failure')
+    # Every stack must finish its existing HDF/stream/raw callbacks despite error.
+    handles[0]['stack'].callback(interrupted)
+    view.close();assert owner._handles
+    with pytest.raises(failure_type,match='literal close failure'):owner.close()
+    assert all(v['raw'].closed and v['stream']._raw.closed for v in handles)
+    for fd in descriptors:
+        with pytest.raises(OSError):os.fstat(fd)
+    owner.close();view.close();assert not owner._handles
 
 
-def test_owner_hash_and_hdf_share_open_inode_after_path_replacement(tmp_path, monkeypatch):
+
+def test_owner_hash_and_hdf_share_open_inode_after_path_replacement(tmp_path,monkeypatch):
     import os
-    from pathlib import Path
-    import qcl_negf_results.saved_views as saved
-    commit = fixture(tmp_path / "original")
-    foreign_commit = fixture(tmp_path / "foreign")
-    foreign = foreign_commit.parent / "analysis.h5"
-    with h5py.File(foreign, "r+") as handle:
-        handle["observables/density_per_m3"][0] = 99.
-    owner = commit.parent / "analysis.h5"
-    original_hdf, original_verify = h5py.File, saved._verify_stream
-    streams, inodes, verified = [], [], []
-    original_path_open = Path.open
-    def no_owner_reopen(path, *args, **kwargs):
-        if path == owner: pytest.fail("owner pathname reopened")
-        return original_path_open(path, *args, **kwargs)
-    def capture_hdf(stream, *args, **kwargs):
-        assert isinstance(stream, saved._BudgetStream)
-        streams.append(stream)
-        info = os.fstat(stream._raw.fileno())
-        inodes.append((info.st_dev, info.st_ino))
-        handle = original_hdf(stream, *args, **kwargs)
-        os.replace(foreign, owner)  # Different healthy owner at the old pathname.
-        monkeypatch.setattr(Path, "open", no_owner_reopen)
+    bundle=fixture(tmp_path/'original');foreign_bundle=fixture(tmp_path/'foreign')
+    ownerpath=bundle[0]/bundle[2]['path'];foreign=foreign_bundle[0]/foreign_bundle[2]['path']
+    with h5py.File(foreign,'r+') as handle:handle['final_observations/arrays/density_per_m3'][0]=99.
+    original=h5py.File;streams=[]
+    def capture(stream,*args,**kwargs):
+        handle=original(stream,*args,**kwargs)
+        if hasattr(stream,'_raw') and not streams:
+            streams.append(stream);os.replace(foreign,ownerpath)
         return handle
-    def capture_verify(stream, size, digest):
-        assert stream is streams[0]
-        info = os.fstat(stream._raw.fileno())
-        assert (info.st_dev, info.st_ino) == inodes[0]
-        assert (owner.stat().st_dev, owner.stat().st_ino) != inodes[0]
-        verified.append(True)
-        return original_verify(stream, size, digest)
-    monkeypatch.setattr(saved.h5py, "File", capture_hdf)
-    monkeypatch.setattr(saved, "_verify_stream", capture_verify)
-    result = read_saved_view(commit, "density", [0], expected_identity=IDENTITY)
-    assert result["values"] == 0.  # Literal original, not replacement sentinel 99.
-    assert result["integrity"]["owner_sha_verified"] is True
-    assert verified == [True] and len(streams) == 1 and streams[0].closed
+    monkeypatch.setattr(h5py,'File',capture)
+    # Immutable source replacement must reject before publishing either inode's
+    # values. Earlier v4 returned original0; native5 strengthens source truth.
+    with pytest.raises(ContractError,match='changed'):semantic_read(bundle,'density',[0])
+    assert len(streams)==1 and streams[0]._raw.closed
+
 
 
 @pytest.mark.parametrize("stage", ["hdf_constructor", "owner_hash"])
-def test_hdf_or_hash_error_closes_owner_descriptor(tmp_path, monkeypatch, stage):
+def test_hdf_or_hash_error_closes_owner_descriptor(tmp_path,monkeypatch,stage):
     import os
-    import qcl_negf_results.saved_views as saved
-    commit = fixture(tmp_path / "record")
-    original_open = saved._open_regular
-    owned = []
-    def capture(path, **kwargs):
-        raw = original_open(path, **kwargs)
-        if str(path).endswith("analysis.h5"): owned.append((raw, raw.fileno()))
-        return raw
-    native_error = ValueError("literal native read failure")
-    def broken(*args, **kwargs): raise native_error
-    monkeypatch.setattr(saved, "_open_regular", capture)
-    if stage == "hdf_constructor":
-        monkeypatch.setattr(saved.h5py, "File", broken)
-        with pytest.raises(ContractError, match="saved native metadata cannot be read") as failure:
-            describe_saved_views(commit, expected_identity=IDENTITY)
-    else:
-        monkeypatch.setattr(saved, "_verify_stream", broken)
-        with pytest.raises(ContractError, match="saved native selection cannot be read") as failure:
-            read_saved_view(commit, "density", [0], expected_identity=IDENTITY)
-    assert failure.value.code == "corrupt_result"
-    assert failure.value.__cause__ is native_error
-    assert len(owned) == 1 and owned[0][0].closed
-    with pytest.raises(OSError): os.fstat(owned[0][1])
+    import qcl_negf_results.state as state
+    import qcl_negf_results._capture_io as capture_io
+    bundle=fixture(tmp_path/'record');original_regular=capture_io.regular;owned=[]
+    @contextmanager
+    def capture(path,**kwargs):
+        with original_regular(path,**kwargs) as raw:
+            if str(path).endswith('observations.h5'):owned.append((raw,raw.fileno()))
+            yield raw
+    error=ValueError('literal native read failure')
+    def broken(*args,**kwargs):raise error
+    monkeypatch.setattr(capture_io,'regular',capture)
+    if stage=='hdf_constructor':monkeypatch.setattr(h5py,'File',broken)
+    else:monkeypatch.setattr(state,'_verify_stream',broken)
+    with pytest.raises(ContractError) as failure:semantic_describe(bundle)
+    assert failure.value.code=='corrupt_result' and failure.value.__cause__ is error
+    assert len(owned)==1 and owned[0][0].closed
+    with pytest.raises(OSError):os.fstat(owned[0][1])
+
 
 
 def test_raw_descriptor_closes_even_if_budget_stream_close_is_interrupted(tmp_path):
     import os
-    commit = fixture(tmp_path / "record")
-    reader = AnalysisReader(commit, expected_identity=IDENTITY)
-    stream = reader._stream
-    raw = stream._raw
-    descriptor = raw.fileno()
-    original_close = stream.close
-    def interrupted(): raise KeyboardInterrupt("literal stream close interruption")
-    stream.close = interrupted
-    with pytest.raises(KeyboardInterrupt, match="literal stream close interruption"):
-        reader.close()
+    bundle=fixture(tmp_path/'record');root,selected,artifact=bundle
+    owner=StateReader(root,state_ref=selected,expected_identity=selected['identity'])
+    view=AnalysisReader(owner,artifact_ref=artifact);view.describe()
+    item=next(iter(owner._handles.values()));stream=item['stream'];raw=item['raw'];fd=raw.fileno();original_close=stream.close
+    def interrupted():raise KeyboardInterrupt('literal stream close interruption')
+    stream.close=interrupted
+    # Borrowed wrapper owns no additional FD and is not an owner-stack callback.
+    owner.close()
     assert raw.closed
-    with pytest.raises(OSError): os.fstat(descriptor)
-    reader.close()
-    # Restore the injected method before destruction of the detached stream.
-    stream.close = original_close
-    stream.close()
+    with pytest.raises(OSError):os.fstat(fd)
+    owner.close();view.close();stream.close=original_close;stream.close()
+
 
 
 def test_regular_open_uses_readonly_nofollow_cloexec_nonblock(tmp_path, monkeypatch):
@@ -609,3 +505,115 @@ def test_regular_open_uses_readonly_nofollow_cloexec_nonblock(tmp_path, monkeypa
     for flag in (os.O_NOFOLLOW, os.O_CLOEXEC, os.O_NONBLOCK):
         assert flags_seen[0] & flag == flag
     with pytest.raises(OSError): os.fstat(descriptor)
+
+# Native5 successor controls use only manufactured literal O1 cells.
+def test_native5_borrowed_facade_metadata_brief_and_alias(tmp_path, monkeypatch):
+    from consumer_context_fixture import fixture as native_fixture
+    from qcl_negf_results.saved_views import SavedAnalysis
+    from qcl_negf_results.state import StateReader
+    selected, artifact, value, _, _ = native_fixture(tmp_path)
+    original = h5py.Dataset.__getitem__
+    def no_numeric(dataset, key):
+        assert '/arrays/' not in dataset.name
+        return original(dataset, key)
+    with StateReader(tmp_path, state_ref=selected, expected_identity=selected['identity']) as owner:
+        with SavedAnalysis(owner, artifact_ref=artifact) as view:
+            assert SavedAnalysis is AnalysisReader
+            monkeypatch.setattr(h5py.Dataset, '__getitem__', no_numeric)
+            description = view.describe()
+            assert description['source_state'] == selected
+            assert description['recorded_statuses']['current'] == value['summary']
+            assert description['views']['spatial_energy_density']['units'] == 'eV^-1 m^-3'
+            brief = view.brief()
+            assert brief['summary']['scientific_accepted'] is None
+            assert brief['scalar_observables']['current_density_A_per_m2'] == value['views']['current_density_A_per_m2']
+            assert brief['request'] == value['request']
+        assert owner.source.state == selected
+
+
+def test_native5_complex_selection_full_square_population_and_raw_locator(tmp_path):
+    from consumer_context_fixture import fixture as native_fixture, change
+    from qcl_negf_results.state import StateReader
+    selected, artifact, _, _, _ = native_fixture(tmp_path)
+    change(tmp_path, selected, artifact, lambda d: d['context']['inputs'].update(
+        N_dop_2D_per_m2={'kind':'ieee','type':'f64','bits':'4024000000000000'},
+        f_ion={'kind':'ieee','type':'f64','bits':'3fe0000000000000'}))
+    with StateReader(tmp_path, state_ref=selected, expected_identity=selected['identity']) as owner:
+        with AnalysisReader(owner, artifact_ref=artifact) as view:
+            assert view.read('effective_wavefunctions_imag', [1,1])['values'] == 4.
+            result = view.read('effective_populations', [slice(0,2)])
+            assert result['values'] == [0.,3.]
+            assert result['fractions']['values'] == [0.,.6]
+            assert result['fractions']['denominator']['value'] == 5.
+            assert result['raw_selection']['artifact'] == artifact
+            assert result['raw_selection']['dataset'].endswith('/effective_density_matrix_per_m2')
+            assert len(result['raw_selection']['selection']) == 2
+            assert result['logical_axes'] == ['state']
+            assert result['recorded_statuses']['current']['scientific_accepted'] is None
+
+
+def test_native5_complex_preflight_counts_full_square_and_output_before_payload(tmp_path, monkeypatch):
+    from consumer_context_fixture import semantic_fixture
+    from qcl_negf_results.state import StateReader
+    selected, artifact, _, _, _ = semantic_fixture(tmp_path)
+    original = h5py.Dataset.__getitem__
+    def no_numeric(dataset,key):
+        assert '/arrays/' not in dataset.name
+        return original(dataset,key)
+    with StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity']) as owner:
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        with AnalysisReader(owner,artifact_ref=artifact,limits=SavedViewLimits(maximum_selected_bytes=200)) as view:
+            with pytest.raises(ContractError,match='complex data, output buffers'):
+                view.read('effective_populations',[slice(0,2)])
+
+
+def test_native5_narrow_matrix_output_containers_are_admitted_before_payload(tmp_path,monkeypatch):
+    from consumer_context_fixture import fixture as native_fixture
+    selected,artifact,_,_,_=native_fixture(tmp_path,nz=1,ne=32)
+    original=h5py.Dataset.__getitem__
+    def no_numeric(dataset,key):
+        assert '/arrays/' not in dataset.name,'nested finite-output allocation must reject before payload'
+        return original(dataset,key)
+    with StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity']) as owner:
+        monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
+        with AnalysisReader(owner,artifact_ref=artifact,limits=SavedViewLimits(maximum_selected_bytes=15000)) as view:
+            with pytest.raises(ContractError,match='output buffers'):
+                view.read('spatial_energy_density',[slice(None),slice(None)])
+
+
+def test_native5_public_wrappers_borrow_selected_owner_and_close_only_facade(tmp_path):
+    from consumer_context_fixture import semantic_fixture
+    selected,artifact,_,_,_=semantic_fixture(tmp_path)
+    with StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity']) as owner:
+        description=describe_saved_views(owner,artifact_ref=artifact)
+        result=read_saved_view(owner,'density',[slice(None)],artifact_ref=artifact)
+        assert description['source_state']==result['source_state']==selected
+        assert result['values']==[0.,-2.,8.]
+        assert owner._handles and not owner._closed
+        assert AnalysisReader(owner,artifact_ref=artifact).brief()['summary']['scientific_accepted'] is None
+
+
+def test_native5_semantic_publication_rechecks_owner_after_finite_projection(tmp_path,monkeypatch):
+    import qcl_negf_results.saved_views as saved
+    bundle=fixture(tmp_path/'source');root,_,artifact=bundle;original=saved._finite;changed=[]
+    def finite_then_tamper(value):
+        result=original(value)
+        if not changed and isinstance(value,np.ndarray) and value.shape==(3,) and np.array_equal(value,[0.,-2.,8.]):
+            with (root/artifact['path']).open('r+b') as raw:
+                raw.seek(-1,2);cell=raw.read(1);raw.seek(-1,2);raw.write(bytes([cell[0]^1]))
+            changed.append(True)
+        return result
+    monkeypatch.setattr(saved,'_finite',finite_then_tamper)
+    with pytest.raises(ContractError) as failure:semantic_read(bundle,'density',[slice(None)])
+    assert failure.value.code=='source_changed' and changed==[True]
+
+
+def test_native5_publication_guard_preserves_single_open_owner_cap(tmp_path):
+    from qcl_negf_results.state import ResultReadLimits
+    root,selected,artifact=fixture(tmp_path/'source')
+    with StateReader(root,state_ref=selected,expected_identity=selected['identity'],limits=ResultReadLimits(maximum_open_files=1)) as owner:
+        with AnalysisReader(owner,artifact_ref=artifact) as view:
+            assert view.describe()['source_state']==selected
+            assert view.read('density',[slice(None)])['values']==[0.,-2.,8.]
+            assert view.brief()['summary']['scientific_accepted'] is None
+            assert len(owner._handles)==1

@@ -6,23 +6,58 @@ observable, changes acceptance, or feeds sampled data back to the solver.
 from __future__ import annotations
 
 import base64
+from contextlib import contextmanager
 import hashlib
 import html
 import json
 import math
+import os
 import struct
+import sys
 import textwrap
 import zlib
 from pathlib import Path
-from typing import Any
+from typing import Any, Mapping, Sequence
 
 from qcl_negf_contracts.artifacts import CONTRACT_SET
 
-from .presentation import atomic_json, inside, read_contract_json
+from .presentation import atomic_json, inside
+from .state import Document
+from .saved_views import SavedAnalysis
+from .saved_views import _open_regular
+from .diagnostic_views import DiagnosticViewBatch
 
-RENDERER_REVISION = "qcl-negf-materialized-v4.0"
+RENDERER_REVISION = "qcl-negf-materialized-native5-v1.0"
 CONVERGENCE_REFERENCES = ((1e-4, "10⁻⁴"), (1e-6, "10⁻⁶"), (1e-8, "10⁻⁸"))
 COLORS = ("#176d52", "#a43b31", "#365b9e", "#8a651d", "#7b488c")
+
+
+def _json_tree_weight(value):
+    """Serialization reserve: repeated aliases expand again in JSON."""
+    weight=sys.getsizeof(value)
+    if isinstance(value,dict):
+        return weight+sum(_json_tree_weight(k)+_json_tree_weight(v) for k,v in value.items())
+    if isinstance(value,(tuple,list)):
+        return weight+sum(_json_tree_weight(v) for v in value)
+    return weight
+
+
+@contextmanager
+def _cache_file(path, *, maximum_size, expected_size=None):
+    """Qualify this one nofollow regular FD and check its path after reading."""
+    from qcl_negf_contracts.messages import ContractError
+    def signature(value):
+        return (value.st_dev,value.st_ino,value.st_mode,value.st_size,value.st_mtime_ns,value.st_ctime_ns)
+    with _open_regular(path) as stream:
+        opened=os.fstat(stream.fileno());identity=signature(opened)
+        if expected_size is not None and opened.st_size!=expected_size:
+            raise ContractError('cached metadata length differs from qualified source/contract memo','corrupt_result')
+        if opened.st_size>maximum_size:
+            raise ContractError('opened cached file exceeds workspace allowance','budget_exceeded')
+        yield stream,opened.st_size
+        if (signature(os.fstat(stream.fileno()))!=identity
+                or signature(path.stat(follow_symlinks=False))!=identity):
+            raise ContractError('cached file FD/path changed during bounded read','corrupt_result')
 MAX_CURVE_POINTS = 4096
 
 
@@ -187,40 +222,77 @@ def _svg(title: str, x_label: str, y_label: str, curves: list[tuple[str, Any, An
     return "".join(parts) + "</g></svg>"
 
 
+def _compress_bound(size: int) -> int:
+    # zlib compressBound formula for default zlib.compress parameters.
+    return size + (size >> 12) + (size >> 14) + (size >> 25) + 13
+
+
+def _raster_forecast(shape, display_shape=None, *, retained_bytes=0):
+    """Conservative explicit buffers, never allocator/RSS/native scratch bound.
+
+    N=H*W, R=3N+H, C=compressBound(R). Codec keeps matrix8N,
+    row<=23W, raw construction<=2R, chunk/CRC/result joins<=4C+4096.
+    Nonuniform display retains native PNG(C+57), source coordinates,
+    source midpoint temporaries, screen coordinates/indices and display8M.
+    SVG base64 bytes+text+joined copies charged at 16*ceil(P/3)+32768.
+    Caller containers and prior output strings are supplied separately.
+    """
+    h,w=shape; n=h*w; r=3*n+h; c=_compress_bound(r)
+    native=8*n+23*w+2*r+4*c+4096
+    peak=native+retained_bytes
+    if display_shape is not None:
+        dh,dw=display_shape; m=dh*dw; dr=3*m+dh; dc=_compress_bound(dr)
+        nearest=(c+57)+8*n+32*(w+h)+16*(dw+dh)+8*m
+        codec=23*dw+2*dr+4*dc+4096
+        # Native PNG and display PNG both retained while embedding SVG.
+        svg=(c+57)+(dc+57)+32*(w+h)+16*(dw+dh)+16*((dc+59)//3)+32768
+        peak=max(peak,retained_bytes+nearest+codec,retained_bytes+8*n+svg)
+    else:
+        peak=max(peak,retained_bytes+8*n+(c+57)+16*((c+59)//3)+32768)
+    return native,peak
+
+
 def _png(values: Any, *, color_limit: float | None = None) -> tuple[bytes, dict[str, Any]]:
     import numpy as np
+    matrix=np.asarray(values,dtype=np.float64)
+    if matrix.ndim != 2 or not all(matrix.shape):
+        raise ValueError('heatmap must have exactly two nonempty annotated axes')
+    minimum=math.inf; maximum=-math.inf; missing=0
+    for row in matrix:
+        for cell in row:
+            value=float(cell)
+            if math.isfinite(value): minimum=min(minimum,value); maximum=max(maximum,value)
+            else: missing+=1
+    observed=max(abs(minimum),abs(maximum)) if missing < matrix.size else 0.
+    limit=observed if color_limit is None else color_limit
+    if not math.isfinite(limit) or limit < observed:
+        raise ValueError('heatmap color range cannot clip a finite native value')
+    height,width=matrix.shape; raw=bytearray()
+    # One row and Python scalar arithmetic replace whole-image float/mask/RGB
+    # temporaries. Exact original uint8 truncation and signed scale are retained.
+    for row in matrix[::-1]:
+        pixels=bytearray(3*width)
+        for index,cell in enumerate(row):
+            value=float(cell); offset=3*index
+            if not math.isfinite(value): pixels[offset:offset+3]=b'\x9b\x9b\x9b'
+            else:
+                scaled=max(-1.,min(1.,value/(limit or 1.)))
+                pixels[offset]=int(255*(1-max(0.,-scaled)))
+                pixels[offset+1]=int(255*(1-abs(scaled)))
+                pixels[offset+2]=int(255*(1-max(0.,scaled)))
+        raw.append(0); raw.extend(pixels)
+    del pixels
+    def chunk(kind,data):
+        return struct.pack('>I',len(data))+kind+data+struct.pack('>I',zlib.crc32(kind+data)&0xffffffff)
+    compressed=zlib.compress(raw,6)
+    payload=b'\x89PNG\r\n\x1a\n'+chunk(b'IHDR',struct.pack('>IIBBBBB',width,height,8,2,0,0,0))+chunk(b'IDAT',compressed)+chunk(b'IEND',b'')
+    return payload,dict(native_shape=list(matrix.shape),display_shape=list(matrix.shape),sampling=[1,1],
+        color_range=[-limit,limit],native_range=None if missing==matrix.size else [minimum,maximum],
+        missing_count=missing,color_normalization='linear, symmetric about zero; range uses all finite native values, without clipping',
+        missing_color='#9b9b9b',orientation='energy increasing upward; position increasing rightward')
 
-    matrix = np.asarray(values, dtype=np.float64)
-    if matrix.ndim != 2:
-        raise ValueError("heatmap must have exactly two annotated axes")
-    # One PNG pixel per native cell; CSS controls the viewport, not the stored
-    # raster resolution. In particular, narrow negative/invalid witnesses are
-    # not discarded by a stride before a user opens the figure at full size.
-    stride_y = stride_x = 1
-    display = matrix
-    valid = np.isfinite(display)
-    finite = np.isfinite(matrix)
-    observed_limit = float(np.max(np.abs(matrix[finite]))) if finite.any() else 0.0
-    limit = observed_limit if color_limit is None else color_limit
-    if not math.isfinite(limit) or limit < observed_limit:
-        raise ValueError("heatmap color range cannot clip a finite native value")
-    # A signed diverging scale preserves negative witnesses; missing is gray.
-    scaled = np.clip(np.nan_to_num(display / (limit or 1.0)), -1, 1)
-    pixels = np.empty((*display.shape, 3), dtype=np.uint8)
-    pixels[:, :, 0] = 255 * (1 - np.maximum(0, -scaled))
-    pixels[:, :, 1] = 255 * (1 - np.abs(scaled))
-    pixels[:, :, 2] = 255 * (1 - np.maximum(0, scaled))
-    pixels[~valid] = [155, 155, 155]
-    pixels = pixels[::-1]  # lower energy is at the bottom, axes documented in index
-    raw = b"".join(b"\0" + row.tobytes() for row in pixels)
-    def chunk(kind: bytes, data: bytes) -> bytes:
-        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data) & 0xffffffff)
-    height, width = display.shape
-    payload = b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0)) + chunk(b"IDAT", zlib.compress(raw, 6)) + chunk(b"IEND", b"")
-    return payload, {"native_shape": list(matrix.shape), "display_shape": list(display.shape), "sampling": [stride_y, stride_x], "color_range": [-limit, limit], "native_range": [float(matrix[finite].min()), float(matrix[finite].max())] if finite.any() else None, "missing_count": int((~finite).sum()), "color_normalization": "linear, symmetric about zero; range uses all finite native values, without clipping", "missing_color": "#9b9b9b", "orientation": "energy increasing upward; position increasing rightward"}
 
-
-def _heatmap_svg(values: Any, z: Any, energy: Any, units: str, quality: str) -> tuple[str, bytes, dict[str, Any]]:
+def _heatmap_svg(values: Any, z: Any, energy: Any, units: str, quality: str, *, maximum_workspace_bytes=None, retained_bytes=0) -> tuple[str, bytes, dict[str, Any]]:
     """Render a physical E,z plot; raster dimensions never dictate card shape.
 
     The original HDF5 stays exact. On a nonuniform physical grid only the display
@@ -236,6 +308,17 @@ def _heatmap_svg(values: Any, z: Any, energy: Any, units: str, quality: str) -> 
     for axis in (z, energy):
         if axis.ndim != 1 or not np.isfinite(axis).all() or not (np.diff(axis) > 0).all():
             raise ValueError("heatmap physical axes must be finite and strictly increasing")
+    display_height,display_width=matrix.shape
+    if maximum_workspace_bytes is not None:
+        native,_=_raster_forecast(matrix.shape,retained_bytes=retained_bytes)
+        if native+retained_bytes > maximum_workspace_bytes:
+            raise ValueError('native raster exceeds explicit workspace allowance')
+        while _raster_forecast(matrix.shape,(display_height,display_width),retained_bytes=retained_bytes)[1] > maximum_workspace_bytes:
+            if display_height==2 and display_width==2:
+                raise ValueError('raster/output buffers exceed explicit workspace allowance')
+            if display_height >= display_width and display_height>2: display_height=max(2,display_height//2)
+            elif display_width>2: display_width=max(2,display_width//2)
+            else: display_height=max(2,display_height//2)
     raw, annotation = _png(matrix)
     regular = all(np.allclose(np.diff(axis), (axis[-1] - axis[0]) / (len(axis) - 1),
                               rtol=1e-7, atol=max(abs(axis[0]), abs(axis[-1]), 1e-12) * 1e-12) for axis in (z, energy))
@@ -243,8 +326,8 @@ def _heatmap_svg(values: Any, z: Any, energy: Any, units: str, quality: str) -> 
     if not regular:
         # A stretched index raster would misplace nonuniform physical samples.
         # Uniform screen pixels instead inherit the nearest original E,z cell.
-        xx = np.linspace(z[0], z[-1], min(1600, max(760, len(z))))
-        yy = np.linspace(energy[0], energy[-1], min(1024, max(370, len(energy))))
+        xx = np.linspace(z[0], z[-1], display_width)
+        yy = np.linspace(energy[0], energy[-1], display_height)
         zi = np.searchsorted((z[:-1] + z[1:]) / 2, xx)
         ei = np.searchsorted((energy[:-1] + energy[1:]) / 2, yy)
         raster, display = _png(matrix[np.ix_(ei, zi)], color_limit=annotation["color_range"][1])
@@ -288,152 +371,279 @@ def _heatmap_svg(values: Any, z: Any, energy: Any, units: str, quality: str) -> 
     return "".join(parts), raw, annotation
 
 
-def materialize(generation: Path, commit: dict[str, Any], commit_hash: str, destination: Path) -> dict[str, Any]:
-    import h5py
+def materialize(analysis: SavedAnalysis, destination: Path, *, selections: Mapping[str, Sequence[int | slice | Document]], history: tuple[DiagnosticViewBatch, ...] = ()) -> Document:
+    """Render explicit semantic blocks from a borrowed native5 reader only."""
     import numpy as np
-
-    from qcl_negf_contracts.artifacts import validate_commit
-    validate_commit(commit)
-    key = hashlib.sha256((commit_hash + CONTRACT_SET + RENDERER_REVISION).encode()).hexdigest()
-    target = destination / key
-    index_path = target / "index.json"
-    if index_path.is_file():
-        return read_contract_json(index_path, "qcl-negf.materialized-point.v3")
-    artifacts = [a for a in commit.get("artifacts", []) if a.get("role") == "physics.analysis"]
-    if not artifacts and any(a.get("schema") == "qcl-negf-operator-diagnostics-v4" for a in commit.get("artifacts", [])):
-        return {"schema": "qcl-negf.materialized-point.v3", "contract_set": CONTRACT_SET, "source_commit": commit_hash,
-                "renderer_revision": RENDERER_REVISION, "generation": commit.get("generation"),
-                "identity": commit.get("identity", {}), "quality": commit.get("quality"),
-                "scientific_accepted": commit.get("scientific_accepted") is True,
-                "physics_ready": False, "checkpoint_ready": False, "presentation_ready": True,
-                "figures": [], "validation": None, "positivity": None}
-    if len(artifacts) != 1:
-        raise ValueError("commit must declare one native analytical HDF5 record")
-    artifact = artifacts[0]
-    source = inside(generation, artifact["path"])
-    digest = hashlib.sha256()
-    with source.open("rb") as stream:
-        while block := stream.read(1024 * 1024):
-            digest.update(block)
-    if digest.hexdigest() != artifact["sha256"]:
-        raise ValueError("HDF5 hash differs from its committed record")
-    target.mkdir(parents=True, exist_ok=True)
-    quality = str(commit.get("quality", "not_evaluated"))
-    figures: list[dict[str, Any]] = []
-    def add_curve(identifier: str, title: str, x_label: str, y_label: str, curves: list[tuple[str, Any, Any]], datasets: list[str], log: bool = False) -> None:
-        curves = [curve for curve in curves if len(curve[1])]
-        if not curves:
-            return
-        filename = f"{identifier}.svg"
-        (target / filename).write_text(_svg(title, x_label, y_label, curves, quality, logarithmic=log), encoding="utf-8")
-        figures.append({"id": identifier, "title": title, "path": f"{key}/{filename}", "media_type": "image/svg+xml", "source_datasets": datasets, "units": {"x": x_label, "y": y_label}, "sampling": "display-only; at most 4096 samples per curve", "quality": quality, "source_commit": commit_hash})
-    validation, positivity = None, None
-    with h5py.File(source, "r") as record:
-        from .native import validate_native_handle
-        validate_native_handle(record, "physics.analysis", "qcl-negf-physics-analysis-v4")
-        def array(name: str):
-            if name not in record:
-                return None
-            item = record[name]
-            if not isinstance(item, h5py.Dataset):
-                raise ValueError(f"{name} must be a native dataset")
-            expected_axes = {"axes/z_nm": "z", "axes/energy_eV": "E", "axes/k_per_nm": "k",
-                             "observables/spatial_energy_density": "E,z", "observables/spectral": "E,k",
-                             "observables/occupied_spectral": "E,k", "basis/effective_wavefunctions/real": "z,state"}.get(name)
-            if name.startswith("observables/potential_") or name == "observables/density_per_m3":
-                expected_axes = "z"
-            if expected_axes and (item.ndim != len(expected_axes.split(",")) or _text(item.attrs.get("logical_axis_order", "")) != expected_axes):
-                raise ValueError(f"{name} has missing or inconsistent logical axis annotation")
-            shape = _text(item.attrs.get("logical_shape", ""))
-            if shape and tuple(int(size) for size in shape.split(",")) != item.shape:
-                raise ValueError(f"{name} logical shape disagrees with its stored shape")
-            return np.asarray(item[...])
-        for field in ("validation", "positivity"):
-            key_path = f"diagnostics/{field}_json"
-            if key_path in record:
-                encoded = _text(record[key_path][()])
-                if field == "validation":
-                    validation = json.loads(encoded)
-                else:
-                    positivity = json.loads(encoded)
-        z, energy = array("axes/z_nm"), array("axes/energy_eV")
-        if z is not None:
-            curves, datasets = [], []
-            for field, label in (("structure", "Структура"), ("external", "Внешний"), ("hartree", "Хартри"), ("total", "Полный")):
-                path = f"observables/potential_{field}_eV"
-                values = array(path)
-                if values is not None and values.ndim == 1 and len(values) == len(z):
-                    curves.append((label, z, values))
-                    datasets.append(path)
-            add_curve("potentials", "Потенциалы", "z, nm", "U, eV", curves, datasets)
-            density = array("observables/density_per_m3")
-            if density is not None and density.ndim == 1 and len(density) == len(z):
-                add_curve("density", "Плотность электронов", "z, nm", "n, m⁻³", [("n(z)", z, density)], ["observables/density_per_m3"])
-            wave = array("basis/effective_wavefunctions/real")
-            if wave is not None and wave.ndim == 2:
-                if wave.shape[0] == len(z):
-                    add_curve("wavefunctions", "Волновые функции", "z, nm", "Re ψ, опубликованная нормировка", [(f"Re ψ {i + 1}", z, wave[:, i]) for i in range(min(12, wave.shape[1]))], ["basis/effective_wavefunctions/real"])
-        if energy is not None:
-            curves, datasets = [], []
-            for name, label in (("spectral", "Спектральная"), ("occupied_spectral", "Занятые состояния")):
-                path = f"observables/{name}"
-                values = array(path)
-                if values is not None and values.ndim == 1 and len(values) == len(energy):
-                    curves.append((label, energy, values))
-                    datasets.append(path)
-                elif values is not None and values.ndim == 2 and values.shape[0] == len(energy):
-                    momentum = array("axes/k_per_nm")
-                    for index in sorted({0, values.shape[1] // 2, values.shape[1] - 1}):
-                        selected = float(momentum[index]) if momentum is not None else index
-                        curves.append((f"{label}, k={selected:.4g} nm⁻¹", energy, values[:, index]))
-                        datasets.append(path)
-            add_curve("spectra", "Опубликованные энергетические спектры", "E, eV", "trace A, trace (−iG˂), eV⁻¹", curves, datasets)
-            heat = array("observables/spatial_energy_density")
-            if heat is not None and heat.ndim == 2 and z is not None:
-                if heat.shape != (len(energy), len(z)):
-                    raise ValueError("spatial energy density does not match native axes")
-                units = _text(record["observables/spatial_energy_density"].attrs.get("units", "see HDF5"))
-                figure, payload, annotation = _heatmap_svg(heat, z, energy, units, quality)
-                (target / "energy-density.svg").write_text(figure, encoding="utf-8")
-                (target / "energy-density.png").write_bytes(payload)
-                figures.append({"id": "energy-density", "title": "Энергетическая и пространственная плотность", "path": f"{key}/energy-density.svg", "raw_path": f"{key}/energy-density.png", "media_type": "image/svg+xml", "source_datasets": ["observables/spatial_energy_density"], "source_commit": commit_hash, "quality": quality, "units": {"x": "z, nm", "y": "E, eV", "value": units}, **annotation})
-        for phase, counter in (("scba", "ν"), ("outer", "μ")):
-            curves, datasets = [], []
-            if f"diagnostics/{phase}" in record and isinstance(record[f"diagnostics/{phase}"], h5py.Group):
-                history = record[f"diagnostics/{phase}"]
-                for name, dataset in history.items():
-                    if name.startswith("r_") and isinstance(dataset, h5py.Dataset):
-                        values = np.asarray(dataset[...])
-                        if values.ndim == 1:
-                            curves.append((name, np.arange(1, len(values) + 1), values))
-                            datasets.append(f"diagnostics/{phase}/{name}")
-            add_curve(f"convergence-{phase}", f"История сходимости: {phase}", "Номер сохранённого шага", "невязка, log₁₀", curves, datasets, True)
-    result = {"schema": "qcl-negf.materialized-point.v3", "contract_set": CONTRACT_SET, "source_commit": commit_hash, "renderer_revision": RENDERER_REVISION, "generation": commit.get("generation"), "identity": commit.get("identity", {}), "quality": quality, "scientific_accepted": commit.get("scientific_accepted") is True, "physics_ready": commit.get("physics_ready") is True, "checkpoint_ready": commit.get("checkpoint_ready") is True, "presentation_ready": True, "figures": figures, "validation": validation, "positivity": positivity}
-    atomic_json(index_path, result)
-    return result
+    from .saved_views import AnalysisReader, _bounded
+    from .diagnostic_views import DiagnosticViewBatch
+    from .state import _metadata_weight
+    from qcl_negf_contracts.messages import ContractError
+    if not isinstance(analysis,AnalysisReader): raise TypeError('explicit SavedAnalysis required')
+    if not isinstance(selections,Mapping) or not selections: raise ValueError('explicit nonempty semantic selections required')
+    if not isinstance(history,tuple) or any(not isinstance(v,DiagnosticViewBatch) for v in history):
+        raise TypeError('explicit DiagnosticViewBatch tuple required')
+    with analysis._operation():
+        description=analysis.describe()
+        if any(v.source != description['source_state'] for v in history):
+            raise ContractError('history belongs to another selected StateRef','identity_mismatch')
+        normalized={}
+        for name,selection in selections.items():
+            if name not in description['views']: raise ValueError('unknown explicit semantic view')
+            view=description['views'][name]
+            if view['availability']!='available': raise ContractError(str(view['issue']),'capability_unavailable')
+            shape=view['shape'][:1] if name.endswith('_populations') else view['shape']
+            _,_,normalized[name]=analysis._normalize(selection,shape)
+        history_key=[dict(source=v.source,records=v.records,rows=v.rows,witness_updates=v.witness_updates,
+            cursor=v.cursor,at_cutoff=v.at_cutoff) for v in history]
+        retained=_metadata_weight((description,history_key,normalized))
+        if retained>analysis.limits.maximum_metadata_bytes: raise ContractError('retained render metadata exceeds allowance','budget_exceeded')
+        _bounded([dict(source=v.source,rows=v.rows,cursor=v.cursor) for v in history],analysis.limits.maximum_json_bytes)
+        effective=min(analysis.limits.maximum_selected_bytes,analysis.reader.limits.maximum_array_bytes)
+        workspace=16*effective+8*analysis.limits.maximum_cells
+        binding=dict(source_state=description['source_state'],identity=description['identity'],invocation=description['invocation'],
+            artifact_ref=description['artifact_ref'],checkpoint_ref=description['checkpoint_ref'],diagnostics_ref=description['diagnostics_ref'],
+            conventions=description['conventions'],recorded_statuses=description['recorded_statuses'],
+            limits=description['limits'],selections=normalized,history=history_key,renderer_revision=RENDERER_REVISION)
+        memo=getattr(analysis.reader,'_materialized_point_memo',None)
+        memo_weight=_metadata_weight(memo) if memo is not None else 0
+        if retained+memo_weight+13*_json_tree_weight(binding)+4096>workspace:
+            context='native raster' if 'spatial_energy_density' in selections else 'render'
+            raise ContractError(context+' binding and memo exceed workspace allowance','budget_exceeded')
+        key=hashlib.sha256(json.dumps(binding,sort_keys=True,ensure_ascii=False,allow_nan=False,separators=(',',':')).encode()).hexdigest()
+        # This one-entry, reader-lifetime memo comes ONLY from a qualified cold
+        # publication. Bytes detach it from returned dictionaries/caller aliases.
+        # A new key drops the previous entry before any new payload allocation.
+        if memo is not None and memo[0]!=key:
+            del analysis.reader._materialized_point_memo
+            memo=None
+        memo_weight=_metadata_weight(memo) if memo is not None else 0
+        retained+=_metadata_weight(binding)
+        # Forecast selected heatmap, finite response lists, coordinate arrays and
+        # output buffers from authenticated metadata BEFORE any numeric read.
+        for name,selection in selections.items():
+            view=description['views'][name]
+            items,counts,_=analysis._normalize(selection,view['shape'][:1] if name.endswith('_populations') else view['shape'])
+            if name=='spatial_energy_density':
+                if len(counts)!=2 or any(type(v) is int for v in items) or min(counts)<2:
+                    raise ValueError('heatmap requires explicit E,z ranges of at least two samples')
+                forecast=retained+memo_weight+128*math.prod(counts)+256*sum(counts)+4096
+                native,_=_raster_forecast(tuple(counts),retained_bytes=forecast)
+                if native+forecast>workspace: raise ContractError('native raster exceeds workspace allowance','budget_exceeded')
+        if retained+memo_weight>workspace:
+            raise ContractError('render metadata and memo exceed workspace allowance','budget_exceeded')
+        target=inside(Path(destination),key); index_path=inside(target,'index.json')
+        if memo is not None and index_path.exists():
+            # Exact bytes are compared before decoding untrusted JSON. No digest
+            # stored beside the untrusted metadata supplies its own authority.
+            # The 64L reserve covers decoded JSON containers; 4L covers a Unicode
+            # decode temporary. This is engineering workspace, not allocator RSS.
+            length=len(memo[1])
+            if retained+memo_weight+69*length+8192>workspace:
+                raise ContractError('cached metadata and memo exceed workspace allowance','budget_exceeded')
+            with _cache_file(index_path,maximum_size=length,expected_size=length) as (stream,_):
+                payload=stream.read(length+1)
+            if payload!=memo[1]:
+                raise ContractError('cached metadata differs from qualified source/contract reader memo','corrupt_result')
+            del payload
+            cached=json.loads(memo[1])
+            for figure in cached['figures']:
+                for path_key,hash_key in (('path','sha256'),('raw_path','raw_sha256'),('monitor_path','monitor_sha256')):
+                    if path_key not in figure: continue
+                    asset=inside(Path(destination),figure[path_key])
+                    available=workspace-retained-memo_weight-_metadata_weight(cached)-4096
+                    with _cache_file(asset,maximum_size=max(0,available//2)) as (stream,size):
+                        if available<0:
+                            raise ContractError('cached asset containers exceed workspace allowance','budget_exceeded')
+                        digest=hashlib.sha256();remaining=size
+                        while remaining:
+                            chunk=stream.read(min(65536,remaining))
+                            if not chunk:raise ContractError('cached asset shortened during bounded read','corrupt_result')
+                            digest.update(chunk);remaining-=len(chunk)
+                            del chunk
+                        if stream.read(1):raise ContractError('cached asset grew during bounded read','corrupt_result')
+                        if digest.hexdigest()!=figure[hash_key]:raise ValueError('cached asset hash differs')
+            analysis._publication_guard(description['source_state'],(description['artifact_ref'],description['diagnostics_ref']))
+            return cached
+        # An index left by another reader lifetime has no qualified memo here;
+        # recreate it from explicit selected source data instead of trusting it.
+        if memo is not None:
+            del analysis.reader._materialized_point_memo
+            memo=None
+            memo_weight=0
+        target.mkdir(parents=True,exist_ok=True)
+        summary=description['recorded_statuses']['current'];quality=summary['quality'];figures=[]
+        def publish(identifier,title,text,source,units,annotation=None,payload=None):
+            if len(text.encode('utf-8'))>workspace: raise ContractError('SVG exceeds workspace/output allowance','budget_exceeded')
+            filename=identifier+'.svg'; data=text.encode('utf-8');(target/filename).write_bytes(data)
+            figure=dict(id=identifier,title=title,path=f'{key}/{filename}',sha256=hashlib.sha256(data).hexdigest(),
+                media_type='image/svg+xml',source_state=description['source_state'],raw_selections=source,
+                units=units,quality=quality)
+            if annotation: figure.update(annotation)
+            if payload is not None:
+                (target/(identifier+'.png')).write_bytes(payload)
+                figure.update(raw_path=f'{key}/{identifier}.png',raw_sha256=hashlib.sha256(payload).hexdigest())
+            figures.append(figure)
+        for name,selection in selections.items():
+            result=analysis.read(name,selection)
+            values=np.asarray(result['values'],dtype=float); axes=result['axes']; raw=[result['raw_selection']]
+            if name=='spatial_energy_density':
+                forecast=retained+_metadata_weight(result)+values.nbytes+sum(8*len(v['values']) for v in axes)
+                text,payload,annotation=_heatmap_svg(values,axes[1]['values'],axes[0]['values'],result['units'],quality,
+                    maximum_workspace_bytes=workspace,retained_bytes=forecast)
+                publish('energy-density','Энергетическая и пространственная плотность',text,raw,
+                    dict(x='z, nm',y='E, eV',value=result['units']),annotation,payload)
+                del text,payload,annotation
+            elif values.ndim in (1,2):
+                coordinate=next(v for v in axes if v['name']==result['logical_axes'][0])
+                xs=np.asarray(coordinate['values'],dtype=float)
+                curves=[(name,xs,values)] if values.ndim==1 else [(name+f' [{i}]',xs,values[:,i]) for i in range(values.shape[1])]
+                text=_svg(name,coordinate['name']+', '+coordinate['units'],result['units'],curves,quality)
+                identifier=('potentials' if name=='potential_total' else 'wavefunctions' if name=='effective_wavefunctions_real'
+                    else 'spectra' if name=='spectral_trace' else name.replace('_','-'))
+                publish(identifier,name,text,raw,dict(x=coordinate['units'],y=result['units']))
+                del text,curves,xs,coordinate
+            else: raise ValueError('renderer requires a line or two dimensional semantic selection')
+            del result,values,axes
+        for stage in ('scba','outer'):
+            entries=[];names=set();previous_sequence={};seen_rows=set()
+            for batch in history:
+                def row_id(value):
+                    return json.dumps([value['identity'],value['invocation']['source_epoch'],value['row_key'],value['stream_ordinal']],sort_keys=True)
+                by_key={row_id(v):v for v in batch.records}
+                for row in batch.rows:
+                    row_lookup=json.dumps([row['source_identity'],row['source_epoch'],row['row_key'],row['stream_ordinal']],sort_keys=True)
+                    record=by_key.get(row_lookup)
+                    if record is None: raise ValueError('history row has no explicit raw record')
+                    core=record['core']['fields']
+                    if core['stage']['value']!=stage: continue
+                    native_source=json.dumps([record['identity'],record['invocation']],sort_keys=True)
+                    sequence=int(core['sequence']['decimal'])
+                    if row_lookup in seen_rows or sequence<=previous_sequence.get(native_source,-1) or row['sequence']!=core['sequence']:
+                        raise ValueError('explicit native history append sequence is duplicated or unordered')
+                    seen_rows.add(row_lookup);previous_sequence[native_source]=sequence
+                    from qcl_negf_contracts.results import validate_scientific_record
+                    from .diagnostic_views import _pairs
+                    validate_scientific_record(record)
+                    units=_pairs(core['units']);missing=_pairs(core['missing_reasons'])
+                    for field,cell in row['cells'].items():
+                        tag=core['row']['fields'][field]
+                        value=struct.unpack('>d' if tag['type']=='f64' else '>f',bytes.fromhex(tag['bits']))[0]
+                        if cell['tagged']!=tag or (cell['value']!=value if math.isfinite(value) else cell['value'] is not None):
+                            raise ValueError('history finite projection differs from explicit raw record')
+                        if cell['units']!=units.get(field) or cell['missing_reason']!=missing.get(field):
+                            raise ContractError('history units/missing projection differs from explicit raw pairs','corrupt_result')
+                    cycle=(json.dumps(record['identity'],sort_keys=True),record['invocation']['source_epoch'],int(core['outer_iteration']['decimal']),
+                        json.dumps([core[k] for k in ('domain_revision','discretization_id','basis_id')],sort_keys=True))
+                    entries.append((record,row,cycle));names.update(row['cells'])
+            if not entries: continue
+            if len(entries)>analysis.limits.maximum_line_points: raise ContractError('explicit history row allowance exceeded','budget_exceeded')
+            curves=[];boundaries=[];cycles=[]
+            for index,(record,row,cycle) in enumerate(entries):
+                if not cycles or cycles[-1]!=cycle:
+                    cycles.append(cycle)
+                    if index: boundaries.append((float(row['sequence']['decimal']),f"μ={cycle[2]} · a={record['identity']['attempt']}"))
+            for field in sorted(names):
+                xs=[];ys=[];previous_units=None
+                for record,row,cycle in entries:
+                    cell=row['cells'].get(field);x=float(row['sequence']['decimal'])
+                    units=cell['units'] if cell else None
+                    if (row['break_before'] or units!=previous_units) and xs: xs.append(float('nan'));ys.append(float('nan'))
+                    xs.append(x);ys.append(float(cell['value']) if cell and cell['value'] is not None and cell['missing_reason'] is None else float('nan'))
+                    previous_units=units
+                curves.append((field,xs,ys))
+            # Residuals use log display; J and other direct stored scalars
+            # remain signed linear values with their recorded units.
+            for field,xs,ys in curves:
+                if field.startswith('r_'):continue
+                units={row['cells'][field]['units'] for _,row,_ in entries if field in row['cells']}
+                unit=next(iter(units)) if len(units)==1 else 'stored units vary'
+                unit=unit if unit is not None else 'units not recorded'
+                text=_svg(field+': '+stage,'Сохранённая последовательность событий',unit,[(field,xs,ys)],quality)
+                publish('history-'+field+'-'+stage,field+': '+stage,text,[v[1]['row_key'] for v in entries],
+                    dict(x='stored event sequence',y=unit),dict(history_rows=len(entries),history_cycle_count=len(cycles),
+                        history_scope='explicit bounded batches; no all-history completeness inference'))
+                del text
+            curves=[curve for curve in curves if curve[0].startswith('r_')]
+            names={curve[0] for curve in curves}
+            if not curves:continue
+            latest=entries[-1][2];monitor=[v for v in entries if v[2]==latest]
+            native_iteration='inner_iteration' if stage=='scba' else 'outer_iteration'
+            monitor_curves=[]
+            for field in sorted(names):
+                xs=[];ys=[]
+                for record,row,cycle in monitor:
+                    cell=row['cells'].get(field)
+                    xs.append(float(record['core']['fields'][native_iteration]['decimal']))
+                    ys.append(float(cell['value']) if cell and cell['value'] is not None and cell['missing_reason'] is None else float('nan'))
+                monitor_curves.append((field,xs,ys))
+            first,last=monitor[0],monitor[-1]
+            context=dict(phase=stage,attempt=last[0]['identity']['attempt'],outer_iteration=latest[2],
+                first_iteration=int(first[0]['core']['fields'][native_iteration]['decimal']),last_iteration=int(last[0]['core']['fields'][native_iteration]['decimal']),
+                first_sequence=int(first[1]['sequence']['decimal']),last_sequence=int(last[1]['sequence']['decimal']),rows=len(monitor))
+            text=_svg('История сходимости: '+stage,'Сохранённая последовательность событий','невязка, log₁₀',curves,quality,logarithmic=True,boundaries=boundaries)
+            monitor_text=_svg('История сходимости: '+stage,'Итерация SCBA, ν' if stage=='scba' else 'Итерация внешнего цикла, μ',
+                'невязка, log₁₀',monitor_curves,quality,logarithmic=True,monitor=True)
+            monitor_path='convergence-'+stage+'-monitor.svg';monitor_data=monitor_text.encode('utf-8')
+            if len(monitor_data)>workspace:raise ContractError('monitor output exceeds allowance','budget_exceeded')
+            (target/monitor_path).write_bytes(monitor_data)
+            annotation=dict(history_rows=len(entries),history_cycle_count=len(cycles),monitor_context=context,
+                monitor_path=f'{key}/{monitor_path}',monitor_sha256=hashlib.sha256(monitor_data).hexdigest(),
+                history_scope='explicit bounded batches; no all-history completeness inference')
+            publish('convergence-'+stage,'История сходимости: '+stage,text,[v[1]['row_key'] for v in entries],
+                dict(x='stored event sequence',y='stored scalar; logarithmic display'),annotation)
+            del text,monitor_text,monitor_data,curves,monitor_curves
+        # No D1 numerical integral scan: only explicit stored tagged diagnostics.
+        diagnostic=analysis.raw._reader
+        from .final_diagnostics import FinalDiagnosticsReader
+        stored=FinalDiagnosticsReader(diagnostic,artifact_ref=description['diagnostics_ref']).describe().declaration
+        result=dict(schema='qcl-negf.materialized-point.v4',contract_set='qcl-negf.results.v2',cache_key=key,
+            source_binding=binding,source_state=description['source_state'],identity=description['identity'],
+            renderer_revision=RENDERER_REVISION,quality=quality,scientific_accepted=summary['scientific_accepted'],
+            presentation_ready=True,figures=figures,validation=stored['solution_metrics'],positivity=stored['positivity'])
+        weight=_metadata_weight(result)
+        if retained+weight+12*_json_tree_weight(result)+4096>workspace:
+            raise ContractError('new render memo/index exceeds workspace allowance','budget_exceeded')
+        _bounded(result,analysis.limits.maximum_json_bytes)
+        # Shared reader checks every retained owner before publishing the index.
+        analysis.describe()
+        atomic_json(index_path,result)
+        analysis._publication_guard(description['source_state'],(description['artifact_ref'],description['diagnostics_ref']))
+        # JSON string + UTF-8 buffers are conservatively reserved at 12 times
+        # retained object weight (escape expansion/Unicode storage), before
+        # encoding. The memo is immutable and contains no caller-owned objects.
+        payload=json.dumps(result,ensure_ascii=False,allow_nan=False,separators=(',',':')).encode()
+        if len(payload)>analysis.limits.maximum_json_bytes or retained+weight+len(payload)+256>workspace:
+            raise ContractError('new render memo exceeds output allowance','budget_exceeded')
+        analysis._publication_guard(description['source_state'],(description['artifact_ref'],description['diagnostics_ref']))
+        analysis.reader._materialized_point_memo=(key,payload)
+        return result
 
 
 def materialize_series(points: list[dict[str, Any]], destination: Path) -> list[dict[str, Any]]:
     """Render already-published scalar currents; invalid points break the line."""
+    from .presentation import accepted_result
     groups: dict[tuple[str, Any, Any], list[dict[str, Any]]] = {}
     for point in points:
         coordinates = point.get("coordinates") or {}
-        if point.get("observables", {}).get("current_density_A_per_m2") is None:
-            continue
         key = (point.get("execution_id", "unknown"), coordinates.get("temperature_K"), coordinates.get("branch"))
         groups.setdefault(key, []).append(point)
     curves = []
     for key, rows in groups.items():
         rows.sort(key=lambda p: p["coordinates"].get("order", 0))
         xs = [p["coordinates"]["voltage_per_period_V"] for p in rows]
-        ys = [p["observables"]["current_density_A_per_m2"] if p.get("scientific_accepted") else float("nan") for p in rows]
+        ys = [p.get("observables",{}).get("current_density_A_per_m2") if accepted_result(p) and type(p.get("observables",{}).get("current_density_A_per_m2")) in (float,int) else float("nan") for p in rows]
         curves.append((f"{key[0]} · {key[1]} K · {key[2]}", xs, ys))
         for point in rows:
-            if not point.get("scientific_accepted"):
+            if not accepted_result(point) and type(point.get("observables",{}).get("current_density_A_per_m2")) in (float,int):
                 curves.append((f"{point['id']} · непринята", [point["coordinates"]["voltage_per_period_V"]], [point["observables"]["current_density_A_per_m2"]]))
     if not curves:
         return []
-    render_key = hashlib.sha256(json.dumps(points, sort_keys=True, ensure_ascii=False, allow_nan=False).encode() + CONTRACT_SET.encode() + RENDERER_REVISION.encode()).hexdigest()
+    def typed_key(value):
+        if type(value) is float:return ['f64',struct.pack('>d',value).hex()]
+        if isinstance(value,dict):return ['map',[[k,typed_key(v)] for k,v in sorted(value.items())]]
+        if isinstance(value,list):return ['list',[typed_key(v) for v in value]]
+        return [type(value).__name__,value]
+    render_key = hashlib.sha256(json.dumps(typed_key(points), sort_keys=True, ensure_ascii=False, allow_nan=False).encode() + CONTRACT_SET.encode() + RENDERER_REVISION.encode()).hexdigest()
     target = destination / render_key
     target.mkdir(parents=True, exist_ok=True)
     path = target / "current-voltage.svg"

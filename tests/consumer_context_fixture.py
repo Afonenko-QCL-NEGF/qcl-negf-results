@@ -12,7 +12,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 from final_diagnostics_fixture import fixture as diagnostic_fixture, fixed_json
-from result_v2_fixture import encoded, ieee, integer, put, reference, symbol
+from result_v2_fixture import ieee, integer, put, reference, symbol
 
 PLAN = b'''# original manufactured input; preserve this comment\nname: configured_operating_points\nroot:\n  kind: level\n  name: temperature\n  axes: [{name: temperature_K, values: [200.0]}]\n  child:\n    kind: level\n    name: voltage\n    axes: [{name: voltage_per_period_V, values: [0.05]}]\n    child: {kind: leaf, name: poisson_scba}\n'''
 
@@ -31,15 +31,21 @@ def canonical(value):
     return b'm'+str(len(value)).encode()+b'{'+b''.join(canonical(k)+canonical(value[k]) for k in sorted(value))+b'}'
 
 
-def fixture(root, *, null_outputs=(), chunks=False, plan_bytes=PLAN, invalid_model=False, plan_kind="nested_sweep"):
+def fixture(root, *, null_outputs=(), chunks=False, plan_bytes=PLAN, invalid_model=False, plan_kind="nested_sweep", nz=4, ne=3, nk=2, nb=2):
     root=Path(root)
-    selected, diagnostics, diagnostic, checkpoint=diagnostic_fixture(root)
+    wire = dict(spectral_integral=np.zeros((nk,nb,nb),dtype='<c16'),
+        spectral_integral_eigenvalues=np.zeros((nk,nb),dtype='<f8'),
+        spectral_trace_cumulative=np.zeros((ne,nk),dtype='<f8'),
+        negative_energy_integral_scaled=np.zeros((6,nk),dtype='<f8'))
+    selected, diagnostics, diagnostic, checkpoint=diagnostic_fixture(root, values=wire if (ne,nk,nb)!=(3,2,2) else None)
+    diagnostic['dimensions'].update(energy=str(ne),momentum=str(nk),basis=str(nb))
+    diagnostic['positivity']['data']['integrals']['total_blocks_per_kind']=integer(ne*nk)
     manifest=json.loads((root/selected['manifest']['path']).read_bytes())
     state=checkpoint['state']['fields']; scba=state['scba']['fields']
-    state['published_U']['shape']=state['published_n']['shape']=['4']
+    state['published_U']['shape']=state['published_n']['shape']=[str(nz)]
     for owner in [scba['green']['fields']]+[entry['value']['fields'] for entry in scba['scattering']['entries']]+[scba[n]['fields'] for n in ('embedding','embedding_plus','embedding_minus')]:
         for value in owner.values():
-            if isinstance(value,dict) and value.get('kind')=='array' and len(value['shape'])==4: value['shape']=['3','2','2','2']
+            if isinstance(value,dict) and value.get('kind')=='array' and len(value['shape'])==4: value['shape']=list(map(str,(ne,nk,nb,nb)))
     # Every declared Core dataset exists, rather than the A1 unopened owner stub.
     def arrays(value):
         if isinstance(value,dict):
@@ -97,7 +103,7 @@ def fixture(root, *, null_outputs=(), chunks=False, plan_bytes=PLAN, invalid_mod
         del handle['final_diagnostics/declaration_json'];fixed_json(handle,'final_diagnostics/declaration_json',diagnostic)
     diagnostics=reference(root,'analysis.h5',diagnostics['schema'],'application/x-hdf5')
     schema=json.loads((Path(__file__).parents[2]/'qcl-negf-contracts/src/qcl_negf_contracts/schemas/final-observations.schema.json').read_bytes())
-    shape={'z':4,'E':3,'k':2,'state':2,'state_prime':2}; descriptors={};values={}
+    shape={'z':nz,'E':ne,'k':nk,'state':nb,'state_prime':nb}; descriptors={};values={}
     for key,item in schema['$defs'].items():
         if not key.startswith('Array_'):continue
         name=key[6:];p=item['properties'];d={k:deepcopy(v['const']) for k,v in p.items() if 'const' in v}
@@ -106,7 +112,7 @@ def fixture(root, *, null_outputs=(), chunks=False, plan_bytes=PLAN, invalid_mod
         count=np.prod(list(map(int,d['shape'])));a=np.arange(count,dtype='<f8').reshape(tuple(map(int,d['shape'])))
         values[name]=((a+1j*(a+1)).astype('<c16') if d['eltype']=='ComplexF64' else
                       a.astype('<i8') if d['eltype']=='Int64' else (a%2==0) if d['eltype']=='Bool' else a)
-    context=dict(dimensions={k:str(v) for k,v in dict(Nz=4,NE=3,Nk=2,Nb=2).items()},domain_revision=integer(0),
+    context=dict(dimensions={k:str(v) for k,v in dict(Nz=nz,NE=ne,Nk=nk,Nb=nb).items()},domain_revision=integer(0),
         discretization_id='c'*64,basis_id='d'*64,scales={k:ieee('3ff0000000000000') for k in ('E0_eV','L0_m','J0_A_per_m2')},
         inputs={k:ieee() for k in schema['$defs']['FinalObservationInputs']['properties']},problem_scattering=scattering,
         enabled_scattering=[],selfenergy_families=[],physical_models=options('PhysicalModelOptions'),
@@ -241,3 +247,80 @@ def completed_fixture(root):
     for key in ('convergence','physics'):manifest['status'][key]['evidence']=deepcopy(artifact)
     selected.update(identity=identity,state_id='state-child',manifest=put(root,'selected-child.json',manifest,manifest['schema']))
     return selected,artifact,value,child_checkpoint,values,parent
+
+
+def semantic_fixture(root, *, denominator=True):
+    """Independent literal cells retaining the original semantic view oracle."""
+    root=Path(root)
+    selected,artifact,value,checkpoint,values=fixture(root,nz=3,ne=2,nk=2,nb=3)
+    replacements=dict(z_nm=[0.,2.,7.],energy_eV=[-.5,.25],k_per_nm=[0.,.3],
+        wX=[.1,.2,.7],state_index=[0,1,2],density_per_m3=[0.,-2.,8.],
+        spatial_energy_density_per_eV_m3=[[-11.,12.,np.nan],[21.,np.inf,-np.inf]],
+        spectral_trace_per_eV=[[101.,102.],[201.,202.]],
+        effective_wavefunctions_per_sqrt_nm=np.array([[11.,12.,13.],[21.,22.,23.],[31.,32.,33.]])*(1-1j),
+        effective_density_matrix_per_m2=np.array([[2.,11.,12.],[21.,4.,23.],[31.,32.,9.]],dtype=complex))
+    with h5py.File(root/artifact['path'],'r+') as handle:
+        for name,data in replacements.items():
+            handle['/final_observations/arrays/'+name][...]=data
+            values[name]=np.asarray(data)
+    change(root,selected,artifact,lambda v:v['context']['inputs'].update(
+        N_dop_2D_per_m2=ieee('4024000000000000') if denominator else ieee(),
+        f_ion=ieee('3fe0000000000000')))
+    return selected,artifact,value,checkpoint,values
+
+
+def history_batch(selected, *, sequence=(1,2,3), iteration=None, outer=None, residual=(.1,.01,.001),
+                  attempts=None, stage='scba', break_before=None, checkpoint=None):
+    """Bounded literal DiagnosticViewBatch; values independently IEEE encoded."""
+    from qcl_negf_results.diagnostic_views import DiagnosticViewBatch
+    from result_v2_fixture import record
+    import math
+    iteration=iteration or tuple(range(1,len(sequence)+1));outer=outer or (1,)*len(sequence)
+    attempts=attempts or (selected['identity']['attempt'],)*len(sequence)
+    records=[];rows=[]
+    for i,(seq,inner,cycle,number,attempt) in enumerate(zip(sequence,iteration,outer,residual,attempts,strict=True)):
+        event=record(i+1,seq);event['identity']=dict(selected['identity'],attempt=str(attempt))
+        fields=event['core']['fields'];fields['inner_iteration']=integer(inner);fields['outer_iteration']=integer(cycle);fields['row']['fields']['ν']=integer(inner)
+        event['row_key'].update(inner_iteration=integer(inner),outer_iteration=integer(cycle))
+        field='r_K'
+        if stage=='outer':
+            field='r_U';fields['stage']=symbol('outer');event['row_key']['stage']=symbol('outer')
+            names=('r_P','r_U','r_n','r_neutral','r_J','r_Jchange','r_population','ζ','J')
+            fields['row']=dict(type='OuterIteration',fields={n:ieee() for n in names})
+            fields['row']['fields'].update(μ=integer(cycle),populations=deepcopy(checkpoint['state']['fields']['published_n']),density=deepcopy(checkpoint['state']['fields']['published_n']))
+        tag=ieee(struct.pack('>d',number).hex());fields['row']['fields'][field]=tag
+        invalid=None if math.isfinite(number) else 'nan' if math.isnan(number) else '+Inf' if number>0 else '-Inf'
+        broken=(i==0 or attempts[i]!=attempts[i-1] or cycle!=outer[i-1] or inner<=iteration[i-1]) if break_before is None else break_before[i]
+        rows.append(dict(row_key=deepcopy(event['row_key']),stream_ordinal=event['stream_ordinal'],sequence=integer(seq),
+            source_identity=deepcopy(event['identity']),source_epoch='epoch',status=deepcopy(fields['status']),
+            quality=deepcopy(fields['quality']),converged=False,break_before=broken,
+            cells={field:dict(tagged=tag,value=number if invalid is None else None,invalid_reason=invalid,units=None,missing_reason=None)}))
+        records.append(event)
+    return DiagnosticViewBatch(deepcopy(selected),tuple(records),tuple(rows),(),dict(literal_cursor=True),True,{})
+
+
+def render_fixture(root, *, ne=2):
+    root=Path(root)
+    selected,artifact,value,checkpoint,values=fixture(root,nz=3,ne=ne,nk=2,nb=2)
+    with h5py.File(root/artifact['path'],'r+') as handle:
+        arrays=handle['final_observations/arrays']
+        arrays['z_nm'][...]=[0.,1.,2.]
+        energy=np.array([-.1,.2]) if ne==2 else np.linspace(-.1473913140194004,.263098718019446,ne)
+        arrays['energy_eV'][...]=energy
+        arrays['density_per_m3'][...]=[1e20,-1e-10,2e20]
+        arrays['spatial_energy_density_per_eV_m3'][...]=([[1.,-1.,np.nan],[0.,.5,2.]] if ne==2 else
+            np.sin(np.arange(ne)[:,None]/100)*np.array([[1.,2.,3.]])*1e22)
+        arrays['effective_wavefunctions_per_sqrt_nm'][...]=np.array([[1.,0.],[.5,.5],[0.,1.]],dtype=complex)
+    refresh(root,selected,artifact)
+    # Independently stored diagnostics, not values derived from Core getters.
+    with h5py.File(root/'analysis.h5','r+') as handle:
+        d=json.loads(bytes(handle['final_diagnostics/declaration_json'][()]))
+        d['solution_metrics']['summary_metrics']=[dict(name='r_sum',value=ieee(struct.pack('>d',.43).hex()))]
+        for witness in d['positivity']['data']['witnesses']:witness['minimum_eigenvalue']=ieee(struct.pack('>d',-.001).hex())
+        del handle['final_diagnostics/declaration_json'];fixed_json(handle,'final_diagnostics/declaration_json',d)
+    diagnosticref=reference(root,'analysis.h5',artifact['schema'],'application/x-hdf5')
+    manifest=json.loads((root/selected['manifest']['path']).read_bytes())
+    next(v for v in manifest['artifacts'] if v['path']=='analysis.h5').update(diagnosticref)
+    selected['manifest']=put(root,'selected.json',manifest,manifest['schema'])
+    change(root,selected,artifact,lambda v:v.update(diagnostics=diagnosticref))
+    return selected,artifact,value,checkpoint,values

@@ -5,23 +5,22 @@ owns exact remote selection, copying, authentication and temporary-file lifetime
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
-import hashlib
+from contextlib import contextmanager
+import copy
+import struct
+from dataclasses import dataclass, replace
 import json
 import math
 import os
 import stat
-from pathlib import Path
-from typing import Any, Mapping
+import sys
+from typing import Mapping, Sequence
 
-import h5py
 import numpy as np
 
-from qcl_negf_contracts.artifacts import validate_commit
 from qcl_negf_contracts.messages import ContractError, scientific_plan
-from .commits import decode_json, safe_path
-from .provenance import _state_identity
-from .state import _BudgetStream, _IOBudget, _same_json_value, _verify_stream
+from .state import StateReader, Document, _same_json_value
+from .final_observations import FinalObservationsReader
 
 
 @dataclass(frozen=True)
@@ -42,30 +41,24 @@ class SavedViewLimits:
             raise ValueError("saved-view limits must be positive integers")
 
 
-# view_id -> native path, external axes, exact units, basis, diagonal projection.
+# view_id -> exact O1 field, logical axes, units, basis, diagonal, component.
 VIEWS = {
-    **{f"potential_{name}": (f"observables/potential_{name}_eV", ("z",), "eV", None, False)
+    **{f"potential_{name}": (f"potential_{name}_eV", ("z",), "eV", None, False, None)
        for name in ("structure", "external", "hartree", "total")},
-    "density": ("observables/density_per_m3", ("z",), "m^-3", None, False),
-    "spatial_energy_density": ("observables/spatial_energy_density", ("E", "z"), "m^-3/eV", None, False),
-    "spectral_trace": ("observables/spectral", ("E", "k"), "eV^-1", None, False),
-    "occupied_trace": ("observables/occupied_spectral", ("E", "k"), "eV^-1", None, False),
-    **{f"{basis}_levels": (f"basis/{basis}_levels_eV", ("state",), "eV", basis, False)
-       for basis in ("localized", "effective")},
-    **{f"{basis}_wavefunctions_{component}": (f"basis/{basis}_wavefunctions/{component}",
-        ("z", "state"), "nm^-1/2", basis, False)
-       for basis in ("localized", "effective") for component in ("real", "imag")},
-    **{f"{basis}_density_matrix_{component}": (f"basis/{native}/{component}",
-        ("state", "state_prime"), "m^-2", basis, False)
-       for basis, native in (("localized", "sheet_density_matrix_per_m2"), ("effective", "effective_density_matrix_per_m2"))
-       for component in ("real", "imag")},
-    **{f"{basis}_populations": (f"basis/{native}/real", ("state", "state_prime"), "m^-2", basis, True)
-       for basis, native in (("localized", "sheet_density_matrix_per_m2"), ("effective", "effective_density_matrix_per_m2"))},
+    "density": ("density_per_m3", ("z",), "m^-3", None, False, None),
+    "spatial_energy_density": ("spatial_energy_density_per_eV_m3", ("E", "z"), "eV^-1 m^-3", None, False, None),
+    **{name: (field, ("E","k"), "eV^-1", None, False, None) for name,field in
+       (("spectral_trace","spectral_trace_per_eV"),("occupied_trace","occupied_trace_per_eV"))},
+    **{f"{basis}_levels": (f"{basis}_levels_eV", ("state",), "eV", basis, False, None)
+       for basis in ("localized","effective")},
+    **{f"{basis}_wavefunctions_{component}": (f"{basis}_wavefunctions_per_sqrt_nm", ("z","state"), "nm^-1/2", basis, False, component)
+       for basis in ("localized","effective") for component in ("real","imag")},
+    **{f"{basis}_density_matrix_{component}": (field, ("state","state_prime"), "m^-2", basis, False, component)
+       for basis,field in (("localized","sheet_density_matrix_per_m2"),("effective","effective_density_matrix_per_m2"))
+       for component in ("real","imag")},
+    **{f"{basis}_populations": (field, ("state","state_prime"), "m^-2", basis, True, None)
+       for basis,field in (("localized","sheet_density_matrix_per_m2"),("effective","effective_density_matrix_per_m2"))},
 }
-AXES = {"z": "axes/z_nm", "E": "axes/energy_eV", "k": "axes/k_per_nm",
-        "state": "axes/state_index", "state_prime": "axes/state_index"}
-WEIGHTS = {"z": "axes/spatial_weights", "E": "axes/energy_weights", "k": "axes/momentum_weights"}
-
 
 def _error(code, reason):
     raise ContractError(reason, code)
@@ -210,240 +203,113 @@ def _open_regular(path, *, expected_size=None):
         raise
 
 
-def _saved_budget_json(path, maximum, budget):
-    # Keep state._budget_json's exact max+1 delivery/decode contract locally.
-    with _open_regular(path) as raw:
-        with _BudgetStream(raw, budget) as stream:
-            payload = stream.read(maximum + 1)
-    if len(payload) > maximum:
-        _error("corrupt_result", "JSON exceeds its declared budget")
-    return decode_json(payload, str(path)), payload
-
-
 class AnalysisReader:
-    """One declared analysis owner, metadata-only description and verified reads."""
-    def __init__(self, commit_path, *, expected_identity, limits=None):
-        raise ContractError('native5 independent analysis view is not yet published; use selected raw StateReader',
-                            'capability_unavailable')
-        self.limits = limits or SavedViewLimits()
-        self._budget = _IOBudget(self.limits.maximum_io_bytes)
-        self._handle = self._stream = self._raw = None
-        self._metadata_bytes = 0
-        self._verified = False
-        path = Path(commit_path)
-        if path.is_symlink() or any(p.is_symlink() for p in path.parents):
-            _error("corrupt_result", "commit path traverses symlink")
-        try:
-            self.commit, payload = _saved_budget_json(path, self.limits.maximum_metadata_bytes, self._budget)
-        except ContractError as error:
-            raise ContractError("invalid saved commit metadata", error.code) from error
-        self._charge_metadata(len(payload))
-        self.commit_sha256 = hashlib.sha256(payload).hexdigest()
-        artifacts = validate_commit(self.commit)
-        expected = dict(expected_identity or {})
-        self.expected_identity = expected
-        if not {"point_id", "execution_id", "attempt", "plan_fingerprint"} <= expected.keys():
-            _error("selection_required", "exact expected point identity required")
-        for key, value in expected.items():
-            if key == "source_commit_sha256":
-                if self.commit_sha256 != value: _error("identity_mismatch", "selected commit changed")
-            elif key in self.commit["identity"] or key in {"point_id", "execution_id", "attempt", "plan_fingerprint"}:
-                if not _same_json_value(self.commit["identity"].get(key), value):
-                    _error("identity_mismatch", "commit differs from selected identity")
-        owners = [item for item in artifacts if item.role == "physics.analysis"]
-        if len(owners) != 1 or owners[0].schema != "qcl-negf-physics-analysis-v4":
-            _error("unsupported_contract", "requires one declared native analysis owner")
-        self.owner = owners[0]
-        if self.owner.size > self.limits.maximum_owner_bytes:
-            _error("budget_exceeded", "analysis owner exceeds ordinary read cap")
-        by_path = {item.path: item for item in artifacts}
-        pending, checked = list(self.owner.dependencies), set()
-        while pending:
-            dependency = by_path[pending.pop()]
-            if dependency.path in checked:
-                continue
-            checked.add(dependency.path)
-            if dependency.media_type != "application/json":
-                _error("unsupported_contract", "analysis dependency is outside bounded metadata closure")
-            self._charge_metadata(dependency.size)
-            dependency_path = safe_path(path.parent, dependency.path)
-            with _open_regular(dependency_path, expected_size=dependency.size) as raw:
-                with _BudgetStream(raw, self._budget) as stream:
-                    self._budget.phase = "sha"
-                    _verify_stream(stream, dependency.size, dependency.sha256)
-            self._budget.phase = "metadata"
-            pending.extend(dependency.dependencies)
-        self.path = safe_path(path.parent, self.owner.path)
-        try:
-            self._raw = _open_regular(self.path, expected_size=self.owner.size)
-            self._stream = _BudgetStream(self._raw, self._budget)
-            self._budget.phase = "hdf"
-            self._handle = h5py.File(self._stream, "r")
-            self._storage()
-            header = self._handle.get("metadata")
-            if not isinstance(header, h5py.Group): _error("unsupported_contract", "native header absent")
-            for key, wanted in {"schema": self.owner.schema, "schema_version": "4.0", "artifact_role": "physics.analysis", "contract_set": "qcl-negf.results.v1"}.items():
-                if self._attr(header, key) != wanted: _error("unsupported_contract", "native header differs")
-            identity = self._json("metadata/identity_json")
-            if not isinstance(identity, dict): _error("corrupt_result", "native identity must be an object")
-            for key, value in self.commit["identity"].items():
-                if key not in identity or not _same_json_value(identity[key], value):
-                    _error("identity_mismatch", "native identity differs from owning commit")
-            _state_identity(identity, self.commit["identity"])
-            for key, value in expected.items():
-                if key in identity and not _same_json_value(identity[key], value):
-                    _error("identity_mismatch", "native recorded identity differs from expected selection")
-            self.identity_binding = {"native_recorded_fields": sorted(identity),
-                "provider_only_fields": sorted(key for key in ("run_uuid", "calcjob_uuid")
-                    if key in expected and key not in identity and key not in self.commit["identity"])}
-            self.conventions = {key: self._attr(header, key) for key in ("current_convention", "energy_reference")}
-            self.source_revisions = self._json("metadata/toolchain_json") if "metadata/toolchain_json" in self._handle else None
-        except BaseException as error:
-            self.close()
-            if isinstance(error, ContractError):
-                raise
-            if isinstance(error, Exception):
-                raise ContractError("saved native metadata cannot be read", "corrupt_result") from error
-            raise
+    """Semantic projection borrowing exactly one selected native5 StateReader."""
+    def __init__(self, reader: StateReader, *, artifact_ref: Document,
+                 limits: SavedViewLimits | None = None):
+        if not isinstance(reader, StateReader):
+            raise TypeError("explicit selected StateReader required")
+        self.reader, self.limits = reader, limits or SavedViewLimits()
+        if not isinstance(self.limits, SavedViewLimits):
+            raise TypeError("limits must be SavedViewLimits")
+        self.raw = FinalObservationsReader(reader, artifact_ref=artifact_ref)
+        self._closed = False
 
-    def __enter__(self): return self
+    def __enter__(self):
+        if self._closed: raise ValueError("saved view is closed")
+        return self
+
     def __exit__(self, *args): self.close()
+
     def close(self):
-        handle, stream, raw = self._handle, self._stream, self._raw
-        self._handle = self._stream = self._raw = None
+        self._closed = True
+        self.raw.close()
+
+    @contextmanager
+    def _operation(self):
+        if self._closed: raise ValueError("saved view is closed")
+        reader, limits = self.reader, self.limits
+        original = reader.limits
+        reader.limits = replace(original,
+            maximum_metadata_bytes=min(original.maximum_metadata_bytes, limits.maximum_metadata_bytes),
+            maximum_array_bytes=min(original.maximum_array_bytes, limits.maximum_selected_bytes),
+            maximum_hdf_objects=min(original.maximum_hdf_objects, limits.maximum_objects))
         try:
-            if handle is not None:
-                handle.close()
-        finally:
-            try:
-                if stream is not None:
-                    stream.close()
-            finally:
-                if raw is not None:
-                    raw.close()
+            with reader._consumer_operation(limits.maximum_io_bytes,
+                    maximum_owner_bytes=limits.maximum_owner_bytes): yield
+        except ContractError:
+            raise
+        except (OSError,ValueError) as error:
+            raise ContractError('saved native metadata/selection cannot be read: '+str(error),'corrupt_result') from error
+        finally: reader.limits = original
 
-    def _charge_metadata(self, count):
-        self._metadata_bytes += count
-        if self._metadata_bytes > self.limits.maximum_metadata_bytes:
-            _error("budget_exceeded", "native metadata exceeds cap")
+    def _publication_guard(self, source, references):
+        # Semantic conversion/cache work happens after raw ArrayBlock checks.
+        # Recheck actual retained owner FDs immediately before public return;
+        # this is stat/FD identity checking, never a warm full-file SHA rescan.
+        if self.reader.source.state != source:
+            _error('source_changed','selected source changed before semantic publication')
+        for index,reference in enumerate(references):
+            key=(reference['path'],reference['sha256'])
+            item=self.reader._handles.get(key)
+            if item is None:
+                if index==0: _error('source_changed','selected owner no longer retained before semantic publication')
+                continue  # Optional cached metadata owner can be evicted by cap1.
+            self.reader._check_hdf_owner(key,item)
 
-    def _attr(self, obj, name):
-        if name not in obj.attrs: return None
-        identifier = obj.attrs.get_id(name)
-        dtype, space = identifier.get_type(), identifier.get_space()
-        try:
-            # Check the low-level atomic type and SCALAR dataspace before any
-            # high-level payload read or NumPy conversion: VLEN descriptor width
-            # does not bound heap allocation, including compound-with-VLEN types.
-            if (space.get_simple_extent_type() != h5py.h5s.SCALAR or
-                    space.get_simple_extent_dims() != () or space.get_simple_extent_npoints() != 1):
-                _error("unsupported_contract", "metadata attributes require scalar dataspace")
-            kind, width = dtype.get_class(), dtype.get_size()
-            if kind == h5py.h5t.STRING:
-                if (dtype.is_variable_str() or width < 1 or
-                        dtype.get_cset() not in {h5py.h5t.CSET_ASCII, h5py.h5t.CSET_UTF8}):
-                    _error("unsupported_contract", "bounded metadata requires atomic fixed strings")
-            elif kind == h5py.h5t.INTEGER:
-                if width not in {1, 2, 4, 8}:
-                    _error("unsupported_contract", "unsupported atomic integer metadata width")
-            elif kind == h5py.h5t.FLOAT:
-                if width not in {4, 8}:
-                    _error("unsupported_contract", "unsupported atomic float metadata width")
-            else:
-                _error("unsupported_contract", "metadata rejects VLEN, compound, array and reference types")
-            self._charge_metadata(width)
-            value = obj.attrs[name]
-            if isinstance(value, bytes): return value.decode("utf-8")
-            if isinstance(value, np.generic): return value.item()
-            if isinstance(value, (str, int, float, bool)): return value
-            _error("unsupported_contract", "metadata attributes must be scalars")
-        finally:
-            space.close(); dtype.close(); identifier.close()
+    @staticmethod
+    def _conventions(context, basis=None):
+        names = ('basis_contract', 'energy_reference', 'effective_gauge', 'localization',
+                 'boundary_condition', 'energy_shift_discretization', 'basis_id',
+                 'discretization_id', 'domain_revision', 'scales')
+        result = {name: copy.deepcopy(context[name]) for name in names}
+        result['gauge'] = context['effective_gauge'] if basis == 'effective' else context['localization'] if basis else None
+        return result
 
-    def _json(self, path):
-        if path not in self._handle: _error("corrupt_result", "required native identity missing")
-        obj = self._handle[path]
-        if not isinstance(obj, h5py.Dataset) or obj.shape != () or obj.dtype.kind != "S":
-            _error("unsupported_contract", "bounded JSON metadata requires fixed-string scalar")
-        self._charge_metadata(obj.dtype.itemsize)
-        return decode_json(b'{"value":' + bytes(obj[()]) + b'}', "native metadata")["value"]
+    def _base(self, description):
+        value = description.declaration
+        return dict(source_state=description.source, identity=copy.deepcopy(value['identity']),
+            invocation=description.invocation, artifact_ref=description.artifact,
+            checkpoint_ref=description.checkpoint, diagnostics_ref=description.diagnostics,
+            recorded_statuses=dict(current=copy.deepcopy(value['summary']),
+                original=copy.deepcopy(description.original_evidence), restoration=copy.deepcopy(value['restoration'])),
+            conventions=self._conventions(value['context']), issues=copy.deepcopy(value['issues']),
+            integrity=copy.deepcopy(description.integrity), limits=vars(self.limits).copy())
 
-    def _storage(self):
-        pending, seen, count = [self._handle], set(), 0
-        while pending:
-            group = pending.pop()
-            address = h5py.h5o.get_info(group.id).addr
-            if address in seen: continue
-            seen.add(address)
-            for key in group:
-                count += 1
-                if count > self.limits.maximum_objects: _error("budget_exceeded", "native inventory exceeds cap")
-                if not isinstance(group.get(key, getlink=True), h5py.HardLink):
-                    _error("corrupt_result", "analysis rejects external and soft links")
-                item = group[key]
-                if isinstance(item, h5py.Group): pending.append(item)
-                elif isinstance(item, h5py.Dataset) and (item.is_virtual or item.external):
-                    _error("corrupt_result", "analysis rejects unowned virtual/external storage")
+    def _descriptor(self, description, view_id):
+        if view_id not in VIEWS: _error('missing_dataset', 'unknown semantic saved view')
+        field, axes, units, basis, diagonal, component = VIEWS[view_id]
+        value = description.declaration
+        native = value['views'][field]
+        issue = next((v for v in value['issues'] if v['target'] == field), None)
+        return dict(view_id=view_id, field=field, native_descriptor=copy.deepcopy(native),
+            shape=None if native is None else list(map(int,native['shape'])),
+            axes=list(axes), units=units, basis=basis, component=component,
+            conventions=self._conventions(value['context'], basis),
+            availability='unavailable' if native is None else 'available', issue=copy.deepcopy(issue),
+            allowed_selection=dict(axis_count=1 if diagonal else len(axes), index_origin=0, positive_step=True))
 
-    def _numeric(self, path, shape=None):
-        if path not in self._handle: _error("missing_dataset", "saved native dataset unavailable")
-        obj = self._handle[path]
-        if not isinstance(obj, h5py.Dataset) or obj.dtype.kind not in "biuf" or obj.dtype.hasobject or obj.dtype.itemsize not in {1, 2, 4, 8}:
-            _error("unsupported_contract", "view requires supported fixed-width real numeric data")
-        if shape is not None and obj.shape != shape: _error("corrupt_result", "saved axis shape differs")
-        return obj
+    def describe(self) -> Document:
+        with self._operation():
+            description = self.raw.describe()
+            result = self._base(description)
+            result['views'] = {name:self._descriptor(description,name) for name in VIEWS}
+            result['io_counters'] = self.reader.io_counters
+            _bounded(result,self.limits.maximum_json_bytes)
+            self._publication_guard(description.source,(description.artifact,description.diagnostics))
+            return result
 
-    def _describe(self, view_id):
-        if view_id not in VIEWS: _error("missing_dataset", "unknown semantic saved view")
-        path, axes, units, basis, diagonal = VIEWS[view_id]
-        obj = self._numeric(path)
-        if obj.ndim != len(axes) or self._attr(obj, "logical_axis_order") != ",".join(axes):
-            _error("corrupt_result", "native axes differ from semantic view")
-        if self._attr(obj, "units") != units: _error("missing_dataset", "required saved units unavailable")
-        logical_shape = self._attr(obj, "logical_shape")
-        if logical_shape is not None and logical_shape != ",".join(map(str, obj.shape)):
-            _error("corrupt_result", "logical and stored shapes differ")
-        raw = self._attr(obj, "axis_coordinate_paths_json")
-        try: paths = json.loads(raw) if isinstance(raw, str) else None
-        except ValueError as error: raise ContractError("invalid saved axis paths", "corrupt_result") from error
-        if paths != [AXES[a] for a in axes] and paths != ["/"+AXES[a] for a in axes]:
-            _error("missing_dataset", "explicit native axis mapping unavailable")
-        for axis, size in zip(axes, obj.shape):
-            coordinate = self._numeric(AXES[axis], (size,))
-            expected_units = {"z": "nm", "E": "eV", "k": "nm^-1", "state": "1", "state_prime": "1"}[axis]
-            if self._attr(coordinate, "units") != expected_units:
-                _error("missing_dataset", "required coordinate units unavailable")
-            if axis in {"state", "state_prime"} and coordinate.dtype.kind not in "iu":
-                _error("corrupt_result", "saved state indices must be integers")
-        gauge = self._attr(self._handle["basis"], "effective_gauge") if basis == "effective" else (
-            self._attr(self._handle["basis"], "localization") if basis else None)
-        if basis and not gauge: _error("missing_dataset", "saved basis/gauge unavailable")
-        if diagonal and (obj.ndim != 2 or obj.shape[0] != obj.shape[1]):
-            _error("corrupt_result", "population matrix must be square")
-        return {"view_id": view_id, "artifact_id": self.owner.path, "native_paths": [path],
-                "shape": list(obj.shape), "dtype": str(obj.dtype), "axes": list(axes), "units": units,
-                "basis": basis, "conventions": {**self.conventions, "gauge": gauge},
-                "allowed_selection": {"axis_count": 1 if diagonal else obj.ndim, "index_origin": 0, "positive_step": True,
-                    "maximum_cells": self.limits.maximum_cells}, "availability": "available", "reason": None}
-
-    def _integrity(self):
-        return {"metadata_checked": True, "owner_sha_verified": self._verified, "native_validation": "not_performed"}
-
-    def describe(self):
-        views = []
-        for view_id in VIEWS:
-            try: views.append(self._describe(view_id))
-            except ContractError as error:
-                if error.code != "missing_dataset": raise
-                views.append({"view_id": view_id, "artifact_id": self.owner.path, "availability": "unavailable", "reason": str(error)})
-        return _bounded({"files": [{"artifact_id": self.owner.path, "role": self.owner.role, "schema": self.owner.schema,
-            "bytes": self.owner.size, "sha256": self.owner.sha256, "commit_sha256": self.commit_sha256}],
-            "identity": dict(self.commit["identity"]), "identity_binding": self.identity_binding,
-            "views": views, "integrity": self._integrity(),
-            "source_commit_sha256": self.commit_sha256,
-            "source": {"source_revisions": self.source_revisions,
-                       "unknown_fields": ["source_revisions"] if self.source_revisions is None else []},
-            "limits": vars(self.limits), "io_counters": self._budget.counters()}, self.limits.maximum_json_bytes)
+    def brief(self) -> Document:
+        with self._operation():
+            description = self.raw.describe(); value = description.declaration
+            result = self._base(description)
+            result.update(request=copy.deepcopy(value['request']), summary=copy.deepcopy(value['summary']),
+                scalar_observables={k:copy.deepcopy(value['views'][k]) for k in
+                    ('current_density_A_per_m2','sheet_density_per_m2')},
+                io_counters=self.reader.io_counters)
+            _bounded(result,self.limits.maximum_json_bytes)
+            self._publication_guard(description.source,(description.artifact,description.diagnostics))
+            return result
 
     def _normalize(self, selection, shape):
         if not isinstance(selection, (list, tuple)) or len(selection) != len(shape):
@@ -468,124 +334,114 @@ class AnalysisReader:
             normalized.append(dict(item))
         return items, counts, normalized
 
-    def _chunk_bound(self, obj):
-        if obj.chunks and math.prod(obj.chunks)*obj.dtype.itemsize > self.limits.maximum_selected_bytes:
-            _error("budget_exceeded", "decoded HDF5 chunk exceeds selection allocation cap")
-        plist = obj.id.get_create_plist()
-        try:
-            if any(plist.get_filter(i)[0] not in {1, 2, 3, 4, 5, 6} for i in range(plist.get_nfilters())):
-                _error("unsupported_contract", "external HDF5 filter unavailable for bounded views")
-        finally:
-            plist.close()
 
-    def read(self, view_id, selection):
-        try:
-            return self._read(view_id, selection)
-        except ContractError:
-            raise
-        except (OSError, ValueError, TypeError, KeyError) as error:
-            raise ContractError("saved native selection cannot be read", "corrupt_result") from error
-
-    def _read(self, view_id, selection):
-        description = self._describe(view_id)
-        native, names, units, basis, diagonal = VIEWS[view_id]
-        dataset = self._numeric(native)
-        semantic_shape = (dataset.shape[0],) if diagonal else dataset.shape
-        selected, counts, normalized = self._normalize(selection, semantic_shape)
-        if diagonal:
-            # Read only the explicitly selected square block, never a full
-            # matrix to extract a tiny diagonal. Its full allocation is charged.
-            item = selected[0]
-            item = slice(item, item+1, 1) if type(item) is int else item
-            native_selected = [item, item]
-            native_counts = [counts[0], counts[0]]
-            output_names = ["state"]
-            output_items = [item]
-        else:
-            native_selected, native_counts = selected, counts
-            output_names, output_items = list(names), selected
-        cells = math.prod(native_counts)
-        if cells > self.limits.maximum_cells:
-            _error("budget_exceeded", "selected native cells exceed cap")
-        for axis, count in zip(names, native_counts):
-            if axis in {"state", "state_prime"}:
-                cap = self.limits.maximum_matrix_states if "density_matrix" in view_id else self.limits.maximum_states
-                if count > cap: _error("budget_exceeded", "explicit state subset exceeds cap")
-        if sum(type(item) is not int for item in native_selected) <= 1 and max(native_counts) > self.limits.maximum_line_points:
-            _error("budget_exceeded", "line selection exceeds native point cap")
-        self._chunk_bound(dataset)
-        required = cells * dataset.dtype.itemsize
-        vectors = []
-        for axis, item in zip(output_names, output_items):
-            size = dataset.shape[names.index(axis)]
-            coordinate = self._numeric(AXES[axis], (size,))
-            self._chunk_bound(coordinate)
-            count = 1 if type(item) is int else len(range(item.start, item.stop, item.step))
-            required += count*coordinate.dtype.itemsize
-            weight = self._numeric(WEIGHTS[axis], (size,)) if axis in WEIGHTS and WEIGHTS[axis] in self._handle else None
-            if weight is not None:
-                self._chunk_bound(weight); required += count*weight.dtype.itemsize
-            vectors.append((axis, item, coordinate, weight))
-        target = None
-        target_paths = ("inputs/N_dop_2D_per_m2", "inputs/f_ion")
-        if diagonal and all(path in self._handle for path in target_paths):
-            donor, ionization = [self._numeric(path, ()) for path in target_paths]
-            if self._attr(donor, "units") != "m^-2" or self._attr(ionization, "units") != "1":
-                _error("missing_dataset", "saved target doping units unavailable")
-            required += donor.dtype.itemsize + ionization.dtype.itemsize
-            target = (donor, ionization)
-        if required > self.limits.maximum_selected_bytes:
-            _error("budget_exceeded", "selected data, coordinates and weights exceed byte cap")
-        # SHA obligation covers the whole declared analysis owner, separately
-        # from hyperslab allocation and all HDF5 stream delivery counters.
-        if not self._verified:
-            self._budget.require(self.owner.size)
-            self._budget.phase = "sha"
-            try: _verify_stream(self._stream, self.owner.size, self.owner.sha256)
-            finally: self._budget.phase = "hdf"
-            self._verified = True
-        axes = []
-        for name, item, coordinate, weight in vectors:
-            coordinate_values = np.atleast_1d(coordinate[item])
-            finite_coordinates, coordinate_invalid = _finite(coordinate_values)
-            if any(reason is not None for reason in coordinate_invalid):
-                _error("corrupt_result", "saved coordinates must be finite")
-            weight_values, weight_invalid = _finite(np.atleast_1d(weight[item])) if weight is not None else (None, None)
-            axes.append({"name": name, "values": finite_coordinates, "units": self._attr(coordinate, "units"),
-                "source_path": AXES[name], "weights": weight_values, "weight_invalid_mask": weight_invalid,
-                "integration_measure": self._attr(weight, "integration_measure") if weight is not None else None,
-                "physical_measure_multiplier": self._attr(weight, "physical_measure_multiplier") if weight is not None else None,
-                "physical_measure_units": self._attr(weight, "physical_measure_units") if weight is not None else None})
-        values = dataset[tuple(native_selected)]
-        if diagonal: values = np.diag(values).copy()
-        finite_values, invalid = _finite(values)
-        fractions = None
-        if diagonal:
-            denominator = float(target[0][()]) * float(target[1][()]) if target else None
-            if denominator is not None and math.isfinite(denominator) and denominator > 0:
-                fraction_values, fraction_invalid = _finite(values/denominator)
-                fractions = {"values": fraction_values, "invalid_mask": fraction_invalid, "reason": None,
-                    "denominator": {"value": denominator, "units": "m^-2", "source_paths": list(target_paths),
-                        "kind": "results_derived_from_saved_target_inputs", "rule": "ionized_sheet_density = saved donor_sheet_density * saved ionization_fraction"}}
+    def read(self, view_id: str, selection: Sequence[int | slice | Document]) -> Document:
+        with self._operation():
+            description = self.raw.describe(); descriptor = self._descriptor(description, view_id)
+            field, names, units, basis, diagonal, component = VIEWS[view_id]
+            if descriptor['availability'] != 'available':
+                _error('capability_unavailable', str(descriptor['issue']))
+            native = descriptor['native_descriptor']; shape = descriptor['shape']
+            selected, counts, normalized = self._normalize(selection, shape[:1] if diagonal else shape)
+            if diagonal:
+                item = selected[0]
+                item = slice(item,item+1,1) if type(item) is int else item
+                native_selected, native_counts = [item,item], [counts[0],counts[0]]
+                output_names, output_items = ['state'], [item]
             else:
-                fractions = {"values": None, "invalid_mask": None, "denominator": None,
-                             "reason": "saved_target_doping_unavailable" if target is None else "saved_target_doping_nonpositive_or_invalid"}
-        self._budget.logical_selected_bytes += required
-        result = {"selection": {k: self.expected_identity.get(k, self.commit["identity"].get(k)) for k in ("run_uuid", "execution_id", "attempt", "calcjob_uuid")},
-            "point_id": self.commit["identity"]["point_id"], "identity_binding": self.identity_binding,
-            "source_commit_sha256": self.commit_sha256,
-            "artifact_sha256": self.owner.sha256, "view_id": view_id, "normalized_selection": normalized,
-            "native_shape": list(dataset.shape), "returned_shape": list(np.shape(values)),
-            "logical_axes": [name for name, item in zip(output_names, output_items) if type(item) is not int],
-            "axes": axes, "values": finite_values, "invalid_mask": invalid,
-            "units": units, "basis": basis, "conventions": description["conventions"],
-            "sampling": {"kind": "exact_native_selection", "step": [item.step if isinstance(item, slice) else None for item in selected]},
-            "recorded_statuses": {k: self.commit.get(k) for k in ("terminal_status", "quality", "converged", "scientific_accepted", "stationary_assessment")},
-            "integrity": self._integrity(), "limits": vars(self.limits), "io_counters": self._budget.counters(),
-            "fractions": fractions,
-            "source": {"source_revisions": self.source_revisions,
-                       "unknown_fields": ["source_revisions"] if self.source_revisions is None else []}}
-        return _bounded(result, self.limits.maximum_json_bytes)
+                native_selected, native_counts = selected, counts
+                output_names, output_items = list(names), selected
+            cells = math.prod(native_counts)
+            if cells > self.limits.maximum_cells: _error('budget_exceeded','selected native cells exceed cap')
+            for axis,count in zip(names,native_counts):
+                cap = self.limits.maximum_matrix_states if diagonal or 'density_matrix' in view_id else self.limits.maximum_states
+                if axis in ('state','state_prime') and count > cap:
+                    _error('budget_exceeded','explicit state subset exceeds cap')
+            if sum(type(v) is not int for v in native_selected) <= 1 and max(native_counts) > self.limits.maximum_line_points:
+                _error('budget_exceeded','line selection exceeds native point cap')
+            coordinate_fields = {'z':'z_nm','E':'energy_eV','k':'k_per_nm','state':'state_index','state_prime':'state_index'}
+            weight_fields = {'z':'wX','E':'wE','k':'wk'}
+            context = description.declaration['context']; vectors=[]
+            # Source complex block, native vectors, diagonal/fraction arrays and
+            # finite JSON output construction coexist; reject before payload.
+            required = 4096+cells*(16 if native['eltype']=='ComplexF64' else 8)
+            output_shape=(counts[0],) if diagonal else tuple(count for count,item in zip(counts,selected) if type(item) is not int)
+            output_retained,output_peak=_finite_buffers(output_shape)
+            required+=output_peak
+            if diagonal: required+=16*counts[0]+output_retained+output_peak
+            for axis,item in zip(output_names,output_items):
+                count = 1 if type(item) is int else len(range(item.start,item.stop,item.step))
+                vector_peak=8*count+_finite_buffers((count,))[1]
+                required+=vector_peak*(2 if axis in weight_fields else 1)
+                vectors.append((axis,item,count))
+            cap = min(self.limits.maximum_selected_bytes,self.reader.limits.maximum_array_bytes)
+            if required > cap: _error('budget_exceeded','selected complex data, output buffers, coordinates and weights exceed byte cap')
+            axes=[]
+            for axis,item,count in vectors:
+                coordinate_name=coordinate_fields[axis]; coordinate=context[coordinate_name]
+                values=self.raw.read_array(coordinate_name,(item,),maximum_bytes=cap).values
+                finite,invalid=_finite(np.atleast_1d(values))
+                if any(v is not None for v in invalid): _error('corrupt_result','saved coordinates must be finite')
+                weight_name=weight_fields.get(axis); weight=context[weight_name] if weight_name else None
+                weights,weight_invalid=(None,None) if weight is None else _finite(np.atleast_1d(
+                    self.raw.read_array(weight_name,(item,),maximum_bytes=cap).values))
+                axes.append(dict(name=axis,values=finite,units=coordinate['units'],source_path=coordinate['dataset'],
+                    weights=weights,weight_invalid_mask=weight_invalid,weight_descriptor=copy.deepcopy(weight),
+                    integration_measure='stored_dimensionless_quadrature' if weight else None,
+                    physical_measure=dict(scales=copy.deepcopy(context['scales']),axis=axis) if weight else None))
+            block=self.raw.read_array(field,tuple(native_selected),maximum_bytes=cap)
+            values=block.values
+            if component is not None: values=getattr(values,component)
+            if diagonal: values=np.diag(values.real).copy()
+            finite,invalid=_finite(values); fractions=None
+            if diagonal:
+                inputs=context['inputs']; donor,ionization=(inputs[k] for k in ('N_dop_2D_per_m2','f_ion'))
+                denominator=_ieee_value(donor)*_ieee_value(ionization)
+                if math.isfinite(denominator) and denominator > 0:
+                    fraction_values,fraction_invalid=_finite(values/denominator)
+                    fractions=dict(values=fraction_values,invalid_mask=fraction_invalid,reason=None,
+                        denominator=dict(value=denominator,units='m^-2',inputs=copy.deepcopy(dict(N_dop_2D_per_m2=donor,f_ion=ionization)),
+                            rule='ionized_sheet_density = saved donor_sheet_density * saved ionization_fraction'))
+                else: fractions=dict(values=None,invalid_mask=None,denominator=None,reason='saved_target_doping_nonpositive_or_invalid')
+            result=self._base(description)
+            result.update(view_id=view_id,normalized_selection=normalized,native_shape=shape,returned_shape=list(np.shape(values)),
+                logical_axes=[name for name,item in zip(output_names,output_items) if type(item) is not int],
+                axes=axes,values=finite,invalid_mask=invalid,units=units,basis=basis,conventions=descriptor['conventions'],
+                sampling=dict(kind='exact_native_selection',step=[item.step if isinstance(item,slice) else None for item in selected]),
+                fractions=fractions,raw_selection=dict(artifact=copy.deepcopy(description.artifact),dataset=native['dataset'],
+                    selection=[dict(start=v.start,stop=v.stop,step=v.step) if isinstance(v,slice) else v for v in native_selected]),
+                io_counters=self.reader.io_counters)
+            _bounded(result,self.limits.maximum_json_bytes)
+            self._publication_guard(description.source,(description.artifact,description.diagnostics))
+            return result
+
+
+SavedAnalysis = AnalysisReader
+
+
+def _ieee_value(value):
+    return struct.unpack('>d',bytes.fromhex(value['bits']))[0]
+
+def _finite_buffers(shape):
+    """Retained/peak Python finite-projection bytes on this runtime.
+
+    _finite builds one temporary list of (value,mask) tuples and then two
+    result lists at every dimension. list_resize's n+n/8+6 bound includes
+    comprehension over-allocation. Scalar36 covers all fixed Int64/Float64
+    values; shared None/reason constants are already live. Native array bytes
+    and a separate 4096-byte bounded scalar/view scratch reserve are external.
+    """
+    scalar=max(sys.getsizeof(2**63-1),sys.getsizeof(-2**63),sys.getsizeof(0.))
+    pair=sys.getsizeof((None,None));header=sys.getsizeof([]);pointer=struct.calcsize('P')
+    def estimate(remaining):
+        if not remaining:return scalar,scalar+pair
+        n=remaining[0];child,peak=estimate(remaining[1:])
+        listing=header+pointer*(n+(n>>3)+6)
+        retained=2*listing+n*child
+        construction=listing+max(0,n-1)*(pair+child)+peak
+        final=3*listing+n*(pair+child)
+        return retained,max(construction,final)
+    return estimate(tuple(shape))
 
 
 def _finite(value):
@@ -599,11 +455,11 @@ def _finite(value):
     return value, None
 
 
-def describe_saved_views(commit_path, *, expected_identity, limits=None):
-    with AnalysisReader(commit_path, expected_identity=expected_identity, limits=limits) as reader:
-        return reader.describe()
+def describe_saved_views(reader: StateReader, *, artifact_ref: Document, limits: SavedViewLimits | None = None) -> Document:
+    with AnalysisReader(reader, artifact_ref=artifact_ref, limits=limits) as view:
+        return view.describe()
 
 
-def read_saved_view(commit_path, view_id, selection, *, expected_identity, limits=None):
-    with AnalysisReader(commit_path, expected_identity=expected_identity, limits=limits) as reader:
-        return reader.read(view_id, selection)
+def read_saved_view(reader: StateReader, view_id: str, selection: Sequence[int | slice | Document], *, artifact_ref: Document, limits: SavedViewLimits | None = None) -> Document:
+    with AnalysisReader(reader, artifact_ref=artifact_ref, limits=limits) as view:
+        return view.read(view_id, selection)
