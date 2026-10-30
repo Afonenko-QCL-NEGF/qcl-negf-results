@@ -608,45 +608,254 @@ def test_native5_never_infers_implicit_identity_from_optional_record(tmp_path, c
         StateReader(tmp_path)
 
 
-def test_actual_runner_producer_transport_when_explicitly_bound():
-    """One call8 control; unset env is not_run, never producer evidence.
+def test_actual_runner_native5_final_transport_when_explicitly_bound(tmp_path):
+    """Read original Julia constructor CP/D/O bytes, without a solve or actor.
 
-    Runner call7 owns creation through native_roundtrip. This test only reads
-    that exact retained final; it never generates a replacement Python fixture.
+    The existing Runner focused test prints OUTWARD_FIXTURE_ROOT. Its selected
+    point is manufactured from a failed terminal; the separate actual empty
+    running writer control is not a stationary result or scientific acceptance.
+    Old D2 filename/private-wrapper/Dyson-zero assertions remain in the literal
+    format tests above; they are not claims about this negative native5 carrier.
     """
     import os
     from pathlib import Path
-    supplied = os.environ.get('QCL_SCI05_RUNNER_FIXTURE_ROOT')
-    if not supplied:
-        pytest.skip('not_run: explicit retained Runner producer fixture is required')
+    import tarfile
+    from qcl_negf_results.state import StateReader, ResultReadLimits
+    from qcl_negf_results.final_observations import FinalObservationsReader, describe_checkpoint_inputs
+    from qcl_negf_results.final_diagnostics import FinalDiagnosticsReader
+    from qcl_negf_results.export import preview, export_snapshot
+    from qcl_negf_results.archive import receive
+    from qcl_negf_contracts.outward import validate_outward_result, validate_outward_native_source
+    from qcl_negf_contracts.results import validate_manifest
+
+    supplied = os.environ.get('QCL_NATIVE5_FINAL_FIXTURE_ROOT')
+    if supplied is None:
+        legacy_bound = 'QCL_SCI05_RUNNER_FIXTURE_ROOT' in os.environ
+        assert not legacy_bound, (
+            'legacy fixture binding retired; supply QCL_NATIVE5_FINAL_FIXTURE_ROOT')
+        pytest.skip('not_run: explicit original native5 constructor fixture root required')
     root = Path(supplied)
     assert root.is_absolute(), 'producer fixture root must be explicitly absolute'
-    path = root / 'archive' / 'final' / 'commit.json'
-    assert path.is_file(), 'bound actual Runner final commit is missing'
-    expected = {'execution_id': 'fixture-execution', 'point_id': 'fixture-point',
-                'attempt': 2, 'plan_fingerprint': 'a' * 64}
-    # Includes commit/receipt, both owner SHAs and their native metadata passes.
-    with StateReader(path, expected_identity=expected, maximum_io_bytes=4 * 1024 * 1024) as reader:
-        assert reader.commit['storage_class'] == 'archive'
-        identity = reader.commit['identity']
-        assert {'execution_id', 'point_id', 'attempt', 'plan_fingerprint',
-                'state_id', 'state_sequence'} <= identity.keys()
-        assert isinstance(identity['state_id'], str) and identity['state_id']
-        assert type(identity['state_sequence']) is int and identity['state_sequence'] > 0
-        wrapper = reader._final_fixed_point_audit
-        assert wrapper['status'] == 'measured' and wrapper['reason'] is None
-        audit = wrapper['record']
-        assert audit['state_identity'] == identity
-        assert audit['shape'] == {'NE': 9, 'Nk': 3, 'Nb': 2}
-        assert audit['detail'] == 'Синтетический transport fixture'
-        assert audit['dyson']['ratio']['status'] == 'measured'
-        assert audit['dyson']['ratio']['value'] == 0
-        assert audit['context']['source_owner_role'] == 'physics.full'
-        owners = reader.commit['artifacts']
-        analysis = [row for row in owners if row['role'] == 'physics.analysis']
-        full = [row for row in owners if row['role'] == 'physics.full']
-        assert len(analysis) == len(full) == 1
-        assert analysis[0]['path'] == 'analysis.h5' and full[0]['path'] == 'physics.h5'
-        assert reader.io_counters['sha_bytes'] == sum(row['bytes'] for row in full + analysis)
-        assert reader.io_counters['hdf_bytes'] > 0 and reader.io_counters['metadata_bytes'] > 0
-        assert reader.io_counters['bytes_read_total'] <= 4 * 1024 * 1024
+    metadata_cap, io_cap, export_cap = 1024**2, 4*1024**2, 32*1024**2
+
+    def metadata(path):
+        with path.open('rb') as stream:
+            payload = stream.read(metadata_cap + 1)
+        assert len(payload) <= metadata_cap, 'fixture metadata exceeds admission'
+        return payload
+
+    def file_hash(path):
+        digest = hashlib.sha256()
+        with path.open('rb') as stream:
+            while block := stream.read(64*1024):
+                digest.update(block)
+        return digest.hexdigest()
+
+    outward_path = root / 'outward-v4.json'
+    assert outward_path.is_file(), 'bound original native5 outward-v4.json is missing'
+    outward = validate_outward_result(json.loads(metadata(outward_path)))
+    assert outward['schema'] == 'qcl-negf-series-result-v4'
+    assert outward['contract_set'] == 'qcl-negf.results.v2' and len(outward['points']) == 1
+    source = outward['points'][0]['data']['native_source']
+    assert source['kind'] == 'final' and source['relation'] == 'current_point_attempt'
+    assert source['artifact_root'] == '.'
+    selected, diagnostics_ref, observations_ref = (
+        source['selected_state'], source['diagnostics'], source['observations'])
+    assert set(selected['identity']) == {
+        'run_id', 'execution_id', 'point_id', 'attempt', 'branch_id', 'model_sha256', 'plan_sha256'}
+    for name, expected in dict(run_id='run', execution_id='exec', point_id='point',
+                               attempt='1', branch_id='branch1').items():
+        assert selected['identity'][name] == expected
+    assert selected['state_id'] == 'epoch1-state-1' and selected['state_sequence'] == '1'
+    manifest_ref = selected['manifest']
+    manifest_raw = metadata(root / manifest_ref['path'])
+    assert len(manifest_raw) == int(manifest_ref['bytes'])
+    assert hashlib.sha256(manifest_raw).hexdigest() == manifest_ref['sha256']
+    manifest = validate_manifest(json.loads(manifest_raw))
+    references = [manifest_ref] + [
+        {key: row[key] for key in ('path', 'bytes', 'sha256', 'media_type', 'schema')}
+        for row in manifest['artifacts']]
+    assert sum(int(ref['bytes']) for ref in references) <= export_cap
+    before = {ref['path']: file_hash(root / ref['path']) for ref in references}
+    assert all(before[ref['path']] == ref['sha256'] and
+               (root / ref['path']).stat().st_size == int(ref['bytes']) for ref in references)
+    outward_before = file_hash(outward_path)
+    limits = ResultReadLimits(maximum_io_bytes=io_cap)
+    deliveries = []
+
+    def note(label, reader):
+        counters = dict(reader.io_counters)
+        assert counters['bytes_read_total'] <= io_cap
+        deliveries.append((label, counters))
+
+    with StateReader(root, state_ref=selected, expected_identity=selected['identity'], limits=limits) as reader:
+        note('construct', reader)
+        checkpoint = reader.checkpoint()
+        note('checkpoint', reader)
+        with FinalDiagnosticsReader(reader, artifact_ref=diagnostics_ref) as view:
+            diagnostic = view.describe()
+            note('diagnostics', reader)
+        with FinalObservationsReader(reader, artifact_ref=observations_ref) as view:
+            observation = view.describe()
+            note('observations', reader)
+        inputs = describe_checkpoint_inputs(reader,
+            plan_ref=observation.declaration['request']['plan'],
+            model_ref=observation.declaration['request']['model'])
+        note('original_inputs', reader)
+        assert observation.source == diagnostic.source == inputs.source == selected
+        assert observation.invocation == diagnostic.invocation == inputs.invocation == {'source_epoch': 'epoch1'}
+        assert observation.checkpoint == diagnostic.checkpoint == inputs.checkpoint == manifest['checkpoint']
+        assert observation.diagnostics == diagnostics_ref and diagnostic.artifact == diagnostics_ref
+        assert observation.artifact == observations_ref
+        assert inputs.plan == observation.plan and inputs.model == observation.model
+        assert inputs.plan_raw.startswith(b'# frozen original plan\r\n')
+        for ref, payload in ((inputs.plan_ref, inputs.plan_raw), (inputs.model_ref, inputs.model_raw)):
+            assert len(payload) == int(ref['bytes']) and hashlib.sha256(payload).hexdigest() == ref['sha256']
+            assert metadata(root / ref['path']) == payload
+        assert inputs.plan_ref['sha256'] == selected['identity']['plan_sha256']
+        assert inputs.model_ref['sha256'] != inputs.model['configuration_hash']
+        assert inputs.model['configuration_hash'] == selected['identity']['model_sha256']
+        assert validate_outward_native_source(source, manifest=manifest, manifest_ref=manifest_ref,
+            checkpoint=checkpoint, diagnostics=diagnostic.declaration,
+            observations=observation.declaration, plan=inputs.plan, model=inputs.model) == source
+        assert observation.declaration['context']['dimensions'] == dict(Nz='25', NE='9', Nk='3', Nb='2')
+        assert diagnostic.declaration['dimensions'] == dict(energy='9', momentum='3', basis='2')
+        summary = observation.declaration['summary']
+        assert summary['status'] == 'scba_invalid_candidate' and summary['quality'] == 'invalid'
+        assert summary['converged'] is False and summary['scientific_accepted'] is False
+        assert summary['discretization_verified'] == 'not_measured'
+        assert reader.source.status['process']['state'] == 'failed'
+        for name in ('convergence', 'physics'):
+            assert reader.source.status[name] == dict(state='recorded', reason=None, evidence=observations_ref)
+        original = checkpoint['state']['fields']['final_evidence']['fields']
+        assert original['original_status']['value'] == 'scba_invalid_candidate'
+        assert original['original_converged'] is False
+        assert original['report']['fields']['passed'] is False
+        assert original['report']['fields']['messages']['values'] == ['constructor current/original report']
+        metrics = {row['name']: row['value'] for row in diagnostic.declaration['solution_metrics']['summary_metrics']}
+        # Public diagnostic summary labels map the stored r_K/r_U report to
+        # keldysh/hartree; the raw report itself remains in CP final_evidence.
+        r_k = int(metrics['keldysh']['bits'], 16)
+        assert r_k & 0x7ff0000000000000 == 0x7ff0000000000000 and r_k & 0x000fffffffffffff
+        assert metrics['hartree']['bits'] == '7ff0000000000000'
+        green = checkpoint['state']['fields']['scba']['fields']['green']['fields']['Gᴿ']
+        assert next(row for row in manifest['artifacts'] if row['path'] == green['file']['path'])['role'] == 'physics.full'
+        description = reader.describe_array(green)
+        note('green_metadata', reader)
+        assert description.logical_shape == description.stored_shape == (9, 3, 2, 2)
+        block = reader.read_array(green, (slice(0, 1), slice(0, 1), slice(None), slice(None)), maximum_bytes=64)
+        note('green_slice', reader)
+        assert block.values.tobytes() == np.full((1, 1, 2, 2), 1-1j, dtype='<c16').tobytes()
+        with FinalObservationsReader(reader, artifact_ref=observations_ref) as view:
+            array = view.describe_array('localized_wavefunctions_per_sqrt_nm')
+            note('wavefunction_metadata', reader)
+            assert array.logical_shape == array.stored_shape == (25, 2)
+            block = view.read_array('localized_wavefunctions_per_sqrt_nm', (slice(0, 3), 1), maximum_bytes=48)
+            note('wavefunction_slice', reader)
+            with h5py.File(root / observations_ref['path'], 'r') as original_hdf:
+                assert block.values.tobytes() == original_hdf[array.declaration['dataset']][0:3, 1].tobytes()
+        integral_shapes = dict(spectral_integral=(3, 2, 2), spectral_integral_eigenvalues=(3, 2),
+                               spectral_trace_cumulative=(9, 3), negative_energy_integral_scaled=(6, 3))
+        assert diagnostic.declaration['positivity']['status'] == 'measured'
+        assert diagnostic.declaration['positivity']['data'] is not None
+        with FinalDiagnosticsReader(reader, artifact_ref=diagnostics_ref) as view:
+            for name, shape in integral_shapes.items():
+                array = view.describe_integral(name)
+                note(name + '_metadata', reader)
+                assert array.logical_shape == array.stored_shape == shape
+                selection = (slice(0, 1),) + (slice(None),)*(len(shape)-1)
+                block = view.read_integral(name, selection, maximum_bytes=64)
+                note(name + '_slice', reader)
+                with h5py.File(root / diagnostics_ref['path'], 'r') as original_hdf:
+                    assert block.values.tobytes() == original_hdf[array.declaration['dataset']][selection].tobytes()
+        assert sum(c['bytes_read_total'] for _, c in deliveries) <= io_cap, deliveries
+        assert any(c['hdf_bytes'] > 0 for _, c in deliveries)
+        assert any(c['metadata_bytes'] > 0 for _, c in deliveries)
+        assert sum(c['sha_bytes'] for _, c in deliveries) >= sum(
+            int(ref['bytes']) for ref in (diagnostics_ref, observations_ref, green['file']))
+        with pytest.raises(ContractError) as underbuffer:
+            reader.read_array(green, (slice(0, 1), slice(0, 1), slice(None), slice(None)), maximum_bytes=8)
+        assert underbuffer.value.code == 'budget_exceeded'
+
+    stale = copy.deepcopy(selected)
+    stale['state_sequence'] = '2'
+    with pytest.raises(ContractError):
+        StateReader(root, state_ref=stale, expected_identity=selected['identity'], limits=limits)
+    with pytest.raises(ContractError) as underbudget:
+        StateReader(root, state_ref=selected, expected_identity=selected['identity'],
+                    limits=ResultReadLimits(maximum_io_bytes=1))
+    assert underbudget.value.code == 'budget_exceeded'
+    with StateReader(root, state_ref=selected, expected_identity=selected['identity'], limits=limits) as reader:
+        for cls, ref in ((FinalObservationsReader, observations_ref), (FinalDiagnosticsReader, diagnostics_ref)):
+            for field, value in (('sha256', '0'*64), ('bytes', '1')):
+                wrong = dict(ref, **{field: value})
+                with cls(reader, artifact_ref=wrong) as view, pytest.raises(ContractError):
+                    view.describe()
+
+    for profile in ('science', 'full-state'):
+        receipts = []
+        for warm in (False, True):
+            destination = tmp_path / profile / str(warm)
+            with StateReader(root, state_ref=selected, expected_identity=selected['identity'], limits=limits) as reader:
+                if warm:
+                    with FinalObservationsReader(reader, artifact_ref=observations_ref) as view:
+                        view.describe()
+                info = preview(reader, profile=profile, observations_ref=observations_ref, diagnostics_ref=diagnostics_ref)
+                assert info['capabilities']['stored_observables']['available']
+                assert info['capabilities']['stored_final_diagnostics']['available']
+                receipt = export_snapshot(reader, destination, profile=profile, byte_budget=export_cap,
+                    reserve_bytes=0, observations_ref=observations_ref, diagnostics_ref=diagnostics_ref)
+            receipts.append(receipt)
+            assert receipt['canonical_source_complete'] is (profile == 'full-state')
+            with tarfile.open(destination / receipt['archive'], 'r:xz') as archive:
+                assert archive.getmember('manifest.json').size <= metadata_cap
+                export_manifest = json.load(archive.extractfile('manifest.json'))
+                copied = 0
+                for row in export_manifest['source_locator']:
+                    reference = row['reference']
+                    digest = hashlib.sha256()
+                    count = 0
+                    with archive.extractfile(row['object']) as exported, (root / reference['path']).open('rb') as original_file:
+                        while chunk := exported.read(64*1024):
+                            copied += len(chunk)
+                            count += len(chunk)
+                            assert copied <= export_cap and chunk == original_file.read(len(chunk))
+                            digest.update(chunk)
+                        assert not original_file.read(1)
+                    assert count == int(reference['bytes']) and digest.hexdigest() == reference['sha256']
+            received = receive([destination / receipt['archive']],
+                destination / 'received' if profile == 'full-state' else None, receipt=receipt)
+            assert received['verified'] and received['profile'] == profile
+            if profile == 'science':
+                assert received['source_root'] is None
+            else:
+                assert received['source_state'] == selected
+                with StateReader(received['source_root'], state_ref=selected,
+                                 expected_identity=selected['identity'], limits=limits) as restored:
+                    assert restored.checkpoint() == checkpoint
+                    with FinalDiagnosticsReader(restored, artifact_ref=diagnostics_ref) as view:
+                        assert view.describe().declaration == diagnostic.declaration
+                    with FinalObservationsReader(restored, artifact_ref=observations_ref) as view:
+                        assert view.describe().declaration == observation.declaration
+                    restored_inputs = describe_checkpoint_inputs(restored,
+                        plan_ref=inputs.plan_ref, model_ref=inputs.model_ref)
+                    assert restored_inputs.plan_raw == inputs.plan_raw and restored_inputs.model_raw == inputs.model_raw
+                copied_model = Path(received['source_root']) / inputs.model_ref['path']
+                payload = metadata(copied_model)
+                copied_model.write_bytes(payload[:-1] + bytes([payload[-1] ^ 1]))
+                with StateReader(received['source_root'], state_ref=selected,
+                                 expected_identity=selected['identity'], limits=limits) as corrupted:
+                    with pytest.raises(ContractError):
+                        describe_checkpoint_inputs(corrupted, plan_ref=inputs.plan_ref, model_ref=inputs.model_ref)
+        assert receipts[0]['snapshot_identity'] == receipts[1]['snapshot_identity']
+        assert receipts[0]['sha256'] == receipts[1]['sha256']
+    with StateReader(root, state_ref=selected, expected_identity=selected['identity'], limits=limits) as reader:
+        with FinalObservationsReader(reader, artifact_ref=observations_ref) as view:
+            view.describe()
+        destination = tmp_path / 'wrong-selected-observations'
+        with pytest.raises(ContractError):
+            export_snapshot(reader, destination, profile='science', byte_budget=export_cap, reserve_bytes=0,
+                            observations_ref=dict(observations_ref, sha256='0'*64))
+        assert not list(destination.glob('*.tar.xz'))
+    assert file_hash(outward_path) == outward_before
+    assert all(file_hash(root / path) == digest for path, digest in before.items())
