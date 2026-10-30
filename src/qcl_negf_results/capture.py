@@ -701,12 +701,15 @@ def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budg
     from .state import _metadata_weight
     from .performance_views import _bounded_objects
 
-    if (not isinstance(arguments, (tuple, list)) or len(arguments) != 7
+    if (not isinstance(arguments, (tuple, list)) or len(arguments) not in (7, 11)
             or any(type(word) is not str for word in arguments)
             or sum(len(word.encode('utf-8')) for word in arguments) > 16384
             or tuple(arguments[:2]) != ('run-plan', 'plan.json')
-            or tuple(arguments[3:]) != ('--execution-id', spec['selection']['execution_id'],
+            or tuple(arguments[3:7]) != ('--execution-id', spec['selection']['execution_id'],
                                       '--source-graph', 'source-graph.json')
+            or (len(arguments) == 11 and tuple(arguments[7:]) !=
+            ('--native-execution', 'native-execution.json', '--native-calcjob-uuid',
+             spec['selection']['calcjob_uuid']))
             or spec['scratch_root'] is not None or spec['plan']['path'] != 'plan.json'):
         raise ValueError('unsupported original native run-plan argv')
     path = Path(os.path.abspath(native_execution_path))

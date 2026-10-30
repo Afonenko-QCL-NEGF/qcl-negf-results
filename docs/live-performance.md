@@ -87,6 +87,11 @@ files. It never imports a module string or deserializes a callback. Ordinary inp
 and unchanged; mixing native ingress with caller `transport` or a programmatic factory is refused
 before observer output.
 
+The original seven-token run-plan vector remains supported. The native origin vector appends
+`--native-execution native-execution.json --native-calcjob-uuid UUID` in that order, with the
+canonical UUID exactly equal to the original capture spec selection. Partial, reordered,
+duplicated or foreign values are rejected. Neither form proves origin by itself.
+
 The fixed parser checks bounded original raw input claims, the public scientific plan and
 SourceGraph grammar, exact run-plan arguments, execution/full fingerprint, and the absolute output
 suffix declared by `relative_execution_root`. Only direct/staged locator roots equal to that exact

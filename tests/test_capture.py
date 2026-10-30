@@ -702,6 +702,37 @@ def _T1_native_job(tmp_path):
     return dict(job=job, result=result, context=c, manifest=manifest, native=native, spec=spec, arguments=args)
 
 
+
+def test_T1_native_eleven_arguments_accept_original_calcjob(tmp_path):
+    from qcl_negf_results.capture import _native_capture_inputs
+    from qcl_negf_results.state import _IOBudget
+    fixture = _T1_native_job(tmp_path)
+    args = (*fixture['arguments'], '--native-execution', 'native-execution.json',
+            '--native-calcjob-uuid', fixture['spec']['selection']['calcjob_uuid'])
+    output, transport = _native_capture_inputs(fixture['job'], fixture['spec'],
+        fixture['job'] / 'native-execution.json', args, budget=_IOBudget(128 << 20))
+    assert output == fixture['result']
+    assert transport['selection'] == fixture['spec']['selection']
+
+
+@pytest.mark.parametrize('tail', [
+    ('--native-execution', 'other.json', '--native-calcjob-uuid', '00000000-0000-4000-8000-000000000007'),
+    ('--native-execution', 'native-execution.json', '--native-calcjob-uuid', '00000000-0000-4000-8000-000000000008'),
+    ('--native-execution', 'native-execution.json', '--native-calcjob-uuid', '00000000-0000-4000-8000-00000000000A'),
+    ('--native-calcjob-uuid', '00000000-0000-4000-8000-000000000007', '--native-execution', 'native-execution.json'),
+    ('--native-execution', 'native-execution.json'),
+    ('--native-execution', 'native-execution.json', '--native-calcjob-uuid', '00000000-0000-4000-8000-000000000007', '--native-execution', 'native-execution.json'),
+])
+def test_T1_native_eleven_invalid_tail_fails_before_output(tmp_path, tail):
+    import qcl_negf_results.capture as module
+    fixture = _T1_native_job(tmp_path)
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 0\n'); os.close(write_fd)
+    assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+        native_execution_path=fixture['job'] / 'native-execution.json',
+        solver_arguments=(*fixture['arguments'], *tail)) == 2
+    assert not (fixture['job'] / 'performance').exists()
+
 def test_T1_native_fixed_ingress_keeps_raw_without_fabricating_original_transport(tmp_path, monkeypatch):
     """External canonical root must capture phases, never guess source transport."""
     import qcl_negf_results.capture as module
@@ -869,6 +900,81 @@ def test_T1_F1_actual_observer_retains_two_phase_rows_and_original_raw(tmp_path,
     """A __main__/canonical PhaseBatch split must not pass as a closed capture."""
     from qcl_negf_results.capture import capture_run
     fixture = _T1_native_job(tmp_path)
+    source = fixture['result']; job = fixture['job']
+    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()}
+    assert len(before) == 22
+    inputs = {name: (job / name).read_bytes() for name in ('plan.json', 'source-graph.json', 'native-execution.json')}
+    marker = tmp_path / 'single-launch.json'
+    solver = tmp_path / 'one SENTINEL solver'
+    solver.write_text('#!' + sys.executable + '\nimport json, pathlib, signal, sys, time\n'
+        + 'def stop(*_): raise SystemExit(143)\n'
+        + 'signal.signal(signal.SIGTERM, stop)\n'
+        + 'with pathlib.Path(' + repr(str(marker)) + ').open("x") as out: json.dump(sys.argv[1:], out)\n'
+        + ('while True: time.sleep(.01)\n' if route == 'runner-term' else 'raise SystemExit(29)\n'))
+    solver.chmod(0o700)
+    if route == 'capture_run':
+        code = capture_run(job / 'capture-spec.json', str(solver), fixture['arguments'],
+                           native_execution_path=job / 'native-execution.json')
+    else:
+        template = os.environ.get('QCL_NEGF_TEST_RUNNER_LAUNCHER')
+        if not template:
+            pytest.skip('paired SOURCE/L requires the explicitly selected frozen Runner launcher')
+        capture = tmp_path / 'real Results CLI'
+        capture.write_text('#!' + sys.executable + '\nfrom qcl_negf_results.cli import main\nmain()\n')
+        capture.chmod(0o700)
+        launcher = tmp_path / 'frozen Runner launcher'
+        launcher.write_text(Path(template).read_text().replace('@bash@', '/bin/bash')
+            .replace('@solver@', str(solver)).replace('@capture@', str(capture)))
+        launcher.chmod(0o700)
+        env = dict(os.environ, QCL_NEGF_CAPTURE_SPEC=str(job / 'capture-spec.json'),
+                   QCL_NEGF_NATIVE_CAPTURE_INPUT=str(job / 'native-execution.json'))
+        process = subprocess.Popen([str(launcher), *fixture['arguments']], cwd=job, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            if route == 'runner-term':
+                deadline = time.monotonic() + 5
+                while not marker.exists():
+                    assert time.monotonic() < deadline and process.poll() is None
+                    time.sleep(.01)
+                process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=15)
+            code = process.returncode
+            assert stdout == stderr == b''
+        finally:
+            if process.poll() is None:
+                process.kill(); process.communicate(timeout=3)
+    assert code == (143 if route == 'runner-term' else 29)
+    assert json.loads(marker.read_bytes()) == list(fixture['arguments'])
+    technical = job / 'performance'
+    pointers = list(technical.glob('sessions/*/current.json'))
+    assert len(pointers) == 1
+    reference = json.loads(pointers[0].read_bytes())['commit']
+    commit = json.loads((technical / reference['path']).read_bytes())
+    summary = json.loads((technical / commit['summary']['path']).read_bytes())
+    assert commit['closed'] is True
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert len(commit['source_cursors']) == 1
+    assert commit['source_cursors'][0]['binding']['status'] == 'unbound'
+    assert commit['source_cursors'][0]['identity']['attempt'] == '1'
+    assert commit['transport']['selection']['attempt'] == 3
+    assert summary['control_events'] == [dict(event='source_binding_missing', count='1')]
+    retained = [p.read_bytes() for p in technical.glob('sessions/*/raw/*')]
+    assert (source / 'phase-segment-1.json').read_bytes() in retained
+    assert (source / 'phase-publication-1.json').read_bytes() in retained
+    assert not (technical / 'performance-binding.json').exists()
+    assert not (technical / 'performance-bindings').exists()
+    assert not (job / 'live').exists()
+    assert {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()} == before
+    assert {name: (job / name).read_bytes() for name in inputs} == inputs
+
+
+@pytest.mark.parametrize('route', ['runner', 'runner-term'])
+def test_T1_eleven_actual_observer_retains_two_phase_rows_and_original_raw(tmp_path, monkeypatch, route):
+    """A __main__/canonical PhaseBatch split must not pass as a closed capture."""
+    from qcl_negf_results.capture import capture_run
+    fixture = _T1_native_job(tmp_path)
+    fixture['arguments'] = (*fixture['arguments'], '--native-execution', 'native-execution.json',
+                            '--native-calcjob-uuid', fixture['spec']['selection']['calcjob_uuid'])
     source = fixture['result']; job = fixture['job']
     before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()}
     assert len(before) == 22
