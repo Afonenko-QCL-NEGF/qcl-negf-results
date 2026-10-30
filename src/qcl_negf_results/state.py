@@ -82,7 +82,7 @@ def _metadata_weight(value):
 
 _context_arena = ContextVar('qcl_results_metadata_context_arena', default=None)
 _CONTEXT_MAXIMUM = 128 * 1024 * 1024
-_CONTEXT_VALIDATION = 96 * 1024 * 1024
+_CONTEXT_VALIDATION = 112 * 1024 * 1024
 _CONTEXT_PROFILE_IO = 6 * 1024 * 1024
 _context_call_lock = Lock()
 _CONTEXT_HEADER = 65536
@@ -90,8 +90,8 @@ _CONTEXT_HEADER = 65536
 
 _VALIDATION_PACKAGES = {
     'qcl_negf_contracts': (48,
-    838829,
-    'a3d3a911d094a12b19dc8aaf4a6fec0de9b2fe130550b1bd5a0f232c8ffb00e8'),
+    885024,
+    '06177da7369959b136666bf827e2a16120c2bc78cfe06bcbab80479c0a02d702'),
     'jsonschema': (38,
     463467,
     '96a04a34eea376cc3afe479fd5115e5648679d15a22028bacfec62eaf8f08766'),
@@ -165,12 +165,12 @@ _VALIDATION_SCHEMAS = {
     'https://qcl-negf.invalid/schema/scientific-record.schema.json': 'bf6e02c8cd0d46f4221d5bd540a31adc5ea3e45f841011b5642d2ce7e669a62b',
     'https://qcl-negf.invalid/schema/scientific-series-result.schema.json': '644b068e5712efb85681f0865d4ce4a92c842cee0fb9194993a090335ca341cf',
     'https://qcl-negf.invalid/schema/scientific-worker-result.schema.json': 'eee0df0691a1caa1e310c0ceec8aab9033774dfe7c2a093e0d03fa5a0b60243a',
-    'https://qcl-negf.invalid/schema/telemetry-envelope.schema.json': 'bd7dc3927d4e36f6b6d233cc3e8ef3d0284af3bd06a3b6b267f478d4a64ae8e8',
+    'https://qcl-negf.invalid/schema/telemetry-envelope.schema.json': '803f24eb5eeb2c07a69b30ad2474215a860e764ca165cf89791e57a660fab850',
     'https://qcl-negf.invalid/schema/validation-diagnostics.schema.json': '35ecb1710da9f36cd510fc147c4974c92aef56a5b897ad1fac0cc31573268aaa'}
 _VALIDATION_LAYOUT = '6515d7d00f248a16ff4d439ee66a2c757b5507c4c6cd29b0b6c4cdb481afe5ad'
 _VALIDATION_ROW_FIELDS = ('domain_revision', 'discretization_id', 'basis_id', 'stage', 'outer_iteration', 'inner_iteration')
 # Shared Contracts.results cache: fixed results + telemetry public callsites.
-# All 15 cached bundles plus 3 direct bundles fit the qualified 96 MiB W reserve.
+# All 15 cached bundles plus 3 direct bundles fit the qualified 112 MiB W reserve.
 _VALIDATION_KINDS = ('checkpoint-declaration.schema.json',
     'core-state.schema.json',
     'final-diagnostics.schema.json',
@@ -381,7 +381,7 @@ def _validation_profile(arena, previous=None):
     # identity alone does not qualify monkeypatched/stale loaded callables.
     for module,names in ((contracts,('schema_names','load_schema','schema_validator')),
                          (results,('_validator','_layout','_row_fields'))):
-        length,expected=(1692,'41b5b746bbf28cd0e60bb85bc927f1c55ba0ac2695f3271b875f83c057a744d1') if module is contracts else (
+        length,expected=(1953,'32cbb629679afd8a752f8de69982889b0b24dfe1e5692c127ac8ccdb351c03be') if module is contracts else (
             51736,'d80c9985cb59a2e1d514695288c63e18b71fe3131294478806c57cac4c9f705f')
         with opened(Path(module.__file__)) as stream:
             raw=read(stream,length)

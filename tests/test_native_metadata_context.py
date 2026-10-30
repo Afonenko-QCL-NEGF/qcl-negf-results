@@ -91,7 +91,7 @@ def test_whole_context_originals(tmp_path,monkeypatch,final):
     if final:
         assert result[4].declaration==value
         assert result[2].io_counters==result[3].io_counters==result[4].io_counters
-    assert 96*M<=arenas[0].high_water<=128*M
+    assert 112*M<=arenas[0].high_water<=128*M
     print('CONTEXT_SUCCESS',final,result[2].io_counters,arenas[0].trace)
 
 
@@ -178,7 +178,7 @@ def test_independent_weight_alias_copies_and_preallocation_oracle(monkeypatch):
     try:
         with pytest.raises(ContractError,match='before deepcopy'):state._context_copy(value)
         assert clone_calls==[]
-        assert arena.failure['requested']==96*M+oracle(value)
+        assert arena.failure['requested']==112*M+oracle(value)
         assert arena.failure['total']>arena.maximum
     finally:state._context_arena.reset(token)
 
@@ -359,9 +359,9 @@ def test_actual_full_shared_cache_and_retained_first_output(tmp_path,monkeypatch
     finally:sys.setprofile(old)
     assert first[0]==second[0]==manifest and first[4] is not None and second[4] is not None
     assert state._context_weight(first)==retained<=4*M
-    assert max(maxima)==90_020_238 and max(maxima)<96*M  # includes real shared standard metaschemas
-    assert calls and arenas[0].validation_reservation==96*M
-    assert 96*M<=second[2].io_counters['metadata_high_water_bytes']<=128*M
+    assert max(maxima)==94_695_342 and max(maxima)+2_676_240+6*M<112*M  # includes real shared standard metaschemas
+    assert calls and arenas[0].validation_reservation==112*M
+    assert 112*M<=second[2].io_counters['metadata_high_water_bytes']<=128*M
     assert arenas[0].profile_bytes_read>5*M and arenas[1].profile_bytes_read==arenas[0].profile_bytes_read
     assert 0<arenas[1].profile_io_remaining<1*M
     assert set(first[2].io_counters)=={'bytes_read_total','sha_bytes','hdf_bytes','metadata_bytes',
