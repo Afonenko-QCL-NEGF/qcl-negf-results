@@ -442,3 +442,45 @@ def test_S2_full_state_receive_restores_science_and_same_retained_technical_cut(
     with StateReader(result['source_root'],state_ref=result['source_state'],expected_identity=result['source_state']['identity']) as reader:
         reader.import_history()
         assert reader.history_batch(maximum_records=1).records[0]['schema']=='qcl-negf.scientific-record.v1'
+
+
+@pytest.mark.parametrize('profile',['science','full-state'])
+def test_S3_writer_retained_export_receive_uses_same_closure_and_original_bits(tmp_path, profile):
+    import copy,struct,tarfile
+    from native_consumer_fixture import technical_source,telemetry_input
+    from qcl_negf_results.telemetry import TelemetryWriter
+    from qcl_negf_results.state import StateReader
+    from qcl_negf_results.archive import receive
+    from qcl_negf_results.performance_views import read_performance_context,PerformanceLimits
+    c=technical_source(tmp_path/'input',checkpoint=profile=='full-state')
+    old=c['technical'];c['technical']=old/'retained'
+    writer=TelemetryWriter(c['technical'],{}, {},transport=c['transport'],technical_version=2,batch_rows=4)
+    target=c['technical']/c['source_binding']['path'];target.write_bytes((old/c['source_binding']['path']).read_bytes())
+    for i in range(5):
+        writer.record_resource(dict(wall_seconds=float(i),cpu_time_seconds=-0.0))
+        writer.flush()
+        writer.retain_window(maximum_retained_bytes=30000,minimum_free_bytes=0,maximum_io_bytes=4194304)
+    writer.close()
+    from test_telemetry import s3_selected
+    selected=s3_selected(c,writer)
+    with StateReader(c['science'],state_ref=c['state'],expected_identity=c['state']['identity']) as reader:
+        _,closure=read_performance_context(reader,telemetry=selected,limits=PerformanceLimits(maximum_objects=16384))
+        receipt=export_snapshot(reader,tmp_path/'export',profile=profile,byte_budget=64<<20,reserve_bytes=0,telemetry=selected)
+    archive=tmp_path/'export'/receipt['filename']
+    result=receive([archive],tmp_path/'received')
+    assert result['verified'] is True
+    assert result['technical_verification']['scope']=='retained_technical_window'
+    with tarfile.open(archive,'r:xz') as handle:
+        manifest=json.loads(handle.extractfile('manifest.json').read())
+        technical=next(row for row in manifest['records'] if row.get('technical'))
+        assert technical['technical_contract']=='qcl-negf.telemetry-retained.v2'
+        assert technical['scope']=='retained_technical_window'
+        actual={(row['scope'],row['reference']['path']) for row in manifest['technical_locator']}
+        expected={('telemetry' if scope=='technical' else scope,ref['path']) for scope,ref,_ in closure if scope!='scientific'}
+        assert any(row['reference']==c['state']['manifest'] for row in manifest['source_locator'])
+        assert actual==expected
+        parquet=[row for row in technical['included'] if row.get('table')=='resources' and row.get('source_path')]
+        assert parquet
+        for row in parquet:
+            table=pq.read_table(io.BytesIO(handle.extractfile(row['object']).read()))
+            assert all(struct.pack('>d',v).hex()=='8000000000000000' for v in table['cpu_time_seconds'].to_pylist())

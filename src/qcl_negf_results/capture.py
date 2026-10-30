@@ -446,7 +446,9 @@ def make_binding(reader,*,telemetry,destination,capture_status,budget=None):
     except ValueError:raise ValueError('binding destination must belong to explicit technical artifact root') from None
     from qcl_negf_contracts.artifacts import relative_path
     relative_path(relative)
-    limits=PerformanceLimits();reservation=None;consumed=0;bindings={}
+    # Explicit retained-v2 closure uses S00's ceiling; public default remains4096.
+    limits=PerformanceLimits(maximum_objects=16384) if telemetry.commit_ref['schema']=='qcl-negf.telemetry-commit.v2' else PerformanceLimits()
+    reservation=None;consumed=0;bindings={}
     allowance=limits.maximum_io_bytes
     if budget is not None:
         allowance=min(allowance,budget.remaining-MIB)
@@ -457,7 +459,7 @@ def make_binding(reader,*,telemetry,destination,capture_status,budget=None):
             before=io.bytes_read_total
             try:
                 loaded=_load_telemetry(reader,telemetry,limits,bindings,creating_binding=True);data=loaded['input'];commit=loaded['commit'];summary=loaded['summary']
-                value=dict(schema='qcl-negf.telemetry-binding.v1',contract_set='qcl-negf.results.v2',
+                value=dict(schema=('qcl-negf.telemetry-binding.v2' if commit['schema']=='qcl-negf.telemetry-commit.v2' else 'qcl-negf.telemetry-binding.v1'),contract_set='qcl-negf.results.v2',
                     scope='selected_state_with_execution_attempt_telemetry',selected_state=reader.source.state,
                     transport=deepcopy(data['expected_transport']),capture_status=deepcopy(capture_status),
                     commit=dict(ref=data['commit_ref'],raw_utf8=loaded['commit_raw'].decode('utf-8')),

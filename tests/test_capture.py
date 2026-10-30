@@ -1041,3 +1041,18 @@ def test_T1_eleven_actual_observer_retains_two_phase_rows_and_original_raw(tmp_p
     assert not (job / 'live').exists()
     assert {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()} == before
     assert {name: (job / name).read_bytes() for name in inputs} == inputs
+
+
+def test_S3_make_binding_dispatches_v2_without_changing_source_binding(tmp_path):
+    from native_consumer_fixture import technical_source,telemetry_input
+    from qcl_negf_results.telemetry import TelemetryWriter
+    c=technical_source(tmp_path/'input');old=c['technical'];c['technical']=old/'retained'
+    writer=TelemetryWriter(c['technical'],{}, {},transport=c['transport'],technical_version=2)
+    original=(old/c['source_binding']['path']).read_bytes()
+    (c['technical']/c['source_binding']['path']).write_bytes(original)
+    writer.record_resource(dict(wall_seconds=1.));writer.close()
+    from test_telemetry import s3_selected
+    selected=s3_selected(c,writer)
+    binding=json.loads((c['technical']/selected.binding_ref['path']).read_bytes())
+    assert binding['schema']=='qcl-negf.telemetry-binding.v2'
+    assert binding['source_binding']['raw_utf8'].encode()==original
