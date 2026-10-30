@@ -17,6 +17,7 @@ read_performance_summary(reader: StateReader, *,
 read_performance_context(reader: StateReader, *,
     telemetry: TelemetrySelection, limits: PerformanceLimits | None = None)
     -> tuple[bytes, tuple[tuple[str, dict, bytes], ...]]
+writer.published_context() -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]
 writer.close_context() -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]
 observe(spec_path, pid, start_ticks, control_fd, *, transport=None,
     telemetry_selection_factory=None, native_execution_path=None,
@@ -51,6 +52,32 @@ retained pairs must bind the same bytes, hash, schema and media. `resume_context
 16 exact `{commit_ref, summary_ref}` pairs. These provide only missing prior completions to the full
 public current-delta validator. They are not trusted decoded evidence. All actual reads, hashes and
 source guards share the existing operation allowance.
+
+`published_context()` returns the last durably acknowledged transaction's commit FileRef,
+additional phase-context quadruples and resume-context pairs under the writer lock. It does not
+flush, close, publish or recover a transaction. Buffered rows and staged cursors remain uncommitted;
+publication generation, committed cursors and the closed flag stay unchanged. A constructor normally
+acknowledges the genesis transaction. Before the first acknowledgement, or while a failed/uncertain
+publication awaits explicit `flush()` recovery, the snapshot raises `ValueError` without inventing
+an empty commit. The method also works after close and returns that exact closed transaction.
+
+Each standalone snapshot is an admitted observer read operation. V2 records its operation/self-cost
+through the existing observer accounting; it does not write those counters or advance the published
+transaction. The ordinary per-operation I/O allowance resets for each snapshot, while any supplied
+caller aggregate budget still covers all reads. Repeated snapshots therefore have no lifetime call
+quota. All v2 observed operations hold that same writer lock across admission, depth checks,
+read-allowance reset, the operation and final accounting. Reentrant calls on the owning thread share
+the outer operation; a contending thread waits and receives a separate interval and its own caller
+bound. Exceptions, including cancellation, unwind depth/accounting and release the lock before
+another thread can enter. The shared close path retains its original combined close-and-readback
+I/O allowance, without a new standalone reset inside it.
+
+Both methods preserve the same 1 MiB combined captured-raw/decoded/commit/return-copy metadata
+admission, the 128 additional phase / 16 resume reference bounds, and exact selected-commit readback.
+The captured snapshot and selected-commit object graph are charged together before allocating
+detached returns or readback buffers. Returned dictionaries are detached on every call; neither caller mutation nor a
+new current pointer changes the selected snapshot. These references select bytes; they certify no
+producer origin, RO lease, scientific acceptance or Portal performance availability.
 
 `close_context()` closes through the existing writer transaction and returns its exact commit
 FileRef, additional phase-context quadruples and resume-context pairs. Accepted phase ranges
