@@ -200,6 +200,55 @@ def _manifest_closure(manifest: dict[str, Any], index: dict[str, Any]) -> None:
             if ref['sha256'] != item['sha256'] or int(ref['bytes']) != item['bytes']:
                 raise ContractError('source locator differs from transport bytes', 'corrupt_result')
             mapping[name] = row
+        technical={};technical_objects={}
+        for row in _rows(manifest.get('technical_locator', [])):
+            if set(row)!={'scope','reference','object'} or row['scope'] not in ('telemetry','canonical_plan'):
+                raise ContractError('invalid technical locator scope/fields','corrupt_result')
+            ref=row['reference'];_schema_check(validator,ref);key=(row['scope'],ref['path'])
+            if key in technical or row['object'] not in objects:
+                raise ContractError('duplicate or dangling technical locator','corrupt_result')
+            obj=objects[row['object']]
+            if ref['sha256']!=obj['sha256'] or int(ref['bytes'])!=obj['bytes']:
+                raise ContractError('technical locator differs from exact original bytes','corrupt_result')
+            technical[key]=ref;technical_objects[key]=row['object']
+        proofs=_rows(manifest.get('telemetry_compaction', []))
+        for record in _rows(manifest.get('records')):
+            if record.get('technical') is not True:continue
+            for row in _rows(record.get('included')):
+                if 'compaction_proof' in row:
+                    number=row['compaction_proof']
+                    if type(number) is not int or not 0<=number<len(proofs):
+                        raise ContractError('technical projection proof locator differs','corrupt_result')
+                    proof=proofs[number]
+                    if row['object']!=proof.get('object') or row.get('table')!=proof.get('table'):
+                        raise ContractError('technical projection object/table differs','corrupt_result')
+                else:
+                    key=(row.get('source_scope'),row.get('source_path'));ref=technical.get(key)
+                    if ref is None or technical_objects[key]!=row['object'] or ref['sha256']!=row.get('sha256') or ref['schema']!=row.get('schema'):
+                        raise ContractError('technical record scope/locator differs','corrupt_result')
+        original_bytes={(ref['sha256'],int(ref['bytes'])) for ref in technical.values() if ref['media_type']=='application/vnd.apache.parquet'}
+        cutoff=manifest.get('cutoff')
+        if cutoff is not None:
+            ref=cutoff.get('commit')
+            if not isinstance(ref,dict) or technical.get(('telemetry',ref.get('path')))!=ref:
+                raise ContractError('technical cutoff has no exact original commit locator','corrupt_result')
+            if cutoff.get('uncommitted')!='not_included' or cutoff.get('pending_rows') is not None:
+                raise ContractError('technical cutoff fabricates uncommitted tail evidence','corrupt_result')
+        elif technical:
+            raise ContractError('technical locator has no selected transaction cutoff','corrupt_result')
+        for proof in _rows(manifest.get('telemetry_compaction', [])):
+            if (proof.get('object') not in objects or proof.get('logical_payload_sha256')!=proof.get('verified_payload_sha256')
+                    or proof.get('row_order')!='source catalog order, no sorting, aggregation or deduplication'):
+                raise ContractError('compaction projection proof/closure differs','corrupt_result')
+            position=0
+            for source in _rows(proof.get('source_segments')):
+                if source.get('row_start')!=position or type(source.get('row_stop')) is not int or source['row_stop']<position:
+                    raise ContractError('compaction source row ranges differ','corrupt_result')
+                position=source['row_stop']
+                if (source.get('sha256'),source.get('bytes')) not in original_bytes:
+                    raise ContractError('compaction original source bytes were not retained','corrupt_result')
+            if position!=proof.get('rows'):
+                raise ContractError('compaction total row range differs','corrupt_result')
         state = manifest.get('source_state')
         _schema_check(common.evolve(schema={'$ref': '#/$defs/StateRef', '$defs': common.schema['$defs']}), state)
         if state['manifest']['path'] not in mapping or mapping[state['manifest']['path']]['reference'] != state['manifest']:

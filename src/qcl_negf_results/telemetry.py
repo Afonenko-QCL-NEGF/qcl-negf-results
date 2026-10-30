@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from copy import deepcopy
+from copy import copy
 import fcntl
 import hashlib
 import math
@@ -16,16 +17,25 @@ import uuid
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from qcl_negf_contracts.artifacts import COMMIT_SCHEMA, CONTRACT_SET, POINTER_SCHEMA
+from qcl_negf_contracts.artifacts import CONTRACT_SET
+from qcl_negf_contracts import load_schema, schema_validator
+from qcl_negf_contracts.messages import encode
+from qcl_negf_contracts.telemetry import validate_telemetry_commit, validate_telemetry_summary
 from qcl_negf_contracts.telemetry import TABLE_FIELDS, TELEMETRY_SCHEMA
 from .commits import (artifact_row, atomic_write, fsync_directory, json_bytes,
-                      publish_pointer, read_json)
+                      read_json)
 from .catalog import CATALOG_SCHEMA
 
 _ARROW_TYPES = {"string": pa.string(), "int64": pa.int64(),
                 "float64": pa.float64(), "bool": pa.bool_()}
 _REQUIRED = {"spans": {"phase", "duration_seconds"},
              "resources": {"wall_seconds"}, "control_events": {"event"}}
+
+
+def publish_pointer(path: Path, reference: Mapping[str, Any]) -> None:
+    """Technical pointer only; never use the scientific pointer wire adapter."""
+    atomic_write(path,json_bytes(dict(schema='qcl-negf.telemetry-pointer.v1',
+        contract_set=CONTRACT_SET,commit=dict(reference))))
 
 
 class CpuCoverage:
@@ -153,19 +163,45 @@ class TelemetryWriter:
     """
     def __init__(self, root: Path, identity: Mapping[str, Any], hardware: Mapping[str, Any],
                  *, batch_rows: int = 256, batch_bytes: int = 4 * 1024 * 1024,
-                 max_buffer_seconds: float = 15.0, metadata_budget=None) -> None:
-        if batch_rows < 1 or batch_rows > 65_536:
+                 max_buffer_seconds: float = 15.0, metadata_budget=None, transport=None) -> None:
+        self._initialize_writer(root,identity,hardware,batch_rows=batch_rows,batch_bytes=batch_bytes,
+            max_buffer_seconds=max_buffer_seconds,metadata_budget=metadata_budget,transport=transport)
+
+    def _initialize_writer(self,root,identity,hardware,*,batch_rows=256,batch_bytes=4*1024*1024,
+            max_buffer_seconds=15.,metadata_budget=None,transport=None,create_outputs=True,publish=True):
+        if type(batch_rows) is not int or batch_rows < 1 or batch_rows > 65_536:
             raise ValueError("batch_rows must be in 1..65536")
-        if not isinstance(batch_bytes, int) or batch_bytes < 1024:
+        if type(batch_bytes) is not int or batch_bytes < 1024:
             raise ValueError("batch_bytes must be an integer >=1024")
         if not math.isfinite(max_buffer_seconds) or not 0 < max_buffer_seconds <= 60:
             raise ValueError("max_buffer_seconds must be finite and in (0,60]")
+        if transport is not None:
+            # Public closed schema, no scientific manifest coercion or inferred transport.
+            encode(transport)
+            validator=schema_validator('telemetry-envelope.schema.json')
+            validator.evolve(schema={'$ref':'#/$defs/Transport','$defs':validator.schema['$defs']}).validate(transport)
+        self.transport = deepcopy(transport)
+        self.baseline = None
+        self._baseline_summary = None
+        self._recovery_summary_override = None
+        self._coverage_gap = None
+        self._inherited_dropped = 0
+        self._catalog_wire_override = None
+        self._resume_guards = []
+        self._previous = None
+        self._previous_summary = None
+        self._previous_ref = None
+        self._publication_pending = None
+        self._metadata_written = 0
+        self._retained_bytes = 0
+        self._began_cpu = time.process_time()
         self.root = Path(root)
         self.metadata_budget = metadata_budget
         self.session_id = uuid.uuid4().hex
         self.directory = self.root / "sessions" / self.session_id
-        self.directory.mkdir(parents=True)
+        if create_outputs:self.directory.mkdir(parents=True)
         self.identity = dict(identity)
+        self._hardware = deepcopy(hardware)
         self.batch_rows = batch_rows
         self.batch_bytes = batch_bytes
         self.max_buffer_seconds = float(max_buffer_seconds)
@@ -187,6 +223,15 @@ class TelemetryWriter:
         self.control_counts: dict[str, int] = {}
         self.source_cursors: dict[str, Any] = {}
         self.staged_source_cursors: dict[str, Any] = {}
+        self.phase_aggregates = []
+        self.accepted_ranges = []
+        self.phase_contexts = []
+        self._resume_contexts = []
+        self._last_phase_contexts = {}
+        self._last_phase_raw = {}
+        self._context_guards = {}
+        self._phase_raw = {}
+        self.accepted_totals = dict(accepted_source_rows=0, accepted_aggregate_calls=0, accepted_diagnostic_events=0, coalesced_source_events=0)
         self.phase_calls: dict[str, int] = {}
         self.producer_phase_seconds: dict[str, float] = {}
         self.producer_phase_calls: dict[str, int] = {}
@@ -199,6 +244,7 @@ class TelemetryWriter:
         self.monotonic_anchor_ns = time.monotonic_ns()
         self.window_buckets: dict[str, int] = {}
         self.transition_windows: set[str] = {"resources", "spans"}
+        if not create_outputs:return
         passport = {"schema": TELEMETRY_SCHEMA, "contract_set": CONTRACT_SET, "identity": self.identity,
             "session_id": self.session_id, "utc_anchor_ns": self.utc_anchor_ns,
             "monotonic_anchor_ns": self.monotonic_anchor_ns,
@@ -210,14 +256,99 @@ class TelemetryWriter:
             "sampling": "all received rows retained; absent measurements are null"}
         self._metadata_write(self.directory / "hardware.json", json_bytes(passport), immutable=True)
         self.artifacts.append(self._metadata_artifact(self.directory / "hardware.json",
-            relative="hardware.json", role="performance.summary", media_type="application/json"))
-        self._publish()
-        self._register()
+            relative="hardware.json", role="performance.summary", media_type="application/json",schema=TELEMETRY_SCHEMA))
+        if publish:
+            self._publish()
+            self._register()
+
+    @classmethod
+    def resume(cls,root: Path,*,commit_ref,expected_session,hardware,
+            batch_rows=256,batch_bytes=4*1024*1024,max_buffer_seconds=15.,metadata_budget=None):
+        """Resume one exact immutable metadata baseline; never infer old CPU endpoints."""
+        from ._capture_io import regular,stamp
+        from .commits import decode_json
+        from .state import _IOBudget
+        root=Path(root);io=_IOBudget(4*1024*1024);guards=[]
+        def read(ref,schema):
+            common=schema_validator('result-common.schema.json')
+            common.evolve(schema={'$ref':'#/$defs/FileRef','$defs':common.schema['$defs']}).validate(ref)
+            if ref['schema']!=schema or ref['media_type']!='application/json':raise ValueError('resume reference schema differs')
+            size=int(ref['bytes'])
+            if size>1024*1024:raise ValueError('resume metadata bound exceeded')
+            from ._capture_io import beneath
+            path=beneath(root,ref['path'])
+            with regular(path,size=size) as stream:
+                before=stamp(stream,include_change=True);io.require(size)
+                if metadata_budget is not None:metadata_budget.require(size)
+                raw=stream.read(size);io.account(len(raw))
+                if metadata_budget is not None:metadata_budget.account(len(raw))
+                if len(raw)!=size or hashlib.sha256(raw).hexdigest()!=ref['sha256'] or stamp(stream,include_change=True)!=before:
+                    raise ValueError('resume metadata bytes changed')
+                current=path.stat(follow_symlinks=False)
+                if (current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns,current.st_ctime_ns)!=before:
+                    raise ValueError('resume metadata path replaced')
+                guards.append((path,before))
+            return decode_json(raw,'resume metadata')
+        commit=read(commit_ref,'qcl-negf.telemetry-commit.v1')
+        validator=schema_validator('telemetry-envelope.schema.json')
+        validator.evolve(schema={'$ref':'#/$defs/TelemetryCommit','$defs':validator.schema['$defs']}).validate(commit)
+        if encode(commit['session'])!=encode(expected_session):raise ValueError('selected resume collector session differs')
+        summary=read(commit['summary'],'qcl-negf.telemetry-summary.v1');validate_telemetry_summary(summary)
+        for key in ('session','transport','generation','closed','baseline','source_cursors'):
+            if encode(dict(v=commit[key]))!=encode(dict(v=summary[key])):raise ValueError('resume commit/summary transaction differs')
+        def verify():
+            for path,before in guards:
+                with regular(path,size=before[2]) as stream:
+                    if stamp(stream,include_change=True)!=before:raise ValueError('resume source changed before publication')
+        verify()
+        if not commit['closed']:
+            recovery=cls.__new__(cls)
+            recovery._initialize_writer(root,{},hardware,batch_rows=batch_rows,batch_bytes=batch_bytes,
+                max_buffer_seconds=max_buffer_seconds,metadata_budget=metadata_budget,transport=commit['transport'],create_outputs=False)
+            recovery.directory=root/Path(commit_ref['path']).parent
+            recovery.session_id=commit['session']['source']['session_id']
+            recovery._previous=deepcopy(commit);recovery._previous_summary=deepcopy(summary);recovery._previous_ref=deepcopy(commit_ref)
+            recovery._recovery_summary_override=deepcopy(summary);recovery.generation=int(commit['generation'])
+            recovery.source_cursors={r['source_key']:deepcopy(r) for r in commit['source_cursors']}
+            recovery.baseline=deepcopy(commit['baseline']);recovery._catalog_wire_override=deepcopy(commit['catalog'])
+            recovery._retained_bytes=int(summary['retention']['retained_bytes']);recovery._resume_guards=list(guards);recovery.closed=True
+            recovery._publish()
+            commit=deepcopy(recovery._previous);summary=deepcopy(recovery._previous_summary);commit_ref=deepcopy(recovery._previous_ref)
+        obj=cls.__new__(cls)
+        obj._initialize_writer(root,{},hardware,batch_rows=batch_rows,batch_bytes=batch_bytes,
+            max_buffer_seconds=max_buffer_seconds,metadata_budget=metadata_budget,transport=commit['transport'],publish=False)
+        obj._previous=deepcopy(commit);obj._previous_summary=deepcopy(summary);obj._previous_ref=deepcopy(commit_ref)
+        obj.generation=int(commit['generation']);obj.baseline=dict(commit=deepcopy(commit_ref),summary=deepcopy(commit['summary']))
+        obj._baseline_summary=deepcopy(summary);obj._resume_guards=list(guards)
+        obj._retained_bytes=int(summary['retention']['retained_bytes'])
+        obj._inherited_dropped=int(summary['totals']['collector_dropped_rows'])
+        obj.accepted_totals={k:int(summary['totals'][k]) for k in obj.accepted_totals}
+        obj.source_cursors={r['source_key']:deepcopy(r) for r in commit['source_cursors']}
+        obj._coverage_gap=dict(source_key=None,clock_domain_id=None,kind='collector_restart',
+            first_monotonic_ns=None,last_monotonic_ns=None,reason='endpoint_reset_uncovered')
+        verify();obj._publish();obj._register()
+        return obj
 
     def _metadata_write(self, path, payload, *, immutable=False):
+        if len(payload)>1024*1024:
+            raise ValueError('technical metadata exceeds bounded page')
         if self.metadata_budget is not None:
             self.metadata_budget.write(len(payload))
         atomic_write(path, payload, immutable=immutable)
+        self._metadata_written += len(payload)
+
+    def _check_retained(self,path,payload):
+        from ._capture_io import regular,stamp
+        with regular(path,size=len(payload)) as stream:
+            before=stamp(stream,include_change=True)
+            if self.metadata_budget is not None:self.metadata_budget.require(len(payload))
+            raw=stream.read(len(payload))
+            if self.metadata_budget is not None:self.metadata_budget.account(len(raw))
+            if raw!=payload or stamp(stream,include_change=True)!=before:
+                raise ValueError('retained immutable telemetry bytes changed')
+            now=path.stat(follow_symlinks=False)
+            if (now.st_dev,now.st_ino,now.st_size,now.st_mtime_ns,now.st_ctime_ns)!=before:
+                raise ValueError('retained immutable telemetry path replaced')
 
     def _metadata_artifact(self, path, **kwargs):
         if self.metadata_budget is not None:
@@ -225,6 +356,10 @@ class TelemetryWriter:
             self.metadata_budget.require(size)
             self.metadata_budget.account(size)
         return artifact_row(path, **kwargs)
+
+    def _root_ref(self,reference):
+        """Wire refs share the explicit technical root across collector pages."""
+        return dict(reference,path=str(self.directory.relative_to(self.root)/reference['path']))
 
     def _register(self) -> None:
         self.root.mkdir(parents=True, exist_ok=True)
@@ -256,7 +391,6 @@ class TelemetryWriter:
         value: dict[str, Any] = {name: row.get(name) for name in fields}
         value["session_id"] = self.session_id
         value["sample_sequence"] = self.next_sequence[table]
-        self.next_sequence[table] += 1
         value["clock_domain_id"] = row.get("clock_domain_id", f"collector:{self.session_id}")
         value["utc_anchor_ns"] = row.get("utc_anchor_ns", self.utc_anchor_ns)
         value["monotonic_anchor_ns"] = row.get("monotonic_anchor_ns", self.monotonic_anchor_ns)
@@ -322,6 +456,8 @@ class TelemetryWriter:
 
     def _append(self, table: str, value: dict[str, Any], science_window: bool,
                 *, auto_flush: bool = True) -> None:
+        value["sample_sequence"] = self.next_sequence[table]
+        self.next_sequence[table] += 1
         self.buffers.setdefault((table, science_window), []).append(value)
         self.pending_bytes += self._row_bytes(value)
         self._mark_pending()
@@ -388,6 +524,8 @@ class TelemetryWriter:
         Parsing/validation precedes mutation. No intermediate automatic flush can
         acknowledge a source offset before every corresponding row is durable.
         """
+        if source_cursors:
+            raise ValueError('nonempty source cursors require stage_phase_batch with actual P29 contexts')
         if len(rows) > self.batch_rows:
             raise ValueError("ingestion batch exceeds configured row bound")
         with self.lock:
@@ -415,6 +553,8 @@ class TelemetryWriter:
         Rows and their offsets become durable together at a flush barrier. The
         caller must invoke flush_due during its polling loop, even with no rows.
         """
+        if source_cursors:
+            raise ValueError('nonempty source cursors require stage_phase_batch with actual P29 contexts')
         if len(rows) > self.batch_rows:
             raise ValueError("ingestion batch exceeds configured row bound")
         with self.lock:
@@ -431,6 +571,294 @@ class TelemetryWriter:
                 self._mark_pending()
             if self.pending_rows >= self.batch_rows:
                 self.flush()
+
+    @staticmethod
+    def _merge_phase(left,right):
+        """Producer aggregation of accepted metadata; no physical recomputation."""
+        result=deepcopy(left);result['call_count']=str(int(left['call_count'])+int(right['call_count']))
+        for start,stop in (('first_sequence','last_sequence'),('first_core_sequence','last_core_sequence')):
+            lo=[int(r[start]) for r in (left,right) if r[start] is not None];hi=[int(r[stop]) for r in (left,right) if r[stop] is not None]
+            result[start]=str(min(lo)) if lo else None;result[stop]=str(max(hi)) if hi else None
+        clocks=result['time_bounds'];other=right['time_bounds']
+        for k in ('measured_calls','unavailable_calls'):clocks[k]=str(int(clocks[k])+int(other[k]))
+        for k,op in (('min_start_monotonic_ns',min),('max_end_monotonic_ns',max)):
+            values=[int(r['time_bounds'][k]) for r in (left,right) if r['time_bounds'][k] is not None]
+            clocks[k]=str(op(values)) if values else None
+        clocks['reasons']=sorted(set(clocks['reasons']+other['reasons']))
+        a={(m['name'],m['unit']):m for m in left['metrics']};b={(m['name'],m['unit']):m for m in right['metrics']}
+        if a.keys()!=b.keys():raise ValueError('metric profile changed; a separate detail page is required')
+        result['metrics']=[]
+        for key,x in a.items():
+            y=b[key];vals=[r['sum'] for r in (x,y) if int(r['measured_calls'])]
+            reasons=sorted(set(x['reasons']+y['reasons']));total=None
+            if x['sum'] is not None and y['sum'] is not None and isinstance(x['sum'],dict)!=isinstance(y['sum'],dict):
+                raise ValueError('native integer versus Float64 metric profile changed')
+            if vals and all(v is not None for v in vals):
+                if len(vals)==1:total=deepcopy(vals[0])
+                elif isinstance(vals[0],dict):
+                    value=sum(int(v['decimal']) for v in vals)
+                    if -(2**63)<=value<2**63:total=dict(kind='integer',type='Int64',decimal=str(value))
+                    else:reasons=sorted(set(reasons+['counter_overflow']))
+                else:
+                    try:total=vals[0]+vals[1];finite=math.isfinite(total)
+                    except OverflowError:finite=False
+                    if not finite:total=None;reasons=sorted(set(reasons+['counter_overflow']))
+            result['metrics'].append(dict(name=key[0],unit=key[1],sum=total,
+                measured_calls=str(int(x['measured_calls'])+int(y['measured_calls'])),
+                unavailable_calls=str(int(x['unavailable_calls'])+int(y['unavailable_calls'])),reasons=reasons))
+        return result
+
+    @staticmethod
+    def _diagnostic_phase(row):
+        """Only explicitly measured end metrics/clocks, never infer normal spans."""
+        metrics=[]
+        allowed={'duration_seconds':('s',),'process_cpu_seconds':('s',),'allocated_bytes':('B','bytes'),'gc_seconds':('s',),'gc_count':('1','')}
+        for item in row['metrics']:
+            name='process_cpu_seconds' if item['name']=='cpu_seconds' else item['name']
+            if name not in allowed:continue
+            value=item['value'];numeric=type(value) in (int,float) or isinstance(value,dict) and value.get('kind')=='integer'
+            measured=item['measurement_status']=='measured' and numeric and item['unit'] in allowed[name]
+            metrics.append(dict(name=name,unit=item['unit'],sum=deepcopy(value) if measured else None,
+                measured_calls='1' if measured else '0',unavailable_calls='0' if measured else '1',
+                reasons=[] if measured else [item['reason'] or ('metric_type_or_unit_invalid' if item['measurement_status']=='measured' else 'producer_metric_unavailable')]))
+        def clock(name):
+            m=next((m for m in row['metrics'] if m['name']==name),None)
+            if m and m['measurement_status']=='measured' and m['unit']=='ns' and isinstance(m['value'],dict) and m['value'].get('type')=='Int64':
+                value=int(m['value']['decimal'])
+                if value>=0:return value
+            return None
+        start,end=clock('start_monotonic_ns'),clock('end_monotonic_ns')
+        producer=next((m for m in row['metrics'] if m['name']=='producer_monotonic_ns'),None)
+        mismatch=producer is not None and producer['measurement_status']=='measured' and clock('producer_monotonic_ns')!=end
+        valid=start is not None and end is not None and start<=end and not mismatch
+        reason='producer_clock_mismatch' if mismatch else 'producer_clock_missing' if start is None or end is None else 'producer_clock_reversed'
+        return dict(kind='aggregate',stage=row['stage'],phase=row['label'],status=row['status'],task_width=None,
+            counter_scope='process_inclusive_delta_on_end',first_sequence=row['sequence'],last_sequence=row['sequence'],
+            first_core_sequence=row['core_sequence'],last_core_sequence=row['core_sequence'],call_count='1',metrics=metrics,
+            time_bounds=dict(min_start_monotonic_ns=str(start) if valid else None,max_end_monotonic_ns=str(end) if valid else None,
+                measured_calls='1' if valid else '0',unavailable_calls='0' if valid else '1',reasons=[] if valid else [reason]))
+
+    def _event_span(self,batch,row,offset):
+        """Explicit optional technical projection of actual measured end Events.
+
+        Raw events remain exact and authoritative for unsupported/missing metrics.
+        No normal aggregate, duration, clock or per-call correlation is invented.
+        """
+        def metric(name,unit,integer=False):
+            item=next((m for m in row['metrics'] if m['name']==name),None)
+            if item is None or item['measurement_status']!='measured' or item['unit'] not in unit:return None
+            value=item['value']
+            if isinstance(value,dict) and value.get('type')=='Int64':value=int(value['decimal'])
+            if integer:return value if type(value) is int and 0<=value<2**63 else None
+            return value if type(value) in (float,int) and math.isfinite(value) and value>=0 else None
+        duration=metric('duration_seconds',('s',))
+        if row['action']!='phase_end' or duration is None:return None
+        number=lambda x:int(x) if x is not None and 0<=int(x)<2**63 else None
+        end=metric('end_monotonic_ns',('ns',),True)
+        value=dict(phase=row['label'],duration_seconds=duration,event_kind='end',measurement_kind='phase_boundary',
+            timing_kind='inclusive',timestamp_kind='measurement' if end is not None else 'unavailable',
+            monotonic_ns=end,clock_domain_id=batch.source['clock_domain_id'],utc_anchor_ns=number(batch.source['utc_anchor_ns']),
+            monotonic_anchor_ns=number(batch.source['monotonic_anchor_ns']),begin_monotonic_ns=metric('start_monotonic_ns',('ns',),True),end_monotonic_ns=end,
+            source_session_id=batch.source['session_id'],source_sequence=number(row['sequence']),source_path=batch.segment_ref['path'],source_offset=offset,
+            stage_path=row['stage'],iteration=number(row['iteration']),attempt=number(batch.identity['attempt']),
+            process_cpu_seconds=metric('cpu_seconds',('s',)) if any(m['name']=='cpu_seconds' for m in row['metrics']) else metric('process_cpu_seconds',('s',)),
+            gc_seconds=metric('gc_seconds',('s',)),allocated_bytes=metric('allocated_bytes',('B','bytes'),True),gc_count=metric('gc_count',('1',''),True),
+            counter_scope='process_inclusive_delta_on_end',capability_reasons='exact_raw_events_retained; projection_only_measured_representable_metrics')
+        return self._normalise('spans',value)
+
+    def _input_contexts(self,phase_context_refs,resume_context_refs):
+        """Authenticate explicit retained context refs, never derive raw paths."""
+        from .performance_views import TelemetrySelection,_check_bindings
+        from .state import _IOBudget,_schema_check,_metadata_weight
+        from ._capture_io import regular,beneath,stamp
+        from .commits import decode_json
+        # Reuse the accepted closed input grammar without another reader/owner.
+        for values,maximum,keys in ((phase_context_refs,128,{'publication_ref','segment_ref','retained_publication_ref','retained_segment_ref'}),
+                (resume_context_refs,16,{'commit_ref','summary_ref'})):
+            if not isinstance(values,(tuple,list)) or len(values)>maximum or any(not isinstance(v,dict) or set(v)!=keys for v in values):
+                raise ValueError('bounded exact context reference inputs required')
+        io=_IOBudget(4*1024*1024);guards={};cache={}
+        def read(ref):
+            common=schema_validator('result-common.schema.json')
+            _schema_check(common.evolve(schema={'$ref':'#/$defs/FileRef','$defs':common.schema['$defs']}),ref)
+            key=json_bytes(ref)
+            if key in cache:return cache[key]
+            count=int(ref['bytes'])
+            if count>self.batch_bytes or ref['media_type']!='application/json':raise ValueError('context metadata allowance/schema exceeded')
+            path=beneath(self.root,ref['path'])
+            with regular(path,size=count) as raw:
+                before=stamp(raw,include_change=True);io.require(count)
+                if self.metadata_budget is not None:self.metadata_budget.require(count)
+                data=raw.read(count);io.account(len(data))
+                if self.metadata_budget is not None:self.metadata_budget.account(len(data))
+                if len(data)!=count or hashlib.sha256(data).hexdigest()!=ref['sha256'] or stamp(raw,include_change=True)!=before:
+                    raise ValueError('context original retained bytes changed')
+                guards[(str(self.root.absolute()),ref['path'])]=before
+                _check_bindings(guards)
+            value=decode_json(data,'retained explicit context');cache[key]=value
+            if _metadata_weight((cache,guards,phase_context_refs,resume_context_refs))>self.batch_bytes:
+                raise ValueError('combined input context allowance exceeded')
+            return value
+        phases=[];seen=set()
+        for row in phase_context_refs:
+            key=json_bytes(row['publication_ref'])
+            if key in seen:raise ValueError('duplicate phase context input')
+            seen.add(key)
+            for original,retained in (('publication_ref','retained_publication_ref'),('segment_ref','retained_segment_ref')):
+                if any(row[original][k]!=row[retained][k] for k in ('bytes','sha256','media_type','schema')):
+                    raise ValueError('retained context ref differs from original')
+            phases.append(dict(publication=read(row['retained_publication_ref']),publication_ref=deepcopy(row['publication_ref']),
+                segment=read(row['retained_segment_ref']),segment_ref=deepcopy(row['segment_ref'])))
+        resumes=[dict(commit=read(r['commit_ref']),commit_ref=deepcopy(r['commit_ref']),summary=read(r['summary_ref']),summary_ref=deepcopy(r['summary_ref'])) for r in resume_context_refs]
+        _check_bindings(guards)
+        return phases,resumes,guards
+
+    def rotate(self):
+        """Explicit barrier: close old page, then begin an empty active page."""
+        from .performance_views import _check_bindings
+        with self.lock:
+            old_path=self.close();old=deepcopy(self._previous);old_summary=deepcopy(self._previous_summary);old_ref=deepcopy(self._previous_ref)
+            # Exact actual baseline bytes are consumed here, not a post-read stat.
+            _,_,guards=self._input_contexts((),(dict(commit_ref=old_ref,summary_ref=old['summary']),))
+            candidate=type(self).__new__(type(self))
+            try:
+                candidate._initialize_writer(self.root,self.identity,self._hardware,batch_rows=self.batch_rows,batch_bytes=self.batch_bytes,
+                    max_buffer_seconds=self.max_buffer_seconds,metadata_budget=self.metadata_budget,transport=self.transport,publish=False)
+                candidate.lock=self.lock;candidate._previous=old;candidate._previous_summary=old_summary;candidate._previous_ref=old_ref
+                candidate.generation=int(old['generation']);candidate.baseline=dict(commit=old_ref,summary=deepcopy(old['summary']))
+                candidate._baseline_summary=old_summary;candidate._retained_bytes=self._retained_bytes
+                candidate._inherited_dropped=int(old_summary['totals']['collector_dropped_rows'])
+                candidate.accepted_totals=dict(self.accepted_totals)
+                candidate._coverage_gap=dict(source_key=None,clock_domain_id=None,kind='collector_restart',
+                    first_monotonic_ns=None,last_monotonic_ns=None,reason='explicit_page_rotation_endpoint_reset')
+                _check_bindings(guards);candidate._publish();candidate._register();_check_bindings(guards)
+            except BaseException as error:
+                error.add_note('old collector page remains closed at '+str(old_path)+'; next page publication did not complete')
+                raise
+            self.__dict__.update(candidate.__dict__)
+            return old_path
+
+    def stage_phase_batch(self,batch,*,phase_context_refs=(),resume_context_refs=()) -> None:
+        from .capture import PhaseBatch
+        from .state import _metadata_weight
+        from qcl_negf_contracts.telemetry import validate_phase_publication,validate_phase_cursor
+        if not isinstance(batch,PhaseBatch):raise TypeError('actual PhaseBatch required')
+        with self.lock:
+            if self.closed:raise RuntimeError('telemetry session is closed')
+            if self._publication_pending is not None:raise RuntimeError('pending publication requires explicit flush recovery')
+            # Both decoded contexts and immutable raw buffers count before copies.
+            if _metadata_weight((self.phase_contexts,self.phase_aggregates,self._last_phase_contexts,self._phase_raw,vars(batch)))>self.batch_bytes:
+                raise ValueError('phase staging exceeds configured byte bound')
+            originals=[(batch.segment_ref,batch.segment_bytes,batch.segment),(batch.publication_ref,batch.publication_bytes,batch.publication)]
+            if batch.previous_ref is not None:originals.append((batch.previous_ref,batch.previous_bytes,batch.previous))
+            for ref,raw,decoded in originals:
+                if type(raw) is not bytes or len(raw)!=int(ref['bytes']) or hashlib.sha256(raw).hexdigest()!=ref['sha256']:
+                    raise ValueError('phase raw bytes differ from exact original reference')
+                from .commits import decode_json
+                if encode(decode_json(raw))!=encode(decoded):raise ValueError('phase raw and decoded contexts differ')
+            validate_phase_publication(batch.publication,segment=batch.segment,segment_ref=batch.segment_ref,
+                previous=batch.previous,previous_ref=batch.previous_ref)
+            context=dict(publication=deepcopy(batch.publication),publication_ref=deepcopy(batch.publication_ref),
+                segment=deepcopy(batch.segment),segment_ref=deepcopy(batch.segment_ref))
+            validate_phase_cursor(batch.cursor,**context)
+            if type(batch.first_row) is not int or type(batch.stop_row) is not int or not 0<=batch.first_row<batch.stop_row<=len(batch.segment['rows']) or int(batch.cursor['next_row'])!=batch.stop_row:
+                raise ValueError('invalid accepted physical phase prefix')
+            sourcekey=hashlib.sha256(encode(dict(identity=batch.identity,source=batch.source))).hexdigest()
+            cursors={**self.source_cursors,**deepcopy(self.staged_source_cursors)}
+            supplied_phases,supplied_resumes,input_guards=self._input_contexts(phase_context_refs,resume_context_refs)
+            resumes={json_bytes(c['commit_ref']):c for c in self._resume_contexts}
+            for c in supplied_resumes:
+                if json_bytes(c['commit_ref']) in resumes:raise ValueError('duplicate resume context input')
+                resumes[json_bytes(c['commit_ref'])]=c
+            old=cursors.get(sourcekey)
+            if old is None:
+                matching=[r for c in resumes.values() for r in c['commit']['source_cursors'] if r['source_key']==sourcekey]
+                if len(matching)>1:raise ValueError('ambiguous resume source context')
+                if matching:old=matching[0]
+            if old is None and batch.publication['previous'] is not None:
+                raise ValueError('non-genesis source requires exact prior collector resume context')
+            expected=int(old['cursor']['next_row']) if old is not None and old['cursor']['publication']==batch.publication_ref else 0
+            if batch.first_row!=expected:raise ValueError('phase prefix replay/skip')
+            if len(cursors)+(sourcekey not in cursors)>16:raise ValueError('source context page full; rotate detail page')
+            cursorrow=dict(source_key=sourcekey,identity=deepcopy(batch.identity),source=deepcopy(batch.source),cursor=deepcopy(batch.cursor),
+                route_epoch=str(batch.route_epoch),binding=dict(status='unbound',state=None,invocation=None,evidence=None,reason='producer_mapping_missing'),
+                producer_health=deepcopy(batch.current['health']),source_closed=batch.current['closed'],health_reason=None)
+            cursors[sourcekey]=cursorrow
+            contexts={json_bytes(c['publication_ref']):c for c in self.phase_contexts}
+            for c in supplied_phases:
+                if json_bytes(c['publication_ref']) in contexts:raise ValueError('duplicate phase completion context')
+                contexts[json_bytes(c['publication_ref'])]=c
+            contexts[json_bytes(batch.publication_ref)]=context
+            if old is not None and old['cursor']['publication']!=batch.publication_ref:
+                previous_context=contexts.get(json_bytes(old['cursor']['publication']))
+                if previous_context is None and sourcekey in self._last_phase_raw:
+                    actual,_,guards=self._input_contexts((self._last_phase_raw[sourcekey],),())
+                    previous_context=actual[0];input_guards.update(guards)
+                if previous_context is None:raise ValueError('old physical completion context missing')
+                contexts[json_bytes(previous_context['publication_ref'])]=deepcopy(previous_context)
+            rawrefs=[]
+            for label,ref,raw in (('segment',batch.segment_ref,batch.segment_bytes),('publication',batch.publication_ref,batch.publication_bytes)):
+                path='raw/'+sourcekey+'-'+label+'-'+ref['sha256']+'.json'
+                rawrefs.append(self._root_ref(dict(ref,path=path)))
+            accepted=dict(source_key=sourcekey,publication=deepcopy(batch.publication_ref),segment=deepcopy(batch.segment_ref),
+                retained_publication=rawrefs[1],retained_segment=rawrefs[0],mode=batch.segment['mode'],
+                first_row=str(batch.first_row),stop_row=str(batch.stop_row),cursor=deepcopy(batch.cursor))
+            rows=batch.segment['rows'][batch.first_row:batch.stop_row]
+            totals=dict(self.accepted_totals);totals['accepted_source_rows']+=len(rows)
+            if batch.stop_row==len(batch.segment['rows']):totals['coalesced_source_events']+=int(batch.segment['coalesced_events'])
+            if batch.segment['mode']=='normal':totals['accepted_aggregate_calls']+=sum(int(r['call_count']) for r in rows);projected=rows;representation='normal_aggregate'
+            else:
+                totals['accepted_diagnostic_events']+=len(rows)
+                projected=[self._diagnostic_phase(r) for r in rows if r['action']=='phase_end'];representation='diagnostic_end_projection'
+            phases=deepcopy(self.phase_aggregates)
+            def key(p):
+                a=p['aggregate'];return (p['source_key'],p['representation'],a['stage'],a['phase'],a['status'],a['task_width'],a['counter_scope'])
+            for row in projected:
+                entry=dict(source_key=sourcekey,identity=deepcopy(batch.identity),source=deepcopy(batch.source),representation=representation,aggregate=deepcopy(row))
+                found=next((i for i,p in enumerate(phases) if key(p)==key(entry)),None)
+                if found is None:phases.append(entry)
+                else:phases[found]['aggregate']=self._merge_phase(phases[found]['aggregate'],row)
+            span_rows=[]
+            if batch.segment['mode']=='diagnostic':
+                span_rows=[value for index,row in enumerate(rows,batch.first_row) if (value:=self._event_span(batch,row,index)) is not None]
+            size=sum(self._row_bytes(row) for row in span_rows)
+            if size+self.pending_bytes>self.batch_bytes or self.pending_rows+len(span_rows)>2*self.batch_rows or len(span_rows)>self.batch_rows:
+                raise ValueError('diagnostic projection exceeds row/byte bound; flush previous staged rows first')
+            candidate=copy(self);candidate.phase_aggregates=phases;candidate.accepted_totals=totals
+            candidate.counts=dict(self.counts,spans=self.counts['spans']+len(span_rows))
+            summary=candidate._technical_summary(self.generation+1,list(cursors.values()))
+            summary_raw=json_bytes(summary)
+            commit=dict(schema='qcl-negf.telemetry-commit.v1',contract_set=CONTRACT_SET,session=summary['session'],transport=deepcopy(self.transport),
+                generation=str(self.generation+1),closed=False,published_unix=time.time(),previous=deepcopy(self._previous_ref),baseline=deepcopy(self.baseline),
+                summary=self._root_ref(dict(path=f'summary-{self.generation+1:06d}.json',bytes=str(len(summary_raw)),sha256=hashlib.sha256(summary_raw).hexdigest(),media_type='application/json',schema=summary['schema'])),
+                catalog=self._root_ref(self.catalog_watermark) if self.catalog_watermark is not None else None,source_cursors=list(cursors.values()),accepted_ranges=deepcopy(self.accepted_ranges)+[accepted])
+            kwargs={} if self._previous is None else dict(previous=self._previous,previous_ref=self._previous_ref,previous_summary=self._previous_summary,previous_summary_ref=self._previous['summary'])
+            validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],phase_contexts=list(contexts.values()),resume_contexts=list(resumes.values()),**kwargs)
+            if _metadata_weight((self.phase_aggregates,phases,self.phase_contexts,list(contexts.values()),self._last_phase_contexts,self._last_phase_raw,cursors,list(resumes.values()),input_guards,self._context_guards))>self.batch_bytes:
+                raise ValueError('phase old/new working metadata exceeds byte bound')
+            from .performance_views import _check_bindings
+            _check_bindings(input_guards)
+            # Invalid input above has not advanced counters/cursors or published files.
+            additions=[]
+            for ref,raw in zip(rawrefs,(batch.segment_bytes,batch.publication_bytes)):
+                target=self.root/ref['path']
+                if target.exists():
+                    self._check_retained(target,raw)
+                else:
+                    if self.metadata_budget is not None:self.metadata_budget.write(len(raw))
+                    atomic_write(target,raw,immutable=True);self._metadata_written+=len(raw)
+                if ref['path'] not in self._phase_raw:
+                    additions.append(dict(ref,path=str(target.relative_to(self.directory)),bytes=int(ref['bytes']),role='performance.window',profile='science',dependencies=[]))
+            self.artifacts.extend(additions)
+            for ref in rawrefs:self._phase_raw[ref['path']]=deepcopy(ref)
+            self.phase_contexts=list(contexts.values());self._resume_contexts=list(resumes.values());self.phase_aggregates=phases;self.accepted_totals=totals
+            self.accepted_ranges.append(accepted);self.staged_source_cursors[sourcekey]=cursorrow;self._last_phase_contexts[sourcekey]=context
+            self._last_phase_raw[sourcekey]=dict(publication_ref=deepcopy(batch.publication_ref),segment_ref=deepcopy(batch.segment_ref),
+                retained_publication_ref=deepcopy(rawrefs[1]),retained_segment_ref=deepcopy(rawrefs[0]))
+            self._context_guards.update(input_guards)
+            for value in span_rows:self._append('spans',value,False,auto_flush=False)
+            self._mark_pending()
+            if self.pending_rows>=self.batch_rows:self.flush()
 
     def flush_due(self, *, now_ns: int | None = None) -> Path:
         """Publish aged tails; latency is max_buffer_seconds + collector poll delay."""
@@ -462,6 +890,13 @@ class TelemetryWriter:
 
     def _flush(self, *, closing: bool = False) -> Path:
         with self.lock:
+            if self._publication_pending is not None:
+                pending_closed=self._publication_pending['commit']['closed']
+                self._publish()
+                self.closed=pending_closed
+                if pending_closed:return self.root/self._previous_ref['path']
+                if not closing and not self.pending_rows and not self.artifacts and not self.staged_source_cursors:
+                    self.dirty=False;self.pending_since_ns=None;return self.root/self._previous_ref['path']
             if self.closed:
                 raise RuntimeError("telemetry session is closed")
             if not self.dirty and not self.artifacts and not closing:
@@ -494,7 +929,8 @@ class TelemetryWriter:
                     self.artifacts.append(artifact_row(destination, relative=name,
                         role="performance.window" if selected_window else "performance.full",
                         profile="science" if selected_window else "full-state",
-                        media_type="application/vnd.apache.parquet"))
+                        media_type="application/vnd.apache.parquet", schema=TELEMETRY_SCHEMA))
+                    self.artifacts[-1]["table"] = table
                     if selected_window:
                         self.window_buckets[table] = bucket
                         self.transition_windows.discard(table)
@@ -512,92 +948,167 @@ class TelemetryWriter:
             self.pending_since_ns = None
             return result
 
+    @staticmethod
+    def _constants(name):
+        properties=load_schema('telemetry-envelope.schema.json')['$defs'][name]['properties']
+        return {key:deepcopy(value['const']) for key,value in properties.items() if 'const' in value}
+
+    @staticmethod
+    def _measurement(value, unit, *, reason='not_instrumented', forecast=False):
+        return dict(value=value,status=('forecast' if forecast else 'measured') if value is not None else ('unavailable' if forecast else 'not_measured'),
+                    reason=None if value is not None else reason)
+
+    def _technical_summary(self, generation, committed_cursors):
+        count=lambda value:str(int(value))
+        if self._recovery_summary_override is not None:
+            value=deepcopy(self._recovery_summary_override)
+            value.update(generation=count(generation),closed=self.closed)
+            value['durability']['uncommitted_resource_batch_at_risk']=not self.closed
+            return value
+        cpu=self.cpu_coverage.summary()
+        cpu['unidentified_samples']=count(cpu['unidentified_samples'])
+        cpu['profile_samples_excluded']=count(cpu['profile_samples_excluded'])
+        for row in cpu['allocations']:
+            for key in ('samples','valid_intervals','missing_samples','discontinuous_intervals','coarse_intervals',
+                        'first_sample_monotonic_ns','last_sample_monotonic_ns'):
+                if row[key] is not None:row[key]=count(row[key])
+            row.setdefault('cpu_unavailable_reason',None);row.setdefault('capacity_unavailable_reason',None)
+        local=cpu['allocations'];contributing=[row for row in local if int(row['valid_intervals'])>0]
+        totals=self._constants('CpuTotals')
+        for key in ('valid_intervals','missing_samples','discontinuous_intervals'):
+            totals[key]=count(sum(int(row[key]) for row in local))
+        totals['covered_wall_seconds']=math.fsum(row['covered_wall_seconds'] for row in local)
+        totals.update(incomplete=False,reasons=[])
+        for key in ('cpu_seconds','allocated_cpu_seconds','observed_capacity_cpu_seconds'):
+            value=None;reason='no_stable_interval'
+            if contributing and all(row[key] is not None for row in contributing):
+                try:value=math.fsum(row[key] for row in contributing)
+                except OverflowError:value=None
+                reason='counter_overflow' if value is None else None
+                if value is not None and not math.isfinite(value):value=None;reason='counter_overflow'
+            elif contributing:reason='allocation_width_unavailable'
+            totals[key]=self._measurement(value,'s',reason=reason)
+            if reason=='counter_overflow':totals[key]['status']='error'
+        baseline=self._baseline_summary
+        if baseline is not None:
+            prior=baseline['cpu_totals'];local_valid=int(totals['valid_intervals'])
+            for k in ('valid_intervals','missing_samples','discontinuous_intervals'):
+                totals[k]=count(int(totals[k])+int(prior[k]))
+            totals['covered_wall_seconds']=math.fsum([totals['covered_wall_seconds'],prior['covered_wall_seconds']])
+            for k in ('cpu_seconds','allocated_cpu_seconds','observed_capacity_cpu_seconds'):
+                values=[];unknown=None;overflow=False
+                for valid,item in ((int(prior['valid_intervals']),prior[k]),(local_valid,totals[k])):
+                    if valid:
+                        if item['value'] is None:
+                            unknown=item['reason'];overflow|=item['status']=='error' and 'overflow' in item['reason']
+                        else:values.append(item['value'])
+                value=None;reason=unknown or 'no_stable_interval'
+                if unknown is None and values:
+                    try:value=math.fsum(values)
+                    except OverflowError:overflow=True
+                    if value is not None and not math.isfinite(value):value=None;overflow=True
+                if overflow:reason='counter_overflow'
+                totals[k]=self._measurement(value,'s',reason=reason)
+                if overflow:totals[k]['status']='error'
+        coverage=self._constants('Coverage')
+        coverage.update(all_observed_sources_consumed=all(r['cursor']['complete_at_observation'] for r in committed_cursors) if committed_cursors else None,
+            terminal_tail='unknown',source_closed=None,capture_error_events=count(self.control_counts.get('performance_capture_incomplete',0)),
+            gaps=[] if self._coverage_gap is None else [deepcopy(self._coverage_gap)],
+            incomplete=bool(self.samples_dropped or self._inherited_dropped or self._coverage_gap),
+            reasons=(['endpoint_reset_uncovered'] if self._coverage_gap is not None else [])+(['collector_rows_dropped'] if self.samples_dropped or self._inherited_dropped else []))
+        cost=self._constants('ObserverSelfCost')
+        for key in ('probe_seconds','read_seconds','hash_seconds','parse_validate_seconds','serialize_seconds','parquet_seconds','flush_sync_seconds'):
+            cost[key]=self._measurement(None,'s')
+        cost['process_cpu_seconds']=self._measurement(time.process_time()-self._began_cpu,'s')
+        for key in ('bytes_read','physical_read_bytes','physical_write_bytes','polls','source_reopens','reverified_bytes'):
+            cost[key]=self._measurement(None,'B' if 'bytes' in key else '1')
+        cost.update(bytes_written=self._measurement(count(self._metadata_written),'B'),
+            flushes=self._measurement(count(generation),'1'),pending_rows=self._measurement(count(self.pending_rows),'1'),
+            pending_bytes=self._measurement(count(self.pending_bytes),'B'),buffer_high_water_bytes=self._measurement(None,'B'),
+            arrow_io_forecast_bytes=self._measurement(None,'B',forecast=True))
+        durability=self._constants('Durability')
+        durability.update(maximum_staged_batch_rows=count(self.batch_rows),maximum_synchronous_flush_rows=count(2*self.batch_rows),
+            maximum_batch_payload_bytes=count(self.batch_bytes),maximum_buffer_seconds=self.max_buffer_seconds,
+            uncommitted_resource_batch_at_risk=not self.closed)
+        retention=dict(mode='windows_and_cumulative',retained_bytes=count(self._retained_bytes+sum(a['bytes'] for a in self.artifacts)),retained_source_rows=count(self.accepted_totals['accepted_source_rows']),
+            omitted_source_rows='0',omitted_resource_rows='0',omitted_span_rows='0',omissions=[],incomplete=False,reasons=[],pinned_retention_refused=False)
+        windows=self._constants('WindowPolicy');windows.update(period_seconds=900.,maximum_batch_rows=count(self.batch_rows),cutoff_tail_segments_per_table='3')
+        spans=[]
+        for key,duration in self.phase_seconds.items():
+            phase,timing=key.rsplit(':',1)
+            spans.append(dict(phase=phase,timing_kind=timing,measurement_kind='phase_duration',call_count=count(self.phase_calls[key]),
+                duration_seconds=self._measurement(duration,'s'),warmup_calls=count(self.warmup_calls.get(key,0)),
+                warmup_seconds=self._measurement(self.warmup_seconds.get(key,0.),'s'),maximum_seconds=None))
+        return dict(schema='qcl-negf.telemetry-summary.v1',contract_set=CONTRACT_SET,
+            session=dict(source=dict(session_id=self.session_id,clock_domain_id='collector:'+self.session_id,
+                utc_anchor_ns=count(self.utc_anchor_ns),monotonic_anchor_ns=count(self.monotonic_anchor_ns)),allocation_id=self.identity.get('allocation_id')),
+            transport=deepcopy(self.transport),generation=count(generation),closed=self.closed,baseline=deepcopy(self.baseline),
+            source_cursors=deepcopy(committed_cursors),totals=dict(rows={k:count(v+(int(baseline['totals']['rows'][k]) if baseline else 0)) for k,v in self.counts.items()},
+                collector_dropped_rows=count(self.samples_dropped+self._inherited_dropped),**{k:count(v) for k,v in self.accepted_totals.items()}),
+            rows={k:count(v) for k,v in self.counts.items()},max_observed_rss_bytes=None if self.max_rss_bytes is None else count(self.max_rss_bytes),
+            cpu_coverage=cpu,cpu_totals=totals,span_aggregates=spans,producer_phase_aggregates=deepcopy(self.phase_aggregates),
+            control_events=[dict(event=k,count=count(v)) for k,v in self.control_counts.items()],coverage=coverage,retention=retention,
+            observer_self_cost=cost,recorded_until_monotonic_ns=count(time.monotonic_ns()),durability=durability,science_window_policy=windows)
+
     def _publish(self) -> Path:
-        committed_cursors = {**self.source_cursors, **self.staged_source_cursors}
-        self.generation += 1
-        if self.artifacts:
-            next_count = self.artifact_count + len(self.artifacts)
-            catalog = {"schema": CATALOG_SCHEMA, "contract_set": CONTRACT_SET, "entries": next_count,
-                       "previous": self.catalog_watermark, "artifacts": self.artifacts}
-            catalog_name = f"catalog-{self.generation:09d}.json"
-            catalog_payload = json_bytes(catalog)
-            self._metadata_write(self.directory / catalog_name, catalog_payload, immutable=True)
-            self.artifact_count = next_count
-            self.catalog_watermark = {"path": catalog_name, "entries": self.artifact_count,
-                "sha256": hashlib.sha256(catalog_payload).hexdigest()}
-            self.artifacts = []
-        summary_name = f"summary-{self.generation:06d}.json"
-        summary = {"schema": TELEMETRY_SCHEMA, "contract_set": CONTRACT_SET, "session_id": self.session_id,
-            "rows": self.counts, "max_observed_rss_bytes": self.max_rss_bytes,
-            "cpu_coverage": self.cpu_coverage.summary(),
-            "phase_seconds": self.phase_seconds, "phase_calls": self.phase_calls,
-            "producer_phase_seconds": self.producer_phase_seconds,
-            "producer_phase_calls": self.producer_phase_calls,
-            "producer_phase_measurements": self.producer_phase_measurements,
-            "phase_attribution": {
-                "source": "producer begin/end boundaries; process-inclusive counters",
-                "resource_endpoint_labels_are_not_interval_attribution": True,
-                "admission_wait_seconds": None,
-                "admission_wait_reason": "not inferred; requires explicit producer wait measurement",
-                "missing_counters_are_zero": False,
-            },
-            "warmup_seconds": self.warmup_seconds, "warmup_calls": self.warmup_calls,
-            "intervals_and_delays": self.measurements,
-            "control_events": self.control_counts,
-            "measurement_coverage": {
-                "scope": "received scalar source rows, not all solver wall time",
-                "sources": committed_cursors,
-                "capture_error_events": self.control_counts.get("performance_capture_incomplete", 0),
-                "all_observed_sources_consumed": all(
-                    cursor.get("complete_at_observation") is True
-                    for cursor in committed_cursors.values()),
-                "jit_separately_measured": False,
-                "initialization_includes_possible_compilation": True,
-                "warmup": "first observed call per phase/source session; not measured JIT",
-                "absent_phase": "not measured, never zero",
-                "phase_scopes": "inclusive unless explicitly exclusive; do not sum overlapping scopes",
-            },
-            "phase_sum_is_not_wall_time": True, "samples_dropped": self.samples_dropped,
-            "durability": {
-                "published_rows": "all rows in this summary and source cursors share this commit",
-                "live_rows": "staged rows after this commit are excluded; not durable",
-                "source_recovery": "replay source journal from published cursor",
-                "resource_tail_recovery": "unpublished resource samples can be lost on process crash",
-                "maximum_staged_batch_rows": self.batch_rows,
-                "maximum_synchronous_flush_rows": 2 * self.batch_rows,
-                "maximum_batch_payload_bytes": self.batch_bytes,
-                "maximum_buffer_seconds": self.max_buffer_seconds,
-                "latency_bound": "buffer age plus coordinator polling/scheduling delay",
-                "parquet_compression": "zstd-3 lossless",
-                "barriers": ["flush", "control_transition", "checkpoint", "export", "close"],
-            },
-            "science_window_policy": {"period_seconds": 900,
-                "selection": "first closed batch per table/period and after control transition",
-                "maximum_batch_rows": self.batch_rows, "cutoff_tail_segments_per_table": 3,
-                "scope": "selected actual rows; not a complete profile"},
-            "closed": self.closed, "uncommitted_resource_batch_at_risk": not self.closed,
-            "recorded_until_monotonic_ns": time.monotonic_ns()}
-        self._metadata_write(self.directory / summary_name, json_bytes(summary), immutable=True)
-        summary_row = self._metadata_artifact(self.directory / summary_name, relative=summary_name,
-            role="performance.summary", media_type="application/json")
-        commit = {"schema": COMMIT_SCHEMA, "contract_set": CONTRACT_SET, "identity": {**self.identity, "session_id": self.session_id},
-            "generation": self.generation, "closed": self.closed,
-            "published_unix": time.time(),
-            "source_cursors": committed_cursors,
-            "telemetry_catalog": self.catalog_watermark,
-            "artifacts": [summary_row]}
-        payload = json_bytes(commit)
-        name = f"commit-{self.generation:06d}.json"
-        self._metadata_write(self.directory / name, payload, immutable=True)
-        if self.metadata_budget is not None:
-            pointer = {"schema": POINTER_SCHEMA, "contract_set": CONTRACT_SET,
-                "commit_path": name, "generation": self.generation,
-                "sha256": hashlib.sha256(payload).hexdigest()}
-            self.metadata_budget.write(len(json_bytes(pointer)))
-        publish_pointer(self.directory / "current.json", name, payload, self.generation)
-        self.source_cursors = deepcopy(committed_cursors)
-        self.staged_source_cursors.clear()
-        return self.directory / name
+        if self._publication_pending is None:
+            generation=self.generation+1
+            watermark=self.catalog_watermark
+            artifact_count=self.artifact_count
+            publications=[]
+            if self.artifacts:
+                artifact_count+=len(self.artifacts)
+                catalog=dict(schema=CATALOG_SCHEMA,contract_set=CONTRACT_SET,entries=artifact_count,
+                    previous=watermark,artifacts=deepcopy(self.artifacts))
+                name=f'catalog-{generation:09d}.json';payload=json_bytes(catalog)
+                publications.append((name,payload))
+                watermark=dict(path=name,entries=artifact_count,sha256=hashlib.sha256(payload).hexdigest())
+            committed={**self.source_cursors,**self.staged_source_cursors}
+            summary=self._technical_summary(generation,list(committed.values()))
+            validate_telemetry_summary(summary)
+            name=f'summary-{generation:06d}.json';payload=json_bytes(summary)
+            summary_ref=dict(path=name,bytes=str(len(payload)),sha256=hashlib.sha256(payload).hexdigest(),
+                media_type='application/json',schema=summary['schema'])
+            summary_ref=self._root_ref(summary_ref)
+            publications.append((name,payload))
+            commit=dict(schema='qcl-negf.telemetry-commit.v1',contract_set=CONTRACT_SET,session=deepcopy(summary['session']),
+                transport=deepcopy(self.transport),generation=str(generation),closed=self.closed,published_unix=time.time(),
+                previous=deepcopy(self._previous_ref),baseline=deepcopy(self.baseline),summary=summary_ref,
+                catalog=deepcopy(self._catalog_wire_override) if self._catalog_wire_override is not None else self._root_ref(watermark) if watermark is not None else None,
+                source_cursors=list(deepcopy(committed).values()),accepted_ranges=deepcopy(self.accepted_ranges))
+            kwargs={} if self._previous is None else dict(previous=self._previous,previous_ref=self._previous_ref,
+                previous_summary=self._previous_summary,previous_summary_ref=self._previous['summary'])
+            validate_telemetry_commit(commit,summary=summary,summary_ref=summary_ref,phase_contexts=self.phase_contexts,resume_contexts=self._resume_contexts,**kwargs)
+            name=f'commit-{generation:06d}.json';payload=json_bytes(commit)
+            cref=dict(path=name,bytes=str(len(payload)),sha256=hashlib.sha256(payload).hexdigest(),media_type='application/json',schema=commit['schema'])
+            cref=self._root_ref(cref)
+            publications.append((name,payload))
+            self._publication_pending=dict(publications=publications,commit=commit,summary=summary,ref=cref,
+                watermark=watermark,artifact_count=artifact_count,committed=committed,
+                retained_bytes=self._retained_bytes+sum(a['bytes'] for a in self.artifacts))
+        pending=self._publication_pending
+        for name,payload in pending['publications']:
+            target=self.directory/name
+            if target.exists():
+                self._check_retained(target,payload)
+            else:self._metadata_write(target,payload,immutable=True)
+        from .performance_views import _check_bindings
+        _check_bindings(self._context_guards)
+        pointer=json_bytes(dict(schema='qcl-negf.telemetry-pointer.v1',contract_set=CONTRACT_SET,commit=pending['ref']))
+        if self._resume_guards:
+            from ._capture_io import regular,stamp
+            for path,before in self._resume_guards:
+                with regular(path,size=before[2]) as source:
+                    if stamp(source,include_change=True)!=before:raise ValueError('resume source changed before pointer publication')
+        if self.metadata_budget is not None:self.metadata_budget.write(len(pointer))
+        publish_pointer(self.directory/'current.json',pending['ref'])
+        self._metadata_written+=len(pointer)
+        self._previous=deepcopy(pending['commit']);self._previous_summary=deepcopy(pending['summary']);self._previous_ref=deepcopy(pending['ref'])
+        self.generation=int(self._previous['generation']);self.catalog_watermark=pending['watermark'];self.artifact_count=pending['artifact_count']
+        self._retained_bytes=pending['retained_bytes']
+        self.source_cursors=deepcopy(pending['committed']);self.staged_source_cursors.clear();self.artifacts=[]
+        self.accepted_ranges=[];self.phase_contexts=[];self._resume_contexts=[];self._context_guards={};self._publication_pending=None
+        return self.root/self._previous_ref['path']
 
     def close(self) -> Path:
         with self.lock:
