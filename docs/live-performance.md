@@ -136,8 +136,8 @@ missing raw. A consumer can materialize separate scoped roots and use the existi
 again, but must independently verify actual original INPUT/CALL/CREATE provenance. This API does
 not certify native access, restore, science acceptance or original creator ownership.
 
-The raw return shares one combined 1 MiB metadata and 4096-object allowance with decoded contexts,
-guards, assertion bytes and detached return copies. Its I/O cap is 4 MiB, response cap 2 MiB and
+For legacy technical v1, the raw return shares one combined 1 MiB metadata and 4096-object allowance
+with decoded contexts, guards, assertion bytes and detached return copies. Its I/O cap is 4 MiB, response cap 2 MiB and
 session cap 16; callers can only tighten them through `PerformanceLimits`. Prospective return
 storage is debited before copying mutable refs. Source guards complete before any return escapes;
 late replacement, missing context, cancellation or exhausted credit returns no partial snapshot.
@@ -146,8 +146,8 @@ reader construction and repeated operations. These reader/writer APIs add no lif
 retention pruning, native origin qualification or AiiDA repository carrier. Those remain separate
 required production work.
 
-Performance metadata is bounded by 1 MiB, delivered I/O by 4 MiB, response JSON by 2 MiB, objects by
-4096 and supplied context pages by 16; limits only tighten. The response reports execution-attempt
+For legacy technical v1, performance metadata is bounded by 1 MiB, delivered I/O by 4 MiB,
+response JSON by 2 MiB, objects by 4096 and supplied context pages by 16; limits only tighten. The response reports execution-attempt
 scope and nullable measured coverage. It never attributes execution3 resources to a borrowed source
 point from attempt2. Summary reading does not open catalog/Parquet payloads; export validates those
 selected original bytes and footers separately. Integer values outside the JSON safe range use
@@ -240,3 +240,90 @@ technical commit/summary bytes and the exact selected state/source-binding relat
 association remains unbound until actual P07 actor evidence is validated; successful byte/contract
 reading cannot promote it. Existing provider/Portal callers need their owning typed-port migration
 before production integration acceptance.
+
+
+## Explicit retained technical v2 read-first boundary
+
+The published Contracts revision adds separate technical commit/summary/pointer/binding v2,
+retained catalog3 and performance index3. This reader accepts an explicit commit2 FileRef through
+the unchanged `TelemetrySelection` and `read_performance_context` ports. It does not enable a v2
+writer, select a newest/index entry, convert a v1 root, prune files or change capture-spec/native5.
+Writer/window/export production remains a separate owning stage. Existing v1 read/export and
+recursive full-state semantics remain on their original branch.
+
+```python
+selection_raw, original_files = read_performance_context(
+    selected_reader, telemetry=explicit_selection,
+    limits=PerformanceLimits(maximum_objects=16384),
+)
+```
+
+The default object allowance remains 4096. An explicit v2 read can request up to 16384; v1 rejects an
+allowance above 4096 before technical file reads. All other bounds remain 1 MiB combined metadata,
+4 MiB delivered I/O and 2 MiB response, with the same operation ledger, source guards and prospective
+return-copy admission. Catalog original bytes have an additional 64 KiB ceiling checked before
+opening the declared catalog. Bounds count current/previous metadata, retained original raw
+contexts and every selected after artifact together; a required closure that cannot fit is an
+explicit `budget_exceeded`, without a partial result or a larger allowance after rotation.
+Object credit includes every decoded selected cache member, including catalog/index after leaves;
+an opaque historical descriptor stops file traversal, not accounting for its consumed metadata.
+These are operation/engineering bounds, not a run-duration quota or a process RSS guarantee.
+
+V2 loads exactly the current commit/summary/catalog and immediate previous commit/summary/catalog,
+if any. It validates committed phase context quadruples and resume transaction pairs using the
+same public Contracts relations. Optional caller context lists must agree with the committed
+inventory. Original producer references keep their source-root meaning; all actual raw reads use
+the exact retained locators under the explicitly selected technical root. Raw source files can
+contain an unaccepted suffix: only validated accepted physical ranges contribute to local and
+cumulative phase summaries. Missing metric profiles remain unavailable. No phase clocks from
+unrelated producers become a global wall interval.
+
+Every current after artifact is authenticated by its whole reference. Parquet payloads are hashed
+in bounded streams, then their actual table/schema and exact footer row count are checked through
+the same open file and I/O ledger, without decoding rows for a summary. Typed catalog/index leaves
+receive public shape/membership validation; their referenced old selections are not traversed.
+Unlike v1, a v2 summary therefore opens its retained catalog and selected payloads. The integrity
+field `catalogs_or_parquet_opened` reports that distinction. Source binding still uses independently
+supplied selected native state, original source transport, canonical plan bytes and producer graph;
+caller assertions do not authenticate actual AiiDA INPUT/CREATE origin.
+
+The unchanged raw-context return shape contains exact original bytes with `technical`,
+`canonical_plan` and `scientific` scopes. For v2 it includes both transaction/catalog triples,
+required current phase/resume raw proof, source/close binding, canonical plan, selected scientific
+manifest and all current after artifacts, including retained Parquet originals. Refs are detached,
+hashes/sizes remain whole-file identities, and late source changes or cancellation return no
+partial closure. Reader I/O counters cover the original operation and reset as before.
+
+Each successor catalog inventories its immediate previous catalog as a provenance metadata leaf.
+That leaf is authenticated as an original file but its historical artifact descriptors are opaque
+for physical retention. Older commit/summary/catalog references inside the immediate previous
+metadata are historical provenance, rather than promises to export an entire recursive history.
+Pending-unlink debt is also not a retained transport member. Missing required current members fail;
+a missing older historical catalog is permitted only through this explicit v2 boundary. Actual
+pins, ownership, read/export/copy lifetime, native RO, no-reuse, publication barrier and unlink
+reconciliation remain independent owning gates.
+
+Offline receive requires v2 technical record and cutoff fields
+`technical_contract='qcl-negf.telemetry-retained.v2'`, `scope='retained_technical_window'`, exact
+`catalog`, `cumulative_scope='enclosing_transport_since_v2_genesis'` and `prior_capture`. It checks
+contained current/previous originals, raw phase/resume closure, complete after membership and whole
+scoped locators, then calls the same public v2 transition/source-binding/close-binding validators.
+The current close is joined by its exact embedded commit reference, never by newest session.
+An open prefix requires an unambiguous contained source binding for the selected state/transport.
+Extra unselected technical locators or transport objects fail. Science and full-state carriers
+use the same complete retained technical window; their scientific source-graph capabilities and
+full-state restoration rules stay separate.
+
+Existing Parquet compaction format and algorithm are unchanged. V2 receive binds projection source
+order and row coverage to the authenticated retained catalog and recomputes the existing
+fixed 4096-row validity/native-bit codec from actual contained originals and projection. A signed-zero
+or NaN-bit change cannot pass because proof strings agree. This additional verification shares the
+4 MiB retained I/O ledger and the existing 32 MiB compaction workspace admission; it stages no second
+payload tree and reads no numerical scientific tensors. Metadata bounds do not claim an Arrow or
+native allocator RSS limit.
+
+A successful v2 receive adds `technical_verification` with the retained-window scope and
+`provenance_origin='not_authenticated_offline'`. It establishes contained byte/declaration
+consistency only. It does not refresh native access, actual producer association, pin leases,
+writer/pruning readiness, runtime overhead or scientific acceptance. The wire/archive checks use
+manufactured fixtures; source publication and later installed/native qualification remain separate.

@@ -79,3 +79,85 @@ def catalog_artifacts(root: Path,watermark: dict[str,Any],*,limits=None,budget=N
     """Read the bounded exact closed prefix; later appends never change its pin."""
     rows,_=_catalog_rows(root,watermark,limits=limits,budget=budget)
     return tuple(item for item,_ in rows)
+
+
+def _retained_parquet_header(stream, descriptor, *, maximum_metadata_bytes):
+    """One already-qualified budgeted FD; inspect footer/schema, never decode rows."""
+    import pyarrow.parquet as pq
+    from qcl_negf_contracts.telemetry import TABLE_FIELDS
+    from .compaction import validate_performance_schema
+    reference = descriptor['ref']; size = int(reference['bytes'])
+    if size < 12 or stream.seek(0, 2) != size:
+        raise ContractError('retained Parquet size differs', 'corrupt_result')
+    stream.seek(-8, 2); trailer = stream.read(8)
+    if len(trailer) != 8 or trailer[4:] != b'PAR1':
+        raise ContractError('invalid retained Parquet footer', 'corrupt_result')
+    footer = int.from_bytes(trailer[:4], 'little')
+    fields = TABLE_FIELDS[descriptor['table']]
+    if 2*footer+len(fields)*1024+4096 > maximum_metadata_bytes:
+        raise ContractError('retained Parquet footer metadata allowance exceeded before decode', 'budget_exceeded')
+    stream.seek(0)
+    with pq.ParquetFile(stream, pre_buffer=False, buffer_size=0,
+            thrift_string_size_limit=max(1, maximum_metadata_bytes),
+            thrift_container_size_limit=max(1, maximum_metadata_bytes//128)) as file:
+        if (file.metadata.num_columns != len(fields)
+                or validate_performance_schema(file.schema_arrow) != descriptor['table']
+                or file.metadata.num_rows != int(descriptor['rows'])):
+            raise ContractError('retained Parquet footer rows/table differ from catalog', 'corrupt_result')
+
+
+def _retained_payload(root, descriptor, *, budget, maximum_metadata_bytes, bindings, retain_raw=False):
+    """Stream one exact Parquet member and keep its same-open identity witness."""
+    from .state import _BudgetStream, _metadata_weight
+    from .performance_views import _check_bindings
+    reference = descriptor['ref']; size = int(reference['bytes'])
+    if reference['media_type'] != 'application/vnd.apache.parquet':
+        raise ContractError('retained payload requires explicit Parquet type', 'unsupported_format')
+    budget.require(size)
+    if retain_raw and 2*size+65536 > maximum_metadata_bytes:
+        raise ContractError('retained raw payload exceeds prospective combined allowance', 'budget_exceeded')
+    key = (str(Path(root).absolute()), reference['path'])
+    if _metadata_weight((bindings, key))+512 > maximum_metadata_bytes:
+        raise ContractError('retained payload witness allowance exceeded', 'budget_exceeded')
+    with regular(beneath(root, reference['path']), size=size) as raw:
+        before = stamp(raw, include_change=True)
+        if key in bindings and bindings[key] != before:
+            raise ContractError('retained immutable payload path rebound', 'source_changed')
+        stream = _BudgetStream(raw, budget); phase = budget.phase
+        try:
+            budget.phase = 'sha'; digest = hashlib.sha256(); captured = bytearray() if retain_raw else None
+            remaining = size
+            while remaining:
+                chunk = stream.read(min(65536, remaining))
+                if not chunk:
+                    raise ContractError('retained payload shortened within selected read', 'source_changed')
+                remaining -= len(chunk); digest.update(chunk)
+                if captured is not None: captured.extend(chunk)
+            if digest.hexdigest() != reference['sha256'] or stamp(raw, include_change=True) != before:
+                raise ContractError('retained payload bytes/identity differ before footer decode', 'source_changed')
+            budget.phase = 'metadata'
+            _retained_parquet_header(stream, descriptor,
+                maximum_metadata_bytes=maximum_metadata_bytes-(2*size if retain_raw else 0))
+            if stamp(raw, include_change=True) != before:
+                raise ContractError('retained payload changed within same-open read', 'source_changed')
+            bindings[key] = before; _check_bindings({key:before})
+            return None, None if captured is None else bytes(captured)
+        except BaseException as primary:
+            try:
+                if stamp(raw, include_change=True) != before:
+                    raise ContractError('retained payload changed during failed read', 'source_changed')
+                _check_bindings({key:before})
+            except BaseException as cleanup:
+                primary.add_note('retained payload guard: '+str(cleanup))
+            raise
+        finally:
+            budget.phase = phase
+
+
+def _retained_metadata(value, reference, *, expected_transport):
+    """Validate typed snapshot metadata without following its historical locators."""
+    from qcl_negf_contracts.telemetry import validate_telemetry_catalog, validate_telemetry_index
+    if reference['schema'] == 'qcl-negf.telemetry-catalog.v3':
+        validate_telemetry_catalog(value, expected_transport=expected_transport)
+    elif reference['schema'] == 'qcl-negf.performance-index.v3':
+        validate_telemetry_index(value, expected_transport=expected_transport)
