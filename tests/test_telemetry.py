@@ -26,14 +26,15 @@ def test_closed_segments_preserve_types_nulls_and_counts(tmp_path: Path) -> None
     path = writer.close()
     commit = json.loads(path.read_bytes())
     assert commit["closed"] is True
-    assert all(not row["path"].startswith(".writing") for row in commit["artifacts"])
+    assert all(not row["path"].startswith(".writing") for row in (dict(path=a.path) for a in catalog_artifacts(writer.directory,writer.catalog_watermark)))
     assert writer.close() == path
     with pytest.raises(RuntimeError, match="closed"):
         writer.record_control({"event": "late"})
 
 
 def test_thread_and_cache_metrics_survive_science_export_and_old_rows(tmp_path: Path) -> None:
-    writer = TelemetryWriter(tmp_path / "run/performance", {}, {}, batch_rows=16)
+    from native_consumer_fixture import consumer_writer,consumer_export
+    context,writer=consumer_writer(tmp_path/"input",batch_rows=16)
     metrics = {"wall_seconds": 2., "voluntary_context_switches": 102,
         "involuntary_context_switches": 51, "voluntary_context_switches_delta": 33,
         "involuntary_context_switches_delta": 11, "thread_counter_interval_seconds": 1.,
@@ -50,7 +51,7 @@ def test_thread_and_cache_metrics_survive_science_export_and_old_rows(tmp_path: 
     writer.record_resource({"wall_seconds": 1.}, science_window=True)  # Old producer remains valid.
     writer.record_resource(metrics, science_window=True)
     writer.close()
-    receipt = export_snapshot(tmp_path / "run", tmp_path / "exports")
+    receipt = consumer_export(context,writer,tmp_path/"exports")
     found = []
     with tarfile.open(tmp_path / "exports" / f'{receipt["sha256"]}.tar.xz', "r:xz") as archive:
         for member in archive.getmembers():
@@ -66,12 +67,13 @@ def test_thread_and_cache_metrics_survive_science_export_and_old_rows(tmp_path: 
 
 
 def test_control_events_and_approved_windows_in_science(tmp_path: Path) -> None:
-    writer = TelemetryWriter(tmp_path / "run/performance", {}, {}, batch_rows=16)
+    from native_consumer_fixture import consumer_writer,consumer_export
+    context,writer=consumer_writer(tmp_path/"input",batch_rows=16)
     writer.record_control({"event": "admission", "reason": "allocation_available", "attempt": 1})
     writer.record_resource({"wall_seconds": 1.0, "cpu_time_seconds": 0.5})
     writer.record_span({"phase": "startup", "duration_seconds": 0.5}, science_window=True)
     writer.close()
-    receipt = export_snapshot(tmp_path / "run", tmp_path / "exports")
+    receipt = consumer_export(context,writer,tmp_path/"exports")
     with tarfile.open(tmp_path / "exports" / f'{receipt["sha256"]}.tar.xz', "r:xz") as archive:
         manifest = json.load(archive.extractfile("manifest.json"))
     roles = [item["role"] for record in manifest["records"] for item in record["included"]]
@@ -100,19 +102,21 @@ def test_unknown_or_nonfinite_fields_are_not_lost(tmp_path: Path) -> None:
 
 
 def test_ingestion_cursor_and_rows_share_one_commit_even_at_batch_boundary(tmp_path: Path) -> None:
-    writer = TelemetryWriter(tmp_path / "performance", {}, {}, batch_rows=2)
-    writer.record_resource({"wall_seconds": 1.0})
-    generation = writer.generation
-    commit_path = writer.ingest_spans([
-        {"phase": "dyson", "duration_seconds": 0.125},
-        {"phase": "total", "duration_seconds": 0.25}],
-        source_cursors={"source": {"offset": 128, "rows": 2}})
-    assert writer.generation == generation + 1
-    commit = json.loads(commit_path.read_bytes())
-    assert commit["source_cursors"]["source"]["offset"] == 128
-    segments = [item for item in catalog_artifacts(writer.directory, commit["telemetry_catalog"])
-                if item.media_type == "application/vnd.apache.parquet"]
-    assert sum(pq.read_table(writer.directory / item.path).num_rows for item in segments) == 3
+    from native_consumer_fixture import diagnostic_parts
+    writer=TelemetryWriter(tmp_path/'performance',{}, {},batch_rows=2)
+    writer.record_resource({'wall_seconds':1.})
+    generation=writer.generation
+    parts=diagnostic_parts(tmp_path/'producer',(.125,.25))
+    from dataclasses import replace
+    writer.stage_phase_batch(replace(parts[-1],first_row=0))
+    assert writer.generation==generation+1
+    commit=json.loads((writer.root/writer._previous_ref['path']).read_bytes())
+    assert commit['source_cursors'][0]['cursor']['next_row']=='2'
+    assert commit['source_cursors'][0]['cursor']['segment']==parts[-1].segment_ref
+    segments=[a for a in catalog_artifacts(writer.directory,writer.catalog_watermark) if a.media_type=='application/vnd.apache.parquet']
+    assert sum(pq.read_table(writer.directory/a.path).num_rows for a in segments)==3
+    spans=[row for a in segments if a.schema=='qcl-negf.performance.v2' for row in pq.read_table(writer.directory/a.path).to_pylist() if 'duration_seconds' in row]
+    assert [row['duration_seconds'] for row in spans]==[.125,.25]
     writer.close()
 
 
@@ -121,7 +125,7 @@ def test_invalid_ingestion_batch_never_advances_source_or_partially_accepts(tmp_
     with pytest.raises(ValueError, match="finite"):
         writer.ingest_spans([{"phase": "total", "duration_seconds": 1.0},
             {"phase": "total", "duration_seconds": float("nan")}],
-            source_cursors={"source": {"offset": 100}})
+            source_cursors={})
     assert writer.source_cursors == {}
     assert writer.counts["spans"] == 0
     writer.close()
@@ -169,19 +173,18 @@ def test_missing_resets_and_capacity_changes_are_unknown_but_long_gaps_are_measu
 
 
 def test_cpu_summary_survives_science_export_without_raw_resource_tables(tmp_path: Path) -> None:
-    writer = TelemetryWriter(tmp_path / "run/performance", {}, {}, batch_rows=16)
+    from native_consumer_fixture import consumer_writer,consumer_export
+    context,writer=consumer_writer(tmp_path/"input",batch_rows=16)
     writer.record_resource(resource_sample("a", 1, 10))
     writer.record_resource(resource_sample("a", 2, 26))
     writer.close()
-    receipt = export_snapshot(tmp_path / "run", tmp_path / "exports")
+    receipt = consumer_export(context,writer,tmp_path/"exports")
     summaries = []
     with tarfile.open(tmp_path / "exports" / f'{receipt["sha256"]}.tar.xz', "r:xz") as archive:
-        for member in archive.getmembers():
-            if member.name.startswith("objects/") and member.name.endswith(".json"):
-                value = json.load(archive.extractfile(member))
-                if "cpu_coverage" in value:
-                    summaries.append(value)
-        manifest = json.load(archive.extractfile("manifest.json"))
+        manifest=json.load(archive.extractfile('manifest.json'))
+        for record in manifest['records']:
+            for item in record['included']:
+                if item['role']=='performance.summary':summaries.append(json.load(archive.extractfile(item['object'])))
     assert len(summaries) == 1
     assert summaries[0]["cpu_coverage"]["allocations"][0]["fraction_of_allocated_cpu"] == 0.5
     assert not any(item["role"] == "performance.full"
@@ -199,23 +202,20 @@ def test_unmeasured_monotonic_timestamp_is_not_a_cpu_interval(tmp_path: Path) ->
 
 
 def test_staged_batches_keep_durable_offsets_and_raw_values_atomic(tmp_path: Path) -> None:
-    writer = TelemetryWriter(tmp_path / "performance", {}, {}, batch_rows=4)
-    first = {"journal": {"offset": 10}}
-    writer.stage_spans([{"phase": "total", "duration_seconds": 0.125}], source_cursors=first)
-    first["journal"]["offset"] = 999
-    assert writer.source_cursors == {}
-    assert writer.staged_source_cursors["journal"]["offset"] == 10
-    assert writer.pending_rows == 1
-    assert not list(writer.directory.glob("spans-*.parquet"))
-    for offset in (20, 30, 40):
-        writer.stage_spans([{"phase": "total", "duration_seconds": offset / 1000}],
-                           source_cursors={"journal": {"offset": offset}})
-    assert writer.pending_rows == 0
-    assert writer.source_cursors["journal"]["offset"] == 40
-    segments = list(writer.directory.glob("spans-*.parquet"))
-    assert len(segments) == 1
-    assert pq.read_table(segments[0])["duration_seconds"].to_pylist() == [0.125, 0.02, 0.03, 0.04]
-    assert pq.ParquetFile(segments[0]).metadata.row_group(0).column(0).compression == "ZSTD"
+    from native_consumer_fixture import diagnostic_parts
+    parts=diagnostic_parts(tmp_path/'producer',(.125,.02,.03,.04))
+    writer=TelemetryWriter(tmp_path/'performance',{}, {},batch_rows=4)
+    writer.stage_phase_batch(parts[0]);parts[0].cursor['next_row']='999'
+    assert writer.source_cursors=={}
+    assert next(iter(writer.staged_source_cursors.values()))['cursor']['next_row']=='1'
+    assert writer.pending_rows==1
+    assert not list(writer.directory.glob('spans-*.parquet'))
+    for part in parts[1:]:writer.stage_phase_batch(part)
+    assert writer.pending_rows==0
+    assert next(iter(writer.source_cursors.values()))['cursor']['next_row']=='4'
+    segments=list(writer.directory.glob('spans-*.parquet'));assert len(segments)==1
+    assert pq.read_table(segments[0])['duration_seconds'].to_pylist()==[.125,.02,.03,.04]
+    assert pq.ParquetFile(segments[0]).metadata.row_group(0).column(0).compression=='ZSTD'
     writer.close()
 
 
@@ -236,49 +236,50 @@ def test_quiet_partial_batch_flushes_at_deadline_and_close_has_one_commit(tmp_pa
     writer.close()
     assert writer.generation == generation + 2
     commit = json.loads((writer.directory / f"commit-{writer.generation:06d}.json").read_bytes())
-    summary = json.loads((writer.directory / commit["artifacts"][-1]["path"]).read_bytes())
-    assert summary["rows"]["resources"] == 2
+    summary = json.loads((writer.root / commit["summary"]["path"]).read_bytes())
+    assert summary["rows"]["resources"] == "2"
     assert summary["closed"] is True
     assert summary["durability"]["maximum_buffer_seconds"] == 15
 
 
 def test_staging_byte_bound_rejects_before_partial_acceptance(tmp_path: Path) -> None:
     writer = TelemetryWriter(tmp_path / "performance", {}, {}, batch_bytes=1024)
-    writer.stage_spans([{"phase": "total", "duration_seconds": 1.0}], source_cursors={"s": {"offset": 1}})
+    writer.stage_spans([{"phase": "total", "duration_seconds": 1.0}], source_cursors={})
     with pytest.raises(ValueError, match="byte bound"):
         writer.stage_spans([{"phase": "x" * 1025, "duration_seconds": 2.0}],
-                           source_cursors={"s": {"offset": 2}})
+                           source_cursors={})
     assert writer.counts["spans"] == 1
-    assert writer.staged_source_cursors["s"]["offset"] == 1
+    assert writer.staged_source_cursors == {}
+    with pytest.raises(ValueError,match="actual P29"):
+        writer.stage_spans([],source_cursors={"s":{"offset":1}})
     writer.close()
 
 
 def test_publication_failure_preserves_durable_cursor_and_retry_has_no_duplicate(tmp_path: Path, monkeypatch) -> None:
     import qcl_negf_results.telemetry as module
-    writer = TelemetryWriter(tmp_path / "performance", {}, {})
-    writer.ingest_spans([{"phase": "total", "duration_seconds": 1.0}], source_cursors={"s": {"offset": 1}})
-    writer.stage_spans([{"phase": "total", "duration_seconds": 2.0}], source_cursors={"s": {"offset": 2}})
-    publish = module.publish_pointer
-    def fail(*args, **kwargs):
-        raise OSError("pointer interrupted")
-    monkeypatch.setattr(module, "publish_pointer", fail)
-    with pytest.raises(OSError, match="interrupted"):
-        writer.flush()
-    assert writer.source_cursors["s"]["offset"] == 1
-    monkeypatch.setattr(module, "publish_pointer", publish)
-    commit = json.loads(writer.flush().read_bytes())
-    assert commit["source_cursors"]["s"]["offset"] == 2
-    artifacts = catalog_artifacts(writer.directory, commit["telemetry_catalog"])
-    rows = [row for item in artifacts if item.media_type == "application/vnd.apache.parquet"
-            for row in pq.read_table(writer.directory / item.path).to_pylist()]
-    assert [row["duration_seconds"] for row in rows] == [1.0, 2.0]
+    from native_consumer_fixture import diagnostic_parts
+    first,second=diagnostic_parts(tmp_path/'producer',(1.,2.))
+    writer=TelemetryWriter(tmp_path/'performance',{}, {})
+    writer.stage_phase_batch(first);writer.flush();writer.stage_phase_batch(second)
+    publish=module.publish_pointer
+    def fail(*args,**kwargs):raise OSError('pointer interrupted')
+    monkeypatch.setattr(module,'publish_pointer',fail)
+    with pytest.raises(OSError,match='interrupted'):writer.flush()
+    assert next(iter(writer.source_cursors.values()))['cursor']['next_row']=='1'
+    monkeypatch.setattr(module,'publish_pointer',publish)
+    commit=json.loads(writer.flush().read_bytes())
+    assert commit['source_cursors'][0]['cursor']['next_row']=='2'
+    artifacts=catalog_artifacts(writer.directory,writer.catalog_watermark)
+    rows=[r for a in artifacts if a.media_type=='application/vnd.apache.parquet' for r in pq.read_table(writer.directory/a.path).to_pylist()]
+    assert [r['duration_seconds'] for r in rows]==[1.,2.]
     writer.close()
 
 
 def test_live_export_is_exact_committed_prefix_and_barrier_includes_tail(tmp_path: Path) -> None:
-    writer = TelemetryWriter(tmp_path / "run/performance", {}, {})
-    writer.ingest_spans([{"phase": "total", "duration_seconds": 1.0}], source_cursors={"s": {"offset": 1}})
-    writer.stage_spans([{"phase": "total", "duration_seconds": 2.0}], source_cursors={"s": {"offset": 2}})
+    from native_consumer_fixture import consumer_writer,consumer_export,diagnostic_parts
+    context,writer=consumer_writer(tmp_path/'input')
+    first,second=diagnostic_parts(tmp_path/'producer',(1.,2.))
+    writer.stage_phase_batch(first);writer.flush();writer.stage_phase_batch(second)
     def values(receipt):
         result = []
         with tarfile.open(tmp_path / "exports" / f'{receipt["sha256"]}.tar.xz', "r:xz") as archive:
@@ -296,9 +297,9 @@ def test_live_export_is_exact_committed_prefix_and_barrier_includes_tail(tmp_pat
                         table = pq.read_table(pa.BufferReader(archive.extractfile(item["object"]).read()))
                         result.extend(table["duration_seconds"].to_pylist())
         return sorted(result)
-    assert values(export_snapshot(tmp_path / "run", tmp_path / "exports")) == [1.0]
+    assert values(consumer_export(context,writer,tmp_path/"exports",observe=True)) == [1.0]
     writer.flush()  # Scheduled export/terminal/checkpoint barrier.
-    assert values(export_snapshot(tmp_path / "run", tmp_path / "exports")) == [1.0, 2.0]
+    assert values(consumer_export(context,writer,tmp_path/"exports",observe=True)) == [1.0, 2.0]
     writer.close()
 
 
@@ -350,22 +351,47 @@ def test_profile_and_out_of_order_samples_do_not_duplicate_cpu() -> None:
 
 
 def test_phase_counters_and_missing_values_have_independent_coverage(tmp_path: Path) -> None:
-    writer = TelemetryWriter(tmp_path / "performance", {}, {})
-    writer.record_span({"phase": "dyson", "measurement_kind": "phase_boundary", "event_kind": "end",
-                        "duration_seconds": 2.0, "process_cpu_seconds": 8.0,
-                        "gc_seconds": 0.25, "allocated_bytes": 1024})
-    writer.record_span({"phase": "dyson", "measurement_kind": "phase_boundary", "event_kind": "end",
-                        "duration_seconds": 3.0})
-    writer.record_control({"event": "resource_samples_coalesced", "samples_dropped": 4})
-    commit = json.loads(writer.close().read_bytes())
-    summary = json.loads((writer.directory / commit["artifacts"][-1]["path"]).read_bytes())
-    measured = summary["producer_phase_measurements"]["dyson:inclusive"]
-    assert measured["calls"] == 2 and measured["cpu_measured_calls"] == 1
-    assert measured["cpu_seconds"] == 8 and measured["duration_seconds"] == 5
-    assert measured["cpu_measured_wall_seconds"] == 2
-    assert measured["gc_measured_wall_seconds"] == 2
-    assert summary["phase_attribution"]["admission_wait_seconds"] is None
-    assert summary["samples_dropped"] == 4
+    from native_consumer_fixture import diagnostic_phase,sealed_phase
+    from qcl_negf_results.capture import PhaseCaptureSource
+    from qcl_negf_results.state import _IOBudget
+    from result_v2_fixture import IDENTITY
+    literal=diagnostic_phase(tmp_path/'producer',IDENTITY)
+    descriptor=dict(status='available',session_id='native',current_path='phase-current.json',reason=None)
+    with PhaseCaptureSource(tmp_path/'producer',descriptor=descriptor,expected_identity=IDENTITY,route_epoch=0) as source:
+        batch=source.harvest(None,budget=_IOBudget(1024*1024))
+        assert batch.segment==literal['segment']
+        assert batch.segment_bytes==(tmp_path/'producer'/literal['segment_ref']['path']).read_bytes()
+        events=batch.segment['rows'][batch.first_row:batch.stop_row]
+        def metric(row,name):return next(m for m in row['metrics'] if m['name']==name)
+        assert len(events)==2 and all(r['action']=='phase_end' for r in events)
+        assert sum(metric(r,'duration_seconds')['value'] for r in events)==5
+        measured={}
+        for name,expected in (('cpu_seconds',8),('gc_seconds',.25),('allocated_bytes',1024)):
+            observed=[r for r in events if metric(r,name)['measurement_status']=='measured']
+            assert len(observed)==1 and sum(metric(r,name)['value'] for r in observed)==expected
+            assert sum(metric(r,'duration_seconds')['value'] for r in observed)==2
+            unavailable=[r for r in events if metric(r,name)['measurement_status']=='not_measured']
+            assert len(unavailable)==1 and metric(unavailable[0],name)['value'] is None
+            assert metric(unavailable[0],name)['reason']=='counter_unavailable'
+        writer=TelemetryWriter(tmp_path/'performance',{},{});writer.stage_phase_batch(batch)
+        writer.record_control({'event':'resource_samples_coalesced','samples_dropped':4})
+        commit=json.loads(writer.close().read_bytes());summary=json.loads((writer.root/commit['summary']['path']).read_bytes())
+        phase=summary['producer_phase_aggregates'][0]['aggregate']
+        assert phase['call_count']=='2'
+        counters={m['name']:m for m in phase['metrics']}
+        assert counters['process_cpu_seconds']['sum']==8 and counters['duration_seconds']['sum']==5
+        assert counters['process_cpu_seconds']['measured_calls']=='1' and counters['process_cpu_seconds']['unavailable_calls']=='1'
+        # No admission-wait measurement exists: unavailable, never measured zero.
+        assert next((m['sum'] for m in phase['metrics'] if m['name']=='admission_wait_seconds'),None) is None
+        assert summary['totals']['collector_dropped_rows']=='4'
+        assert summary['control_events']==[dict(event='resource_samples_coalesced',count='1')]
+        assert all('measured_wall_seconds' not in m for m in phase['metrics'])
+    normal=sealed_phase(tmp_path/'normal',IDENTITY)
+    with PhaseCaptureSource(tmp_path/'normal',descriptor=descriptor,expected_identity=IDENTITY,route_epoch=0) as source:
+        aggregate=source.harvest(None,budget=_IOBudget(1024*1024))
+        assert aggregate.segment['mode']=='normal'
+        assert all('cpu_measured_wall_seconds' not in r for r in aggregate.segment['rows'])
+        assert source.correlation_capabilities()['per_metric_measured_wall']==dict(available=False,reason='correlation_not_recorded')
 
 
 def test_retained_rss_peak_reaches_summary_after_current_counter_disappears(tmp_path: Path) -> None:
@@ -373,6 +399,178 @@ def test_retained_rss_peak_reaches_summary_after_current_counter_disappears(tmp_
     writer.record_resource({"wall_seconds": 1.0, "rss_bytes": None,
                             "peak_rss_bytes": 12345, "missing_reason": "process_counter_unavailable"})
     commit = json.loads(writer.close().read_bytes())
-    summary = json.loads((writer.directory / commit["artifacts"][-1]["path"]).read_bytes())
-    assert summary["max_observed_rss_bytes"] == 12345
+    summary = json.loads((writer.root / commit["summary"]["path"]).read_bytes())
+    assert summary["max_observed_rss_bytes"] == "12345"
     assert summary["cpu_coverage"]["allocations"] == []
+
+
+def test_T10_writer_commits_only_published_technical_envelope_with_integer_transport(tmp_path):
+    from qcl_negf_contracts.telemetry import validate_telemetry_commit
+    from qcl_negf_contracts.artifacts import validate_commit
+    from qcl_negf_contracts.messages import ContractError
+    transport=dict(selection=dict(calcjob_uuid='job3',execution_id='ex',attempt=3,
+        plan_fingerprint='a'*64),frozen_plan=None)
+    writer=TelemetryWriter(tmp_path,{}, {},transport=transport)
+    writer.record_resource(dict(allocation_id='alloc',execution_id='ex',pid=42,
+        process_start_ticks=7,monotonic_ns=0,wall_seconds=0.,cpu_time_seconds=1.,cpu_count=2,
+        cgroup_scope='root_julia_process_including_threads'))
+    writer.record_resource(dict(allocation_id='alloc',execution_id='ex',pid=42,
+        process_start_ticks=7,monotonic_ns=2_000_000_000,wall_seconds=2.,cpu_time_seconds=4.,cpu_count=2,
+        cgroup_scope='root_julia_process_including_threads'))
+    path=writer.close();commit=json.loads(path.read_bytes())
+    summary=json.loads((writer.root/commit['summary']['path']).read_bytes())
+    assert commit['schema']=='qcl-negf.telemetry-commit.v1'
+    assert commit['transport']['selection']['attempt']==3
+    assert type(commit['transport']['selection']['attempt']) is int
+    assert isinstance(commit['generation'],str)
+    prior_path=writer.root/commit['previous']['path']
+    prior=json.loads(prior_path.read_bytes())
+    prior_summary=json.loads((writer.root/prior['summary']['path']).read_bytes())
+    validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],
+        previous=prior,previous_ref=commit['previous'],previous_summary=prior_summary,
+        previous_summary_ref=prior['summary'])
+    with pytest.raises(ContractError):validate_commit(commit)
+    cpu=summary['cpu_coverage']['allocations'][0]
+    assert (cpu['cpu_seconds'],cpu['allocated_cpu_seconds'],cpu['fraction_of_observed_capacity'])==(3.,4.,.75)
+    assert summary['coverage']['scientific_acceptance']=='not_assessed'
+    assert summary['observer_self_cost']['physical_read_bytes']['value'] is None
+    assert writer.close()==path
+
+
+def test_T10_phase_rows_and_exact_accepted_prefix_share_one_technical_commit(tmp_path):
+    from native_consumer_fixture import sealed_phase
+    from result_v2_fixture import IDENTITY
+    from qcl_negf_results.capture import PhaseCaptureSource,PhaseCaptureLimits
+    from qcl_negf_results._capture_io import ObserverIO
+    literal=sealed_phase(tmp_path/'producer',IDENTITY)
+    source=PhaseCaptureSource(tmp_path/'producer',descriptor=dict(status='available',session_id='native',current_path='phase-current.json',reason=None),
+        expected_identity=IDENTITY,route_epoch=0,limits=PhaseCaptureLimits(maximum_rows=1))
+    writer=TelemetryWriter(tmp_path/'performance',{},{});budget=ObserverIO(1024*1024)
+    first=source.harvest(None,budget=budget);writer.stage_phase_batch(first)
+    assert writer.source_cursors=={}
+    old=json.loads(writer.flush().read_bytes());summary=json.loads((writer.root/old['summary']['path']).read_bytes())
+    assert old['accepted_ranges'][0]['first_row']=='0' and old['accepted_ranges'][0]['stop_row']=='1'
+    assert old['source_cursors'][0]['cursor']['last_sequence']=='8'
+    assert summary['totals']['accepted_source_rows']=='1' and summary['totals']['accepted_aggregate_calls']=='2'
+    assert summary['totals']['coalesced_source_events']=='0'
+    assert summary['producer_phase_aggregates'][0]['aggregate']['metrics'][0]['sum']==4.5
+    second=source.harvest(first.cursor,budget=budget);writer.stage_phase_batch(second)
+    commit=json.loads(writer.close().read_bytes());summary=json.loads((writer.root/commit['summary']['path']).read_bytes())
+    assert commit['accepted_ranges'][0]['first_row']=='1' and commit['accepted_ranges'][0]['stop_row']=='2'
+    assert commit['source_cursors'][0]['cursor']['last_sequence']=='8'
+    assert summary['totals']['accepted_source_rows']=='2' and summary['totals']['accepted_aggregate_calls']=='3'
+    assert summary['totals']['coalesced_source_events']=='6'
+    assert summary['rows']['spans']=='0'  # normal aggregate never becomes a fake per-call span
+    raw=writer.root/commit['accepted_ranges'][0]['retained_segment']['path']
+    assert raw.read_bytes()==first.segment_bytes==second.segment_bytes
+    assert len(list((writer.directory/'raw').glob('*segment*')))==1
+    assert literal['segment']['rows'][1]['last_sequence']=='6'
+    source.close()
+
+
+def test_T10_resume_preserves_closed_totals_and_never_bridges_old_cpu_endpoint(tmp_path):
+    from result_v2_fixture import reference
+    writer=TelemetryWriter(tmp_path,{}, {})
+    for stamp,cpu in ((0,1.),(2_000_000_000,4.)):
+        writer.record_resource(dict(monotonic_ns=stamp,wall_seconds=stamp/1e9,cpu_time_seconds=cpu,cpu_count=2,
+            allocation_id='alloc',execution_id='ex',pid=42,process_start_ticks=7,cgroup_scope='root_julia_process_including_threads'))
+    closed=writer.close();raw=closed.read_bytes();commit=json.loads(raw)
+    cref=reference(tmp_path,str(closed.relative_to(tmp_path)),'qcl-negf.telemetry-commit.v1')
+    resumed=TelemetryWriter.resume(tmp_path,commit_ref=cref,expected_session=commit['session'],hardware={})
+    resumed.record_resource(dict(monotonic_ns=10_000_000_000,wall_seconds=10.,cpu_time_seconds=100.,cpu_count=2,
+        allocation_id='alloc',execution_id='ex',pid=42,process_start_ticks=7,cgroup_scope='root_julia_process_including_threads'))
+    middle=json.loads(resumed.flush().read_bytes());summary=json.loads((tmp_path/middle['summary']['path']).read_bytes())
+    assert summary['cpu_totals']['cpu_seconds']['value']==3.
+    assert summary['cpu_totals']['valid_intervals']=='1'
+    assert summary['rows']['resources']=='1' and summary['totals']['rows']['resources']=='3'
+    resumed.record_resource(dict(monotonic_ns=12_000_000_000,wall_seconds=12.,cpu_time_seconds=103.,cpu_count=2,
+        allocation_id='alloc',execution_id='ex',pid=42,process_start_ticks=7,cgroup_scope='root_julia_process_including_threads'))
+    final=json.loads(resumed.close().read_bytes());summary=json.loads((tmp_path/final['summary']['path']).read_bytes())
+    assert summary['cpu_totals']['cpu_seconds']['value']==6.
+    assert summary['cpu_totals']['allocated_cpu_seconds']['value']==8.
+    assert summary['coverage']['incomplete'] is True
+    assert summary['coverage']['gaps'][0]['kind']=='collector_restart'
+    assert summary['session']['source']['session_id']!=commit['session']['source']['session_id']
+    assert summary['baseline']['commit']==cref
+    assert closed.read_bytes()==raw
+
+
+def test_T10_explicit_collector_page_rotation_admits_seventeenth_source_and_exact_older_return(tmp_path):
+    import copy
+    from native_consumer_fixture import sealed_phase
+    from result_v2_fixture import IDENTITY
+    from qcl_negf_results.capture import PhaseCaptureSource
+    from qcl_negf_results.state import _IOBudget
+    producer=tmp_path/'producer';writer=TelemetryWriter(tmp_path/'technical',{}, {})
+    accepted=None;first_batch=None;first_literal=None
+    def batch(number,*,previous=None,generation=1,cursor=None):
+        identity=dict(IDENTITY,point_id='point-'+str(number));root=producer/str(number)
+        literal=sealed_phase(root,identity,previous=previous,generation=generation)
+        with PhaseCaptureSource(root,descriptor=dict(status='available',session_id='native',current_path='phase-current.json',reason=None),
+                expected_identity=identity,route_epoch=0) as source:
+            return source.harvest(cursor,budget=_IOBudget(1024*1024)),literal
+    for number in range(16):
+        source,literal=batch(number);writer.stage_phase_batch(source)
+        result=json.loads(writer.flush().read_bytes())
+        if number==0:accepted=copy.deepcopy(result['accepted_ranges'][0]);first_batch=source;first_literal=literal
+    seventeenth,_=batch(16);before=(writer.generation,copy.deepcopy(writer.source_cursors),dict(writer.accepted_totals))
+    with pytest.raises(ValueError,match='page full'):writer.stage_phase_batch(seventeenth)
+    assert (writer.generation,writer.source_cursors,writer.accepted_totals)==before
+    closed=writer.rotate();old=json.loads(closed.read_bytes())
+    assert old['closed'] is True and len(old['source_cursors'])==16
+    assert writer.source_cursors=={} and not writer.closed
+    writer.stage_phase_batch(seventeenth);writer.flush()
+    assert writer.accepted_totals['accepted_source_rows']==34
+    second_closed=writer.rotate();assert second_closed!=closed
+    writer.record_resource(dict(wall_seconds=1.));writer.flush()  # no old source in predecessor
+    returning,_=batch(0,previous=first_literal['publication_ref'],generation=2,cursor=first_batch.cursor)
+    old_completion=dict(publication_ref=accepted['publication'],segment_ref=accepted['segment'],
+        retained_publication_ref=accepted['retained_publication'],retained_segment_ref=accepted['retained_segment'])
+    from result_v2_fixture import reference
+    resume=dict(commit_ref=reference(writer.root,str(closed.relative_to(writer.root)),'qcl-negf.telemetry-commit.v1'),summary_ref=old['summary'])
+    counts=dict(writer.accepted_totals)
+    with pytest.raises((ValueError,__import__('qcl_negf_contracts.messages',fromlist=['ContractError']).ContractError)):
+        writer.stage_phase_batch(returning)
+    assert writer.accepted_totals==counts
+    writer.stage_phase_batch(returning,phase_context_refs=(old_completion,),resume_context_refs=(resume,))
+    final=json.loads(writer.close().read_bytes());summary=json.loads((writer.root/final['summary']['path']).read_bytes())
+    assert summary['totals']['accepted_source_rows']=='36' and len(final['source_cursors'])==1
+    assert final['source_cursors'][0]['cursor']['next_row']=='2'
+
+
+def test_T10_new_publication_requires_completed_old_physical_rows_and_forgeries_change_no_cursor(tmp_path):
+    import copy
+    from native_consumer_fixture import sealed_phase
+    from result_v2_fixture import IDENTITY
+    from qcl_negf_results.capture import PhaseCaptureSource,PhaseCaptureLimits
+    from qcl_negf_results.state import _IOBudget
+    from qcl_negf_contracts.messages import ContractError
+    producer=tmp_path/'producer';literal=sealed_phase(producer,IDENTITY)
+    descriptor=dict(status='available',session_id='native',current_path='phase-current.json',reason=None)
+    with PhaseCaptureSource(producer,descriptor=descriptor,expected_identity=IDENTITY,route_epoch=0,
+            limits=PhaseCaptureLimits(maximum_rows=1)) as source:
+        first=source.harvest(None,budget=_IOBudget(1024*1024))
+        tail=source.harvest(first.cursor,budget=_IOBudget(1024*1024))
+    writer=TelemetryWriter(tmp_path/'technical',{},{});writer.stage_phase_batch(first);writer.flush()
+    second=sealed_phase(producer,IDENTITY,previous=literal['publication_ref'],generation=2)
+    with PhaseCaptureSource(producer,descriptor=descriptor,expected_identity=IDENTITY,route_epoch=0) as source:
+        next_batch=source.harvest(tail.cursor,budget=_IOBudget(1024*1024))
+    before=copy.deepcopy(writer.source_cursors);totals=copy.deepcopy(writer.accepted_totals)
+    with pytest.raises((ValueError,ContractError)):
+        writer.stage_phase_batch(next_batch)
+    assert writer.source_cursors==before and writer.accepted_totals==totals
+    writer.stage_phase_batch(tail);writer.flush();phase=copy.deepcopy(next(iter(writer._last_phase_raw.values())));closed=writer.rotate()
+    old=json.loads(closed.read_bytes())
+    from result_v2_fixture import reference
+    resume=dict(commit_ref=reference(writer.root,str(closed.relative_to(writer.root)),'qcl-negf.telemetry-commit.v1'),summary_ref=old['summary'])
+    counts=copy.deepcopy(writer.accepted_totals);generation=writer.generation
+    bad=copy.deepcopy(resume);bad['summary_ref']['sha256']='f'*64
+    with pytest.raises((ValueError,ContractError)):
+        writer.stage_phase_batch(next_batch,phase_context_refs=(phase,),resume_context_refs=(bad,))
+    forged=copy.deepcopy(phase);forged['retained_segment_ref']['sha256']='f'*64
+    with pytest.raises((ValueError,ContractError)):
+        writer.stage_phase_batch(next_batch,phase_context_refs=(forged,),resume_context_refs=(resume,))
+    assert writer.generation==generation and writer.accepted_totals==counts and writer.source_cursors=={}
+    writer.stage_phase_batch(next_batch,phase_context_refs=(phase,),resume_context_refs=(resume,));final=writer.close()
+    summary=json.loads((writer.root/json.loads(final.read_bytes())['summary']['path']).read_bytes())
+    assert summary['totals']['accepted_source_rows']=='4'

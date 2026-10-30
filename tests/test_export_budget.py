@@ -114,7 +114,9 @@ def test_typed_buffer_counts_bytes_instead_of_elements(tmp_path: Path) -> None:
     assert path.stat().st_size == 0
 
 
-def test_parquet_derivation_writes_are_actually_limited(tmp_path: Path) -> None:
+def test_parquet_derivation_writes_are_actually_limited(tmp_path: Path, monkeypatch) -> None:
+    import os
+    import struct
     import pyarrow as pa
     import pyarrow.parquet as pq
     from qcl_negf_contracts.artifacts import CONTRACT_SET
@@ -125,14 +127,50 @@ def test_parquet_derivation_writes_are_actually_limited(tmp_path: Path) -> None:
     schema = pa.schema([pa.field(name, types[kind]) for name, kind in TABLE_FIELDS["resources"]],
         metadata={b"schema": TELEMETRY_SCHEMA.encode(), b"contract_set": CONTRACT_SET.encode(), b"table": b"resources"})
     source, spool = tmp_path / "source.parquet", tmp_path / "spool"
-    pq.write_table(pa.Table.from_pylist([{"monotonic_ns": 1}], schema=schema), source)
+    nan_bits = bytes.fromhex("341200000000f87f")
+    pq.write_table(pa.Table.from_pylist([{"monotonic_ns": 1, "wall_seconds": -0.0,
+        "cpu_time_seconds": struct.unpack("<d", nan_bits)[0]}], schema=schema), source)
     original = source.read_bytes()
     spool.mkdir()
     budget = ExportBudget(spool, byte_budget=64, reserve_bytes=0)
     target = spool / "derived.parquet"
+    def measure_writes(allowance):
+        writes = []
+        original_open = allowance.open
+        def measured_open(path, *args, **kwargs):
+            sink = original_open(path, *args, **kwargs)
+            stream = sink.stream
+            class PhysicalWrites:
+                def __getattr__(self, name):
+                    return getattr(stream, name)
+                def write(self, value):
+                    count = stream.write(value)
+                    # Observe actual unbuffered delivery before compaction cleanup.
+                    writes.append((count, os.fstat(stream.fileno()).st_size))
+                    return count
+            sink.stream = PhysicalWrites()
+            return sink
+        monkeypatch.setattr(allowance, "open", measured_open)
+        return writes
+    writes = measure_writes(budget)
     with pytest.raises(ContractError, match="export.*budget"):
         compact_performance([source], target, budget=budget)
-    assert target.stat().st_size <= 64
+    assert writes and all(count > 0 and size <= 64 for count, size in writes)
+    high_water = max(size for _, size in writes)
+    assert budget.used == budget.sizes[target.resolve()] == high_water <= 64
+    assert not target.exists()
+    assert source.read_bytes() == original
+    healthy = ExportBudget(spool, byte_budget=1024 * 1024, reserve_bytes=0)
+    healthy_writes = measure_writes(healthy)
+    completed = spool / "complete.parquet"
+    proof = compact_performance([source], completed, budget=healthy)
+    actual = pq.read_table(completed)
+    assert proof["rows"] == 1 and actual["monotonic_ns"].to_pylist() == [1]
+    assert actual.schema.equals(schema, check_metadata=True)
+    assert struct.pack("<d", actual["wall_seconds"][0].as_py()) == bytes.fromhex("0000000000000080")
+    assert struct.pack("<d", actual["cpu_time_seconds"][0].as_py()) == nan_bits
+    assert healthy_writes and all(size <= healthy.byte_budget for _, size in healthy_writes)
+    assert healthy.used == max(size for _, size in healthy_writes) == completed.stat().st_size
     assert source.read_bytes() == original
 
 

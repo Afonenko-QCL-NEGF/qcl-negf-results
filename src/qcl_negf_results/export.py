@@ -145,6 +145,109 @@ def _selection(reader, profile, *, analysis=(None, None)):
             primary.add_note('lineage cleanup also raised '+type(first).__name__)
 
 
+def _technical_selection(reader, telemetry, profile, bindings):
+    """Exact declared transaction and logical table subset; no newest discovery."""
+    if telemetry is None:
+        return None
+    from .performance_views import _load_telemetry, PerformanceLimits
+    from .catalog import _catalog_rows
+    from qcl_negf_contracts.telemetry import TABLE_FIELDS, TELEMETRY_SCHEMA
+    loaded = _load_telemetry(reader, telemetry, PerformanceLimits(), bindings)
+    selected = {}; omitted = []; rows = []
+    def add(scope, reference, role, **extra):
+        key = (str(Path(scope).absolute()), reference['path'])
+        row = dict(reference=_ref(reference), root=Path(scope), role=role, **extra)
+        old = selected.get(key)
+        if old is not None and old['reference'] != row['reference']:
+            raise ContractError('technical path has conflicting selected references', 'corrupt_result')
+        if old is None:selected[key] = row
+        from .state import _metadata_weight
+        if _metadata_weight((selected,omitted,bindings))>reader.limits.maximum_catalog_bytes:
+            raise ContractError('technical selected metadata inventory exceeds allowance','budget_exceeded')
+        if len(selected)>reader.limits.maximum_catalog_entries:
+            raise ContractError('technical selected inventory exceeds allowance', 'budget_exceeded')
+    for scope,ref in loaded['references']:
+        role = 'performance.summary' if ref==loaded['commit']['summary'] and scope==telemetry.artifact_root else 'performance.provenance'
+        add(scope,ref,role)
+    commit=loaded['commit'];commits=[commit]
+    if profile=='full-state':
+        from .performance_views import _read_reference
+        from .state import _schema_check,_metadata_weight
+        from qcl_negf_contracts import schema_validator
+        from qcl_negf_contracts.telemetry import validate_telemetry_summary
+        envelope=schema_validator('telemetry-envelope.schema.json')
+        queue=[];seen={json_bytes(telemetry.commit_ref)}
+        for key in ('previous','baseline'):
+            value=commit[key]
+            if value is not None:queue.append(value['commit'] if key=='baseline' else value)
+        while queue:
+            ref=queue.pop();key=json_bytes(ref)
+            if key in seen:continue
+            seen.add(key)
+            if len(seen)>reader.limits.maximum_catalog_pages:raise ContractError('technical predecessor graph exceeds allowance','budget_exceeded')
+            value,_=_read_reference(reader,telemetry.artifact_root,ref,reader.limits,bindings)
+            _schema_check(envelope.evolve(schema={'$ref':'#/$defs/TelemetryCommit','$defs':envelope.schema['$defs']}),value)
+            add(telemetry.artifact_root,ref,'performance.provenance')
+            prior_summary,_=_read_reference(reader,telemetry.artifact_root,value['summary'],reader.limits,bindings)
+            validate_telemetry_summary(prior_summary)
+            for field in ('session','transport','generation','closed','baseline','source_cursors'):
+                if value[field]!=prior_summary[field]:raise ContractError('retained technical transaction header differs','corrupt_result')
+            add(telemetry.artifact_root,value['summary'],'performance.provenance')
+            for ar in value['accepted_ranges']:
+                for name in ('retained_publication','retained_segment'):
+                    if ar[name] is not None:add(telemetry.artifact_root,ar[name],'performance.provenance')
+            commits.append(value)
+            for name in ('previous','baseline'):
+                edge=value[name]
+                if edge is not None:queue.append(edge['commit'] if name=='baseline' else edge)
+            if _metadata_weight((selected,omitted,commits,queue,seen,bindings))>reader.limits.maximum_catalog_bytes:
+                raise ContractError('technical metadata graph exceeds allowance','budget_exceeded')
+    catalog_groups={}
+    for value in commits:
+        head=value['catalog']
+        if head is not None:catalog_groups.setdefault(str(Path(head['path']).parent),[]).append(head)
+    for group_name,heads in catalog_groups.items():
+        group_generation=min(int(value['generation']) for value in commits if value['catalog'] is not None and str(Path(value['catalog']['path']).parent)==group_name)
+        watermark=max(heads,key=lambda head:head['entries'])
+        # Wire root is explicit, while catalog previous/artifact paths are local
+        # to the catalog's declared parent. Never infer a session by basename.
+        parent=Path(watermark['path']).parent
+        catalog_root=telemetry.artifact_root/parent
+        local=dict(watermark,path=Path(watermark['path']).name)
+        artifacts,pages=_catalog_rows(catalog_root,local,limits=reader.limits,budget=reader._budget,bindings=bindings)
+        for ref,_ in pages:
+            add(telemetry.artifact_root,dict(ref,path=str(parent/ref['path'])),'performance.catalog')
+        witnessed={(ref['path'],ref['sha256'],page['entries']) for ref,page in pages}
+        if any((Path(h['path']).name,h['sha256'],h['entries']) not in witnessed for h in heads):
+            raise ContractError('technical catalog pins do not share their declared exact prefix','corrupt_result')
+        tables={name:[] for name in TABLE_FIELDS}
+        for artifact,raw in artifacts:
+            if artifact.media_type=='application/vnd.apache.parquet':
+                table=raw.get('table')
+                if raw.get('schema')!=TELEMETRY_SCHEMA or table not in TABLE_FIELDS:
+                    raise ContractError('declared performance table/schema required; no format guessing','unsupported_format')
+                tables[table].append(raw)
+        tails={raw['path'] for group in tables.values() for raw in group[-3:]}
+        for artifact_index,(artifact,raw) in enumerate(artifacts):
+            reference=dict(path=str(parent/artifact.path),bytes=str(artifact.size),sha256=artifact.sha256,
+                media_type=artifact.media_type,schema=artifact.schema)
+            if artifact.schema is None:raise ContractError('explicit technical artifact schema required','unsupported_format')
+            chosen=profile=='full-state' or artifact.included('science') or artifact.path in tails
+            if chosen:
+                projection_role='performance.provenance' if artifact.media_type=='application/json' else 'performance.window' if profile=='science' and artifact.role=='performance.full' else artifact.role
+                add(telemetry.artifact_root,reference,projection_role,table=raw.get('table'),
+                    catalog_order=(group_generation,artifact_index),source_role=artifact.role,selection='cutoff_tail' if artifact.path in tails else 'declared_profile')
+                rows.append(raw)
+            else:omitted.append(dict(reference=reference,role=artifact.role,reason='performance_full_excluded_from_science'))
+    return dict(loaded=loaded,selected=selected,omitted=omitted,
+        cutoff=dict(commit=telemetry.commit_ref,catalog=commit['catalog'],source_cursors=commit['source_cursors'],
+            uncommitted='not_included',pending_rows=None),
+        freshness=dict(session=commit['session']['source']['session_id'],published_unix=commit['published_unix'],
+            observed_unix=telemetry.observed_unix,committed_age_seconds=None if telemetry.observed_unix is None else telemetry.observed_unix-commit['published_unix'],
+            maximum_buffer_seconds=loaded['summary']['durability']['maximum_buffer_seconds'],pending_rows=None),
+        root=telemetry.artifact_root,plan_root=telemetry.canonical_plan_root)
+
+
 def _bound_capabilities(reader, profile, analysis):
     capabilities = copy.deepcopy(reader.source.capabilities)
     observations, diagnostics = analysis
@@ -161,14 +264,18 @@ def _bound_capabilities(reader, profile, analysis):
 
 
 def preview(reader: StateReader, *, profile: str,
-            observations_ref: Document | None = None, diagnostics_ref: Document | None = None) -> dict:
+            observations_ref: Document | None = None, diagnostics_ref: Document | None = None, telemetry=None) -> dict:
     if not isinstance(reader, StateReader):
         raise TypeError('explicit selected StateReader required')
     with reader._consumer_operation():
         analysis = _analysis_context(reader, observations_ref, diagnostics_ref)
         selected, omitted, _ = _selection(reader, profile, analysis=analysis)
-        return dict(profile=profile, source=copy.deepcopy(reader.source.state), files=len(selected),
-            bytes=sum(int(row['bytes']) for row in selected.values()), omitted_by_policy=omitted,
+        bindings={};technical=_technical_selection(reader,telemetry,profile,bindings)
+        from .performance_views import _check_bindings
+        _check_bindings(bindings)
+        return dict(profile=profile, source=copy.deepcopy(reader.source.state), files=len(selected)+(0 if technical is None else len(technical['selected'])),
+            bytes=sum(int(row['bytes']) for row in selected.values())+ (0 if technical is None else sum(int(row['reference']['bytes']) for row in technical['selected'].values())), omitted_by_policy=omitted,
+            telemetry=None if technical is None else dict(cutoff=technical['cutoff'],freshness=technical['freshness']),
             capabilities=_bound_capabilities(reader, profile, analysis),
             integrity_scope='selected_analysis_metadata_verified' if any(analysis) else 'declared_metadata_availability',
             canonical_source_complete=profile == 'full-state', scientific_accepted=None)
@@ -177,18 +284,25 @@ def preview(reader: StateReader, *, profile: str,
 def export_snapshot(reader: StateReader, destination: str | Path, *, profile: str,
                     byte_budget: int, reserve_bytes: int,
                     progress: Callable[[dict], None] | None = None,
-                    observations_ref: Document | None = None, diagnostics_ref: Document | None = None) -> dict:
+                    observations_ref: Document | None = None, diagnostics_ref: Document | None = None, telemetry=None, witness_policy=None) -> dict:
     if not isinstance(reader, StateReader):
         raise TypeError('explicit selected StateReader required')
     with reader._consumer_operation():
         analysis = _analysis_context(reader, observations_ref, diagnostics_ref)
         return _export_snapshot(reader, destination, profile=profile,
-            byte_budget=byte_budget, reserve_bytes=reserve_bytes, progress=progress, analysis=analysis)
+            byte_budget=byte_budget, reserve_bytes=reserve_bytes, progress=progress, analysis=analysis,telemetry=telemetry,witness_policy=witness_policy)
 
 
-def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes, progress, analysis):
+def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes, progress, analysis,telemetry,witness_policy):
     validate_options(byte_budget, reserve_bytes)
     selected, omitted, records = _selection(reader, profile, analysis=analysis)
+    witness=None
+    if witness_policy is not None:
+        from .witness_selection import POLICY,select_history_witnesses
+        if witness_policy!=POLICY:raise ValueError('unsupported logical witness selection policy')
+        witness=select_history_witnesses(reader)
+    technical_bindings={}
+    technical=_technical_selection(reader,telemetry,profile,technical_bindings)
     if profile == 'full-state':
         from .archive import _verify_source_tree
         _verify_source_tree(reader.root, reader.source.state, limits=reader.limits, budget=reader._budget, selected_reader=reader)
@@ -205,7 +319,8 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
     snapshot_identity = hashlib.sha256(json_bytes(dict(schema=EXPORT_SCHEMA, contract_set=CONTRACT_SET,
         profile=profile, source_state=reader.source.state, selected=[selected[k] for k in sorted(selected)],
         omitted_by_policy=omitted, selected_analysis=[None if d is None else d.artifact for d in analysis],
-        native_format='5.0', exporter_revision=10))).hexdigest()
+        technical_selection=[] if technical is None else [dict(scope='telemetry' if row['root']==technical['root'] else 'canonical_plan',reference=row['reference'],role=row['role'],table=row.get('table')) for _,row in sorted(technical['selected'].items())],
+        technical_observation=None if technical is None else technical['freshness']['observed_unix'],witness_policy=witness_policy,native_format='5.0', exporter_revision=11))).hexdigest()
     report = progress or (lambda event: None)
     def transport_report(phase, **values):
         report(dict(phase=phase, **values))
@@ -249,6 +364,42 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
         provenance['native_verified_references_scope'] = 'captured_native_bytes_and_headers'
         records = [dict(source_state=copy.deepcopy(reader.source.state), included=included, omitted_by_policy=omitted,
             native_provenance=provenance)]
+        technical_locator=[];compaction=[];telemetry_storage=None
+        if technical is not None:
+            from .compaction import _CompactionRead,compact_export_records
+            footer=_CompactionRead(32*1024*1024,reader._budget)
+            technical_included=[]
+            for _,row in sorted(technical['selected'].items(),key=lambda pair:(pair[1].get('catalog_order',(-1,-1)),pair[0])):
+                ref=row['reference'];suffix='.parquet' if ref['media_type']=='application/vnd.apache.parquet' else '.json'
+                name='objects/'+ref['sha256']+suffix
+                if name not in objects:
+                    with regular(beneath(row['root'],ref['path']),size=int(ref['bytes'])) as source:
+                        technical_bindings[(str(row['root'].absolute()),ref['path'])]=stamp(source,include_change=True)
+                    from .state import _metadata_weight
+                    if _metadata_weight(technical_bindings)>reader.limits.maximum_catalog_bytes:
+                        raise ContractError('technical source stability inventory exceeds allowance','budget_exceeded')
+                    target=spool/(ref['sha256']+suffix);size=int(ref['bytes']);budget.check(size)
+                    copy_closed(beneath(row['root'],ref['path']),target,size=size,sha256=ref['sha256'],budget=reader._budget)
+                    budget._record(target.resolve(),size)
+                    objects[name]=(target,dict(path=name,bytes=size,sha256=ref['sha256'],media_type=ref['media_type']))
+                if row.get('table') is not None:
+                    with footer.open(objects[name][0]) as stream:
+                        with footer.parquet(stream) as file:
+                            _,table=footer.geometry(file)
+                            if table!=row['table']:raise ContractError('selected Parquet footer differs from authenticated table declaration','corrupt_result')
+                scope='telemetry' if row['root']==technical['root'] else 'canonical_plan'
+                technical_locator.append(dict(scope=scope,reference=ref,object=name))
+                technical_included.append(dict(role=row['role'],object=name,sha256=ref['sha256'],schema=ref['schema'],
+                    dependencies=[],table=row.get('table'),source_path=ref['path'],source_scope=scope,
+                    source_role=row.get('source_role',row['role']),selection=row.get('selection','exact_transaction_metadata')))
+            footer.finish()
+            technical_record=dict(source_state=copy.deepcopy(reader.source.state),source_commit_sha256=telemetry.commit_ref['sha256'],
+                technical=True,included=technical_included,omitted_by_policy=technical['omitted'])
+            records.append(technical_record)
+            compaction=compact_export_records([technical_record],objects,spool,budget=budget,io_budget=reader._budget,retain_original=True)
+            originals={row['object'] for row in technical_locator if row['reference']['media_type']=='application/vnd.apache.parquet'}
+            telemetry_storage=dict(original_parquet_bytes=sum(objects[name][1]['bytes'] for name in originals),
+                projection_parquet_bytes=sum(proof['compacted_bytes'] for proof in compaction),physical_space_saving_claim=False)
         capabilities = ['complete_exact_source_graph'] if profile == 'full-state' else []
         if any(row['role']=='science.history' for row in selected.values()):
             capabilities += ['raw_scientific_history', 'stored_diagnostic_witnesses']
@@ -262,6 +413,10 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
             source_locator=[dict(reference=_ref(row), object=mapping[path]) for path, row in sorted(selected.items())],
             canonical_source_complete=profile == 'full-state', scientific_accepted=None,
             snapshot_consistent=True, complete=profile == 'full-state',
+            technical_locator=technical_locator,telemetry_compaction=compaction,telemetry_storage=telemetry_storage,
+            cutoff=None if technical is None else technical['cutoff'],freshness=dict(telemetry=[] if technical is None else [technical['freshness']]),
+            job_complete=False if technical is not None and not technical['loaded']['commit']['closed'] else None,
+            witness_selection=witness,
             coverage=dict(scope='explicit_selected_state', uncommitted_tail='not_included',
                           stored_observables='selected_metadata_verified' if analysis[0] is not None else 'explicit_final_observations_ref_required',
                           stored_final_diagnostics='selected_metadata_verified' if any(analysis) else 'explicit_final_diagnostics_ref_required'))
@@ -290,6 +445,8 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
         previous_receipt = receipt_path.read_bytes() if receipt_path.exists() else None
         receipt_published = False
         try:
+            from .performance_views import _check_bindings
+            _check_bindings(technical_bindings)
             for path,before in bindings.items():
                 with regular(beneath(reader.root,path), size=int(selected[path]['bytes'])) as stream:
                     if stamp(stream, include_change=True) != before:

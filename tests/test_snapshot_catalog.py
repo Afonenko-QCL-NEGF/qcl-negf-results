@@ -22,7 +22,7 @@ def test_catalog_storage_is_linear_and_pinned_prefix_survives_appends(tmp_path: 
     sizes = []
     for index in range(100):
         writer.ingest_spans([{"phase": "dyson", "duration_seconds": 0.125}],
-                            source_cursors={"source": {"offset": index + 1}})
+                            source_cursors={})
         if index == 9:
             old = dict(writer.catalog_watermark)
             before = tuple(catalog_artifacts(writer.directory, old))

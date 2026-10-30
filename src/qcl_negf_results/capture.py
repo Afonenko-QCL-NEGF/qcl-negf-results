@@ -8,6 +8,8 @@ import signal
 import subprocess
 import sys
 import time
+from copy import deepcopy
+from dataclasses import dataclass
 from pathlib import Path
 
 from ._atomic_io import atomic_write, fsync_directory
@@ -19,11 +21,182 @@ from ._capture_io import (
     integer,
     ObserverIO,
     regular,
+    stamp,
     small_json,
 )
 from .commits import decode_json, json_bytes
 
 MIB = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class PhaseCaptureLimits:
+    maximum_metadata_bytes: int = MIB
+    maximum_segment_bytes: int = 4*MIB
+    maximum_rows: int = 128
+    maximum_publications: int = 256
+    maximum_pending_reference_bytes: int = 4*MIB
+
+    def __post_init__(self):
+        if any(type(v) is not int or v<1 for v in vars(self).values()):
+            raise ValueError('positive phase capture bounds required')
+
+
+@dataclass(frozen=True)
+class PhaseBatch:
+    identity: dict
+    source: dict
+    segment: dict
+    segment_ref: dict
+    segment_bytes: bytes
+    publication: dict
+    publication_ref: dict
+    previous: dict | None
+    previous_ref: dict | None
+    current: dict
+    first_row: int
+    stop_row: int
+    cursor: dict
+    route_epoch: int
+    io_counters: dict
+    publication_bytes: bytes
+    previous_bytes: bytes | None
+
+
+class PhaseCaptureSource:
+    """One bounded sealed-source epoch. No journal prefix, global index or solve."""
+    def __init__(self,artifact_root,*,descriptor,expected_identity,route_epoch,limits=None):
+        if (not isinstance(descriptor,dict) or set(descriptor)!={'status','session_id','current_path','reason'}
+                or descriptor['status']!='available' or descriptor['reason'] is not None
+                or not isinstance(descriptor['session_id'],str) or not descriptor['session_id']):
+            raise ValueError('explicit available producer phase descriptor required')
+        from qcl_negf_contracts.artifacts import relative_path
+        relative_path(descriptor['current_path'])
+        if not integer(route_epoch):raise ValueError('nonnegative route epoch required')
+        self.root=Path(artifact_root);self.descriptor=deepcopy(descriptor);self.identity=deepcopy(expected_identity)
+        self.route_epoch=route_epoch;self.limits=limits or PhaseCaptureLimits()
+        if not isinstance(self.limits,PhaseCaptureLimits):raise TypeError('PhaseCaptureLimits required')
+        self._cache={};self._pending=[];self._walk=None;self._stop=None;self._head=None;self._seen=set();self._discovering=False
+        stat=self.root.stat();self._root_stamp=(stat.st_dev,stat.st_ino);self.closed=False;self.backlogged=False;self._mode=None;self.observed_closed=None
+
+    def __enter__(self):return self
+    def __exit__(self,*args):self.close()
+    def close(self):self._cache.clear();self._pending.clear();self.closed=True
+
+    def correlation_capabilities(self):
+        """Raw representation capability, never actual metric coverage/acceptance."""
+        return dict(per_metric_measured_wall=dict(available=self._mode=='diagnostic',
+            reason=None if self._mode=='diagnostic' else 'correlation_not_recorded' if self._mode=='normal' else 'explicit_segment_required'))
+
+    def _guard(self,path,before):
+        from qcl_negf_contracts.messages import ContractError
+        try:
+            st=self.root.stat()
+            if (st.st_dev,st.st_ino)!=self._root_stamp:fail('source_changed','phase artifact root replaced')
+            with regular(path) as stream:
+                if stamp(stream,include_change=True)!=before:fail('source_changed','immutable phase source replaced')
+        except (OSError,ContractError) as error:
+            raise ContractError('consumed immutable phase source changed','source_changed') from error
+
+    def _read(self,ref,budget):
+        from qcl_negf_contracts import schema_validator
+        from .state import _metadata_weight,_schema_check
+        common=schema_validator('result-common.schema.json')
+        _schema_check(common.evolve(schema={'$ref':'#/$defs/FileRef','$defs':common.schema['$defs']}),ref)
+        path=beneath(self.root,ref['path']);key=json_bytes(ref)
+        if key in self._cache:
+            value,raw,before=self._cache[key];self._guard(path,before);return deepcopy(value),raw
+        is_segment=ref['schema']=='qcl-negf.producer-phase-segment.v1'
+        maximum=self.limits.maximum_segment_bytes if is_segment else self.limits.maximum_metadata_bytes
+        size=int(ref['bytes'])
+        if size>maximum:fail('budget_exceeded','phase metadata/segment byte cap exceeded')
+        with regular(path,size=size) as stream:
+            before=stamp(stream,include_change=True);budget.require(size);raw=stream.read(size);budget.account(len(raw))
+            if len(raw)!=size or stamp(stream,include_change=True)!=before or digest(raw)!=ref['sha256']:
+                fail('source_changed','phase reference bytes changed')
+            self._guard(path,before)
+        value=decode_json(raw,'sealed phase source')
+        if value.get('identity')!=self.identity or value.get('source',{}).get('session_id')!=self.descriptor['session_id']:
+            fail('identity_mismatch','phase source identity/session differs')
+        old=dict(self._cache)
+        if is_segment:
+            old={k:v for k,v in old.items() if v[0].get('schema')!='qcl-negf.producer-phase-segment.v1'}
+        prospective=(value,raw,before)
+        if (_metadata_weight((old,key,prospective,self._pending))+2*_metadata_weight(value))>self.limits.maximum_pending_reference_bytes+self.limits.maximum_segment_bytes:
+            fail('budget_exceeded','phase retained decoded context exceeds allowance')
+        old[key]=prospective;self._cache=old
+        return deepcopy(value),raw
+
+    def harvest(self,cursor,*,budget):
+        from qcl_negf_contracts import schema_validator
+        from qcl_negf_contracts.telemetry import validate_phase_current,validate_phase_publication,validate_phase_cursor
+        from .state import _metadata_weight,_schema_check
+        if self.closed:raise RuntimeError('phase source closed')
+        before=budget.read_bytes if hasattr(budget,'read_bytes') else budget.bytes_read_total
+        current,_=small_json(beneath(self.root,self.descriptor['current_path']),self.limits.maximum_metadata_bytes,budget=budget)
+        current_validator=schema_validator('producer-phase-source.schema.json')
+        _schema_check(current_validator.evolve(schema={'$ref':'#/$defs/Current','$defs':current_validator.schema['$defs']}),current)
+        if current['identity']!=self.identity or current['source']['session_id']!=self.descriptor['session_id']:
+            fail('identity_mismatch','phase current owner differs')
+        head=current['publication']
+        if head is None:
+            validate_phase_current(current)
+            if cursor is not None or self._head is not None or self._discovering or self._pending:
+                # A locally valid empty Current cannot certify an earlier prefix.
+                self.observed_closed=None
+                fail('source_changed','observed phase head no longer reaches the prior prefix')
+            self.observed_closed=current["closed"]
+            return None
+        head_value,_=self._read(head,budget)
+        validate_phase_current(current,publication=head_value,publication_ref=head)
+        self.observed_closed=current["closed"]
+        if not self._discovering and not self._pending:
+            self._head=deepcopy(head);self._walk=deepcopy(head);self._stop=None if cursor is None else deepcopy(cursor['publication'])
+            self._seen=set();self._discovering=True
+        if self._discovering:
+            count=0
+            while self._walk!=self._stop:
+                if self._walk is None:fail('source_changed','committed phase publication is not an ancestor')
+                key=json_bytes(self._walk)
+                if key in self._seen:fail('corrupt_result','phase publication cycle')
+                if count>=self.limits.maximum_publications:self.backlogged=True;return None
+                pub,_=self._read(self._walk,budget)
+                validator=schema_validator('producer-phase-source.schema.json')
+                _schema_check(validator.evolve(schema={'$ref':'#/$defs/Publication','$defs':validator.schema['$defs']}),pub)
+                if _metadata_weight((self._pending,self._seen,key,self._walk))>self.limits.maximum_pending_reference_bytes:
+                    fail('budget_exceeded','phase pending reference cap exceeded')
+                self._pending.append(deepcopy(self._walk));self._seen.add(key);self._walk=deepcopy(pub['previous']);count+=1
+            self._discovering=False;self.backlogged=False
+        # A partial old publication must finish before any newer page. A false
+        # completion bit with a full physical prefix may advance legitimately.
+        chosen=None
+        if cursor is not None:
+            oldpub,_=self._read(cursor['publication'],budget);oldseg,_=self._read(cursor['segment'],budget)
+            validate_phase_cursor(cursor,publication=oldpub,publication_ref=cursor['publication'],segment=oldseg,segment_ref=cursor['segment'])
+            if int(cursor['next_row'])<len(oldseg['rows']):chosen=cursor['publication']
+        if chosen is None:
+            if not self._pending:return None
+            chosen=self._pending[-1]
+        publication,publication_raw=self._read(chosen,budget);segment,raw=self._read(publication['segment'],budget)
+        previous_ref=publication['previous'];previous=None;previous_raw=None
+        if previous_ref is not None:previous,previous_raw=self._read(previous_ref,budget)
+        validate_phase_publication(publication,segment=segment,segment_ref=publication['segment'],previous=previous,previous_ref=previous_ref)
+        first=int(cursor['next_row']) if cursor is not None and cursor['publication']==chosen else 0
+        stop=min(len(segment['rows']),first+self.limits.maximum_rows)
+        maxima=[int(r['sequence'] if r['kind']=='event' else r['last_sequence']) for r in segment['rows'][:stop]]
+        next_cursor=dict(schema='qcl-negf.producer-phase-cursor.v1',contract_set='qcl-negf.results.v2',identity=deepcopy(self.identity),
+            source=deepcopy(segment['source']),publication=deepcopy(chosen),segment=deepcopy(publication['segment']),
+            next_row=str(stop),last_sequence=str(max(maxima)),complete_at_observation=stop==len(segment['rows']))
+        validate_phase_cursor(next_cursor,publication=publication,publication_ref=chosen,segment=segment,segment_ref=publication['segment'])
+        if stop==len(segment['rows']) and self._pending and self._pending[-1]==chosen:self._pending.pop()
+        after=budget.read_bytes if hasattr(budget,'read_bytes') else budget.bytes_read_total
+        keep={json_bytes(r) for r in self._pending+[chosen,publication['segment']]+([previous_ref] if previous_ref else [])}
+        keep.add(json_bytes(head))
+        self._cache={k:v for k,v in self._cache.items() if k in keep}
+        self._mode=segment['mode']
+        return PhaseBatch(deepcopy(self.identity),deepcopy(segment['source']),segment,deepcopy(publication['segment']),raw,
+            publication,deepcopy(chosen),previous,deepcopy(previous_ref),current,first,stop,next_cursor,self.route_epoch,
+            dict(bytes_read_total=after-before),publication_raw,previous_raw)
 
 
 def _start_ticks(pid):
@@ -260,56 +433,50 @@ def journal_batch(path, cursor, *, source_key, maximum_bytes=65536, maximum_rows
         )
 
 
-def make_binding(
-    job_root, *, selection, result_path, point_pins, closed_path, capture_status, budget=None
-):
-    """Only returned close path is authoritative. Caller supplies independently proven point pins."""
-    from .performance_views import validate_performance_binding
-
-    job_root = Path(job_root)
-    closed_path = Path(closed_path)
-    commit, raw = small_json(closed_path, MIB, budget=budget)
-    owners = [
-        r for r in commit.get("artifacts", []) if r.get("role") == "performance.summary"
-    ]
-    if len(owners) != 1:
-        fail("corrupt_result", "unique closed summary required")
-    owner = owners[0]
-    summary_path = beneath(closed_path.parent, owner["path"])
-    _, summary_raw = small_json(summary_path, MIB - len(raw), budget=budget)
-    _, result_raw = small_json(beneath(job_root, result_path), MIB, budget=budget)
-
-    def retained(path, payload):
-        return {
-            "native_path": str(path.relative_to(job_root)),
-            "bytes": len(payload),
-            "sha256": digest(payload),
-            "raw_utf8": payload.decode("utf-8"),
-        }
-
-    value = {
-        "schema": "qcl-negf.performance-binding.v1",
-        "scope": "execution_attempt",
-        "selection": selection,
-        "runner_result": {
-            "path": result_path,
-            "bytes": len(result_raw),
-            "sha256": digest(result_raw),
-        },
-        "point_pins": point_pins,
-        "commit": retained(closed_path, raw),
-        "summary": retained(summary_path, summary_raw),
-        "capture_status": capture_status,
-    }
-    validate_performance_binding(
-        value, expected_selection=selection, expected_point_pins=point_pins
-    )
-    payload = json_bytes(value)
-    if len(payload) > MIB:
-        fail("budget_exceeded", "retained performance sidecar exceeds cap")
+def make_binding(reader,*,telemetry,destination,capture_status,budget=None):
+    """Retain the exact returned close with explicit selected source/input contexts."""
+    from .state import StateReader
+    from .performance_views import TelemetrySelection,PerformanceLimits,_load_telemetry,_check_bindings
+    from qcl_negf_contracts.telemetry import validate_telemetry_binding
+    if not isinstance(reader,StateReader) or not isinstance(telemetry,TelemetrySelection):
+        raise TypeError('explicit StateReader and TelemetrySelection required')
+    destination=Path(destination)
+    try:relative=str(destination.absolute().relative_to(telemetry.artifact_root.absolute()))
+    except ValueError:raise ValueError('binding destination must belong to explicit technical artifact root') from None
+    from qcl_negf_contracts.artifacts import relative_path
+    relative_path(relative)
+    limits=PerformanceLimits();reservation=None;consumed=0;bindings={}
+    allowance=limits.maximum_io_bytes
     if budget is not None:
-        budget.write(len(payload))
-    atomic_write(job_root / "performance-binding.json", payload)
+        allowance=min(allowance,budget.remaining-MIB)
+        if allowance<1:raise ValueError('binding metadata/output allowance unavailable')
+        budget.reserve(allowance);reservation=allowance
+    try:
+        with reader._consumer_operation(allowance,verify_source_stability=True,maximum_stability_bytes=limits.maximum_metadata_bytes) as io:
+            before=io.bytes_read_total
+            try:
+                loaded=_load_telemetry(reader,telemetry,limits,bindings,creating_binding=True);data=loaded['input'];commit=loaded['commit'];summary=loaded['summary']
+                value=dict(schema='qcl-negf.telemetry-binding.v1',contract_set='qcl-negf.results.v2',
+                    scope='selected_state_with_execution_attempt_telemetry',selected_state=reader.source.state,
+                    transport=deepcopy(data['expected_transport']),capture_status=deepcopy(capture_status),
+                    commit=dict(ref=data['commit_ref'],raw_utf8=loaded['commit_raw'].decode('utf-8')),
+                    summary=dict(ref=commit['summary'],raw_utf8=loaded['summary_raw'].decode('utf-8')),
+                    source_binding=dict(ref=data['source_binding_ref'],raw_utf8=loaded['source_binding_raw'].decode('utf-8')))
+                validate_telemetry_binding(value,expected_state=reader.source.state,expected_transport=data['expected_transport'],
+                    commit=commit,commit_ref=data['commit_ref'],summary=summary,summary_ref=commit['summary'],
+                    source_binding=loaded['source_binding'],source_binding_ref=data['source_binding_ref'],
+                    manifest=reader._manifest,manifest_ref=reader.source.state['manifest'],source_transport=data['source_transport'],
+                    canonical_plan_ref=data['canonical_plan_ref'],expected_producer_provenance=data['expected_producer_provenance'])
+                payload=json_bytes(value)
+                if len(payload)>MIB:fail('budget_exceeded','retained technical binding metadata cap exceeded')
+                _check_bindings(bindings)
+            finally:consumed=io.bytes_read_total-before
+    finally:
+        if reservation is not None:
+            budget.reserved-=reservation;budget.account(consumed)
+    # Both actual source guards have succeeded before the single atomic publication.
+    if budget is not None:budget.write(len(payload))
+    atomic_write(destination,payload)
     return value
 
 
@@ -333,136 +500,100 @@ class ScalarPublisher:
         self.last_publish = -float("inf")
         self.budget = budget
 
-    def publish(
-        self, actual_root, point, *, mode, terminal=False, io_remaining=128 * MIB
-    ):
-        if self.disabled or (
-            not terminal and time.monotonic() - self.last_publish < 30
-        ):
+    def publish(self, actual_root, point, *, mode, terminal=False, io_remaining=128*MIB):
+        if self.disabled or (not terminal and time.monotonic()-self.last_publish<30):
             return self.last
-        budget = self.budget if self.budget is not None else ObserverIO(io_remaining)
-        initial_io = budget.used
+        from .state import StateReader,ResultReadLimits,_IOBudget,_metadata_weight
+        from .export import _selection
+        from qcl_negf_contracts.messages import ContractError
+        from qcl_negf_contracts.artifacts import CONTRACT_SET
+        budget=self.budget if self.budget is not None else ObserverIO(io_remaining)
+        initial=budget.used
+        class Reads(_IOBudget):
+            def require(inner,count):
+                super().require(count);budget.require(count)
+            def account(inner,count):
+                budget.account(count);super().account(count)
+        reader=None
         try:
-            if mode not in ("direct", "scratch", "staged"):
-                raise ValueError("unknown actual source route")
-            expected = {
-                "point_id": point["point_id"],
-                "execution_id": self.selection["execution_id"],
-                "attempt": point["source_attempt"],
-                "plan_fingerprint": self.selection["plan_fingerprint"],
-            }
-            history = beneath(actual_root, point["artifact_root"]) / "history"
-            from .live_views import LiveHistoryLimits, _index
-
-            owner = {
-                **self.selection,
-                "point_id": point["point_id"],
-                "source_attempt": point["source_attempt"],
-            }
-            if not (history / "index.json").exists():
-                return self.last
-            value, raw = _index(
-                history / "index.json", owner, LiveHistoryLimits(), budget
-            )
-            target = (
-                self.job_root
-                / "live"
-                / self.selection["execution_id"]
-                / point["point_id"]
-                / f"attempt-{point['source_attempt']}"
-                / "history"
-            )
-            metadata = {**self.metadata, str(target): len(raw)}
-            if sum(metadata.values()) > MIB:
-                raise ValueError("whole-job live metadata cap exhausted")
-            previous = self.prefixes.get(str(target))
-            if previous is not None and (
-                value["generation"] < previous["generation"]
-                or value["segments"][: len(previous["segments"])]
-                != previous["segments"]
-            ):
-                raise ValueError("closed prefix changed across source root epochs")
-            new = []
-            if mode == "scratch":
-                new = [
-                    r
-                    for r in value["segments"]
-                    if (str(target / r["path"]), r["sha256"]) not in self.copied
-                ]
-            budget.require((len(raw) if mode == "scratch" else 0) + 16384 + 2 * sum(r["bytes"] for r in new))
-            if mode == "scratch":
-                if (
-                    len(self.copied) + len(new) > 4096
-                    or self.bytes + sum(r["bytes"] for r in new) > self.maximum
-                ):
-                    raise ValueError("admitted scalar partition exhausted")
-                free = os.statvfs(self.job_root)
-                if (
-                    free.f_bavail * free.f_frsize
-                    < self.reserve + sum(r["bytes"] for r in new) + MIB
-                ):
-                    raise ValueError("protected output reserve unavailable")
-                target.mkdir(parents=True, exist_ok=True)
-                for row in new:
-                    destination = beneath(target, row["path"])
-                    destination.parent.mkdir(parents=True, exist_ok=True)
-                    temporary = destination.with_name(".copy-" + destination.name)
-                    budget.require(2 * row["bytes"])
-                    budget.write(row["bytes"])
-                    copy_closed(
-                        beneath(history, row["path"]),
-                        temporary,
-                        size=row["bytes"],
-                        sha256=row["sha256"],
-                        budget=budget,
-                    )
-                    os.link(temporary, destination)
-                    temporary.unlink()
-                    fsync_directory(destination.parent)
-                    self.copied[(str(destination), row["sha256"])] = True
-                    self.bytes += row["bytes"]
-                budget.write(len(raw))
-                atomic_write(target / "index.json", raw)
-                published = target / "index.json"
-            else:
-                published = history / "index.json"
-            descriptor = {
-                "schema": "qcl-negf.live-prefix.v1",
-                "identity": expected,
-                "access_mode": "selected_closed_copy",
-                "index_path": str(published.relative_to(self.job_root)),
-                "index_sha256": digest(raw),
-                "generation": value["generation"],
-                "scba_rows": value["scba_rows"],
-                "outer_rows": value["outer_rows"],
-                "updated_unix": value["updated_unix"],
-                "observed_unix": time.time(),
-                "route": mode,
-                "live_publication_incomplete": False,
-            }
-            payload = json_bytes(descriptor)
-            budget.write(len(payload))
-            atomic_write(self.job_root / "live" / "current.json", payload)
-            self.last = descriptor
-            self.last_publish = time.monotonic()
-            self.metadata = metadata
-            self.prefixes[str(target)] = {
-                "generation": value["generation"],
-                "segments": value["segments"],
-            }
+            if mode not in ('direct','scratch','staged'):raise ValueError('unknown actual source route')
+            ref=point['selected_state'];identity=ref['identity']
+            if identity['point_id']!=point['point_id'] or identity['execution_id']!=self.selection['execution_id'] or int(identity['attempt'])!=point['source_attempt']:
+                raise ValueError('selected canonical source differs from explicit point')
+            source=Path(actual_root) if point['artifact_root']=='.' else beneath(actual_root,point['artifact_root'])
+            reader=StateReader.__new__(StateReader)
+            reader._initialize(source,state_ref=ref,expected_identity=identity,limits=ResultReadLimits(),budget=Reads(budget.remaining))
+            with reader._consumer_operation(verify_source_stability=True):
+                selected,omitted,_=_selection(reader,'science')
+                history=reader._manifest['history']
+                if history is None:return self.last
+                key=digest(json_bytes(identity));previous=self.prefixes.get(key)
+                if previous is not None and int(ref['state_sequence'])<int(previous['source_state']['state_sequence']):
+                    raise ValueError('selected live source sequence reversed')
+                if mode=='scratch':
+                    target=self.job_root/'live'/'sources'/key
+                    new=[row for path,row in selected.items() if (str(target/path),row['sha256']) not in self.copied]
+                    size=sum(int(row['bytes']) for row in new)
+                    if len(self.copied)+len(new)>4096 or self.bytes+size>self.maximum:
+                        raise ValueError('admitted scalar partition exhausted')
+                    if _metadata_weight((self.copied,selected,omitted,self.prefixes))>MIB:
+                        raise ValueError('whole-job live metadata allowance exhausted')
+                    free=os.statvfs(self.job_root)
+                    if free.f_bavail*free.f_frsize<self.reserve+size+MIB:
+                        raise ValueError('protected output reserve unavailable')
+                    budget.require(2*size+16384)
+                    target.mkdir(parents=True,exist_ok=True)
+                    for path,row in sorted(selected.items()):
+                        destination=beneath(target,path);count=int(row['bytes'])
+                        if (str(destination),row['sha256']) in self.copied:
+                            # Existing mirror bytes are checked, never trusted by name.
+                            with regular(destination,size=count) as stream:
+                                before=stamp(stream,include_change=True);budget.require(count)
+                                actual=hashlib.sha256()
+                                while block:=stream.read(min(MIB,count+1)):
+                                    budget.account(len(block));actual.update(block)
+                                if stamp(stream,include_change=True)!=before or actual.hexdigest()!=row['sha256']:
+                                    fail('source_changed','retained scalar mirror changed')
+                            continue
+                        destination.parent.mkdir(parents=True,exist_ok=True)
+                        temporary=destination.with_name('.copy-'+destination.name)
+                        try:
+                            budget.write(count)
+                            copy_closed(beneath(source,path),temporary,size=count,sha256=row['sha256'],budget=reader._budget)
+                            os.link(temporary,destination);fsync_directory(destination.parent)
+                        finally:temporary.unlink(missing_ok=True)
+                        self.copied[(str(destination),row['sha256'])]=True;self.bytes+=count
+                    published=target
+                else:
+                    # Path.relative_to refuses an out-of-job direct route.
+                    source.relative_to(self.job_root);published=source
+                descriptor=dict(schema='qcl-negf.live-prefix.v2',contract_set=CONTRACT_SET,
+                    source_state=ref,artifact_root=str(published.relative_to(self.job_root)),history=history,
+                    route=mode,access_mode='selected_history_copy' if mode=='scratch' else 'direct_selected_source',
+                    omitted_by_policy=omitted,canonical_source_complete=False,observed_unix=time.time(),live_publication_incomplete=False)
+                payload=json_bytes(descriptor)
+                if len(payload)>MIB or _metadata_weight((self.prefixes,descriptor))>MIB:
+                    raise ValueError('live descriptor metadata allowance exhausted')
+                # End of the same owner operation checks all consumed witnesses
+                # before publishing this non-authoritative locator below.
+            reader.close();reader=None
+            budget.write(len(payload));atomic_write(self.job_root/'live'/'current.json',payload)
+            self.last=descriptor;self.last_publish=time.monotonic();self.prefixes[key]=descriptor
             return descriptor
-        except OSError, ValueError:
-            self.disabled = True
+        except (OSError,ValueError,ContractError):
+            self.disabled=True
             if self.last is not None:
-                self.last = {**self.last, "live_publication_incomplete": True}
-                payload = json_bytes(self.last)
-                budget.write(len(payload))
-                atomic_write(
-                    self.job_root / "live" / "current.json", payload
-                )
+                self.last={**self.last,'live_publication_incomplete':True};raw=json_bytes(self.last)
+                budget.write(len(raw));atomic_write(self.job_root/'live'/'current.json',raw)
             raise
         finally:
-            self.io_bytes += budget.used - initial_io
+            primary=sys.exception()
+            if reader is not None:
+                try:reader.close()
+                except BaseException as cleanup:
+                    if primary is None:raise
+                    primary.add_note('scalar reader cleanup: '+str(cleanup))
+            self.io_bytes+=budget.used-initial
 
 
 def _spec(path, *, budget=None):
@@ -595,92 +726,36 @@ def _locator(root, spec, *, budget=None):
     return value, actual
 
 
+def _outward_point(row, selection, known, *, current=False):
+    point=row['point_id'] if current else row['id']
+    if row['execution_id']!=selection['execution_id'] or point not in known:
+        raise ValueError('outward point differs from frozen execution')
+    data=row if current else row['data'];source=data['native_source']
+    state=source['selected_state']
+    return dict(point_id=point,source_attempt=None if state is None else int(state['identity']['attempt']),
+        artifact_root=source['artifact_root'],selected_state=state,phase_source=data['phase_source'])
+
+
 def _current(actual, selection, known, *, budget=None):
-    value, _ = small_json(actual / "current_point.json", 16384, budget=budget)
-    if (
-        value.get("schema") != "qcl-negf-current-point-v1"
-        or value.get("execution_id") != selection["execution_id"]
-        or value.get("point_id") not in known
-        or not integer(value.get("attempt"), 1)
-    ):
-        raise ValueError("current point differs from frozen execution")
-    beneath(actual, value.get("artifact_root"))
-    return {
-        "point_id": value["point_id"],
-        "source_attempt": value["attempt"],
-        "artifact_root": value["artifact_root"],
-    }
+    from qcl_negf_contracts.outward import validate_outward_result
+    value,_=small_json(actual/'current_point.json',16384,budget=budget)
+    checked=validate_outward_result(value)
+    if checked['schema']!='qcl-negf-current-point-v2':raise ValueError('explicit current-point-v2 required')
+    return _outward_point(checked,selection,known,current=True)
 
 
 def _final_points(actual, selection, known, *, budget=None):
-    value, raw = small_json(actual / "series_result.json", MIB, budget=budget)
-    if (
-        value.get("schema") != "qcl-negf-series-result-v3"
-        or value.get("plan_fingerprint") != selection["plan_fingerprint"]
-    ):
-        raise ValueError("final result differs from frozen execution")
-    rows = value.get("points")
-    if not isinstance(rows, list) or len(rows) > 256:
-        raise ValueError("bounded final point inventory required")
-    points = []
-    pins = []
-    seen = set()
-    metadata = len(raw)
-    for row in rows:
-        if not isinstance(row, dict):
-            fail("corrupt_result", "invalid final point row")
-        if row.get("execution_id") != selection["execution_id"]:
-            continue
-        point = row.get("id")
-        data = row.get("data") or {}
-        if point not in known or point in seen or not isinstance(data, dict):
-            raise ValueError("unknown/duplicate final point")
-        seen.add(point)
-        if data.get("result_commit") is None:
-            continue
-        commit, raw_commit = small_json(
-            beneath(actual, data["result_commit"]), MIB - metadata, budget=budget
-        )
-        metadata += len(raw_commit)
-        identity = commit.get("identity", {})
-        source = data.get("checkpoint_source_attempt", row.get("attempt"))
-        expected = {
-            "point_id": point,
-            "execution_id": selection["execution_id"],
-            "attempt": source,
-            "plan_fingerprint": selection["plan_fingerprint"],
-        }
-        if (
-            not isinstance(identity, dict)
-            or not integer(source, 1)
-            or any(
-                type(identity.get(k)) is not type(v) or identity[k] != v
-                for k, v in expected.items()
-            )
-        ):
-            raise ValueError("native source point commit differs")
-        relative = str((actual.relative_to(actual.parent)) / data["result_commit"])
-        # Source attempt is independent of enclosing input attempt; no UUID stamping.
-        pins.append(
-            {
-                "point_id": point,
-                "source_attempt": source,
-                "point_commit_path": relative,
-                "point_commit_sha256": digest(raw_commit),
-            }
-        )
-        beneath(actual, data.get("artifact_root"))
-        points.append(
-            {
-                "point_id": point,
-                "source_attempt": source,
-                "artifact_root": data["artifact_root"],
-            }
-        )
-    return points, pins
+    from qcl_negf_contracts.outward import validate_outward_result
+    value,_=small_json(actual/'series_result.json',MIB,budget=budget)
+    checked=validate_outward_result(value)
+    if checked['schema']!='qcl-negf-series-result-v4' or checked['plan_fingerprint']!=selection['plan_fingerprint']:
+        raise ValueError('explicit selected native series-result-v4 required')
+    if len(checked['points'])>256:raise ValueError('bounded final point inventory required')
+    points=[_outward_point(row,selection,known) for row in checked['points'] if row['execution_id']==selection['execution_id']]
+    return points,[p['selected_state'] for p in points if p['selected_state'] is not None]
 
 
-def observe(spec_path, pid, start_ticks, control_fd):
+def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetry_selection_factory=None):
     """Only this disposable process imports Arrow or touches job/scratch/NFS files."""
     budget = ObserverIO(16384)
     try:
@@ -689,12 +764,30 @@ def observe(spec_path, pid, start_ticks, control_fd):
         os.close(control_fd)
         return 2 # No traceback/inherited-log write before capture credit.
     selection = spec["selection"]
+    try:
+        if telemetry_selection_factory is not None and not callable(telemetry_selection_factory):
+            raise ValueError('trusted programmatic telemetry input factory required')
+        if transport is not None:
+            from qcl_negf_contracts import schema_validator
+            from qcl_negf_contracts.messages import encode
+            from .state import _schema_check,_metadata_weight
+            validator=schema_validator('telemetry-envelope.schema.json')
+            _schema_check(validator.evolve(schema={'$ref':'#/$defs/Transport','$defs':validator.schema['$defs']}),transport)
+            encode(transport)
+            if transport['selection']!=selection or _metadata_weight(transport)>MIB:
+                raise ValueError('initial telemetry transport differs from explicit launch selection')
+            transport=deepcopy(transport)
+    except Exception:
+        os.close(control_fd);return 2
     credits = spec["credits"]
     began = time.monotonic()
     cursors = {}
     journal_bytes = 0
     previous_epoch = -1
     missing_sources = set()
+    closed_sources={}
+    old_source_contexts={}
+    closed_page_bytes=0
     publisher = ScalarPublisher(
         root,
         selection,
@@ -705,18 +798,29 @@ def observe(spec_path, pid, start_ticks, control_fd):
     writer = None
     failure = None
     closed = None
+    phase_source=None;phase_key=None
+    last_actual=None;last_points=[]
+
+    def session_bytes(directory):
+        count=0;used=0;directories=[directory]
+        while directories:
+            current=directories.pop()
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    count+=1
+                    if count>4096 or entry.is_symlink():raise ValueError('bounded session inventory exceeded')
+                    if entry.is_dir(follow_symlinks=False) and current==directory and entry.name=='raw':
+                        directories.append(Path(entry.path));continue
+                    if not entry.is_file(follow_symlinks=False):raise ValueError('unexpected session entry')
+                    used+=entry.stat(follow_symlinks=False).st_size
+        return used
 
     def admit(estimate=8 * MIB):
         # Software forecast, not atomic filesystem quota/IO enforcement. Conservative
         # 8 MiB burst is inside the previously admitted 32 MiB partition.
         count = 0
         used = 0
-        if writer is not None:
-            for path in writer.directory.iterdir():
-                count += 1
-                if count > 4096 or path.is_symlink() or not path.is_file():
-                    raise ValueError("bounded session inventory exceeded")
-                used += path.stat().st_size
+        if writer is not None:used=closed_page_bytes+session_bytes(writer.directory)
         free = os.statvfs(root)
         budget.require(estimate)
         if (
@@ -731,59 +835,91 @@ def observe(spec_path, pid, start_ticks, control_fd):
         admit()
         reservation = 4 * (writer.batch_bytes if writer is not None else 4 * MIB) + MIB
         budget.reserve(reservation)
-        before = set(writer.directory.glob("*.parquet")) if writer is not None else set()
+        before_directory=writer.directory if writer is not None else None
+        before = set(before_directory.glob("*.parquet")) if before_directory is not None else set()
         try:
             return method(*args, **kwargs)
         finally:
-            paths = set(writer.directory.glob("*.parquet")) if writer is not None else set()
+            paths = set(before_directory.glob("*.parquet")) if before_directory is not None else set()
+            if writer is not None:paths.update(writer.directory.glob("*.parquet"))
             forecast = 4 * sum(path.stat().st_size for path in paths - before)
             budget.settle(reservation, forecast)
             if forecast > reservation:
                 raise ValueError("writer exceeded its finite I/O forecast; capture unknown")
 
-    def capture_point(actual, point, mode, terminal):
-        nonlocal journal_bytes
-        key = f"{point['point_id']}/attempt-{point['source_attempt']}"
-        path = beneath(actual, point["artifact_root"]) / "progress" / "phases.jsonl"
-        # Prefix replay also consumes the whole-job journal/IO cap. A long run
-        # can deliberately disable observation rather than exceed its credit.
-        cursor = cursors.get(key, {})
-        offset = cursor.get("offset", 0)
-        allowance = min(65536, 64 * MIB - journal_bytes - offset - 1, budget.remaining - offset - 1)
-        if allowance < 1:
-            raise ValueError("whole-job journal processed-byte cap exhausted")
-        while True:
-            rows, next_cursor, consumed = journal_batch(
-                path, cursor, source_key=key, maximum_bytes=allowance, budget=budget
-            )
-            journal_bytes += consumed
-            if journal_bytes > 64 * MIB:
-                raise ValueError("observer journal/IO credit exhausted")
-            if rows or next_cursor != cursor:
-                admit()
-                writer_call(writer.ingest_spans, rows, source_cursors={key: next_cursor})
-                cursors[key] = next_cursor
-            if (
-                not terminal
-                or next_cursor["complete_at_observation"]
-                or next_cursor["offset"] == cursor.get("offset", 0)
-            ):
-                break
-            cursor = next_cursor
-            allowance = min(
-                65536,
-                64 * MIB - journal_bytes - cursor["offset"] - 1,
-                budget.remaining - cursor["offset"] - 1,
-            )
-            if allowance < 1:
-                raise ValueError("whole-job final journal drain exhausted")
-        publisher.publish(
-            actual,
-            point,
-            mode=mode,
-            terminal=terminal,
-            io_remaining=budget.remaining,
-        )
+    def capture_point(actual, point, mode, terminal, epoch):
+        nonlocal journal_bytes,phase_source,phase_key,closed_page_bytes
+        state=point['selected_state'];descriptor=point['phase_source']
+        if state is None:
+            missing_sources.add(point['point_id']);return
+        key=digest(json_bytes(dict(identity=state['identity'],session=descriptor['session_id'])))
+        if descriptor['status']=='available':
+            qualified=(str(actual),key,epoch)
+            if phase_key!=qualified:
+                if phase_source is not None:phase_source.close()
+                phase_source=PhaseCaptureSource(actual,descriptor=descriptor,expected_identity=state['identity'],route_epoch=epoch)
+                phase_key=qualified
+            while True:
+                before=budget.read_bytes
+                batch=phase_source.harvest(cursors.get(key),budget=budget)
+                journal_bytes+=budget.read_bytes-before
+                if journal_bytes>64*MIB:raise ValueError('v1 observer processed-byte credit exhausted')
+                closed_sources[key]=phase_source.observed_closed
+                if batch is None:
+                    if terminal and phase_source.backlogged:continue
+                    break
+                from qcl_negf_contracts.messages import encode
+                source_key=hashlib.sha256(encode(dict(identity=batch.identity,source=batch.source))).hexdigest()
+                active={**writer.source_cursors,**writer.staged_source_cursors}
+                if source_key not in active and len(active)>=16:
+                    completed=deepcopy(writer._last_phase_raw)
+                    closed_path=writer_call(writer.rotate)
+                    closed_page_bytes+=session_bytes(closed_path.parent)
+                    resume=dict(commit_ref=deepcopy(writer.baseline['commit']),summary_ref=deepcopy(writer.baseline['summary']))
+                    for source in writer._baseline_summary['source_cursors']:
+                        if source['source_key'] in completed:
+                            old_source_contexts[source['source_key']]=dict(resume=deepcopy(resume),phase=completed[source['source_key']])
+                    from .state import _metadata_weight
+                    if _metadata_weight((old_source_contexts,cursors,closed_sources))>4*MIB:
+                        raise ValueError('bounded capture page-context allowance exhausted')
+                proof=old_source_contexts.get(source_key) if source_key not in writer.source_cursors else None
+                writer_call(writer.stage_phase_batch,batch,phase_context_refs=() if proof is None else (proof['phase'],),
+                    resume_context_refs=() if proof is None else (proof['resume'],))
+                writer_call(writer.flush)
+                cursors[key]=deepcopy(batch.cursor)
+                from .state import _metadata_weight
+                if _metadata_weight(cursors)>MIB:raise ValueError('whole-observer cursor metadata bound exceeded')
+                if not terminal:break
+        else:missing_sources.add(point['point_id'])
+        publisher.publish(actual,point,mode=mode,terminal=terminal,io_remaining=budget.remaining)
+
+    def bind_selected(actual,point,close_ref,capture_status):
+        from .state import StateReader,ResultReadLimits,_IOBudget
+        from .performance_views import TelemetrySelection
+        if point['selected_state'] is None:raise ValueError('selected native state required for binding')
+        source=actual if point['artifact_root']=='.' else beneath(actual,point['artifact_root'])
+        io=_IOBudget(min(budget.remaining,4*MIB));reader=StateReader.__new__(StateReader);charged=0
+        try:
+            reader._initialize(source,state_ref=point['selected_state'],expected_identity=point['selected_state']['identity'],
+                limits=ResultReadLimits(),budget=io)
+            budget.account(io.bytes_read_total);charged=io.bytes_read_total
+            with reader._consumer_operation(verify_source_stability=True):
+                selected=telemetry_selection_factory(reader,deepcopy(close_ref))
+            budget.account(io.bytes_read_total-charged);charged=io.bytes_read_total
+            if not isinstance(selected,TelemetrySelection) or selected.expected_transport!=transport or selected.commit_ref!=close_ref or selected.artifact_root!=writer.root:
+                raise ValueError('factory selection differs from exact close/initial transport/root')
+            name='performance-binding.json' if len(last_points)==1 else 'performance-bindings/'+digest(json_bytes(point['selected_state']))+'.json'
+            make_binding(reader,telemetry=selected,destination=writer.root/name,capture_status=capture_status,budget=budget)
+            charged=io.bytes_read_total  # make_binding already charged its exact delta
+        finally:
+            primary=sys.exception()
+            try:
+                if io.bytes_read_total>charged:budget.account(io.bytes_read_total-charged)
+            finally:
+                try:reader.close()
+                except BaseException as cleanup:
+                    if primary is None:raise
+                    primary.add_note('observer source cleanup: '+str(cleanup))
 
     try:
         # Runner publishes this existing token/fullFP locator only after charging
@@ -805,7 +941,7 @@ def observe(spec_path, pid, start_ticks, control_fd):
                 "scope": "root_julia_process_including_threads",
                 "allocated_logical_cpus": spec["allocated_logical_cpus"],
             },
-            metadata_budget=budget,
+            metadata_budget=budget,transport=transport,
         )
         while True:
             try:
@@ -845,23 +981,9 @@ def observe(spec_path, pid, start_ticks, control_fd):
                     if terminal
                     else ([_current(actual, selection, known, budget=budget)], None)
                 )
+                last_actual=actual;last_points=points
                 for point in points:
-                    if (
-                        beneath(actual, point["artifact_root"])
-                        / "progress"
-                        / "phases.jsonl"
-                    ).exists():
-                        capture_point(actual, point, locator["mode"], terminal)
-                    else:
-                        missing_sources.add(point["point_id"])
-                        # Scalar publication still works when phase telemetry is absent.
-                        publisher.publish(
-                            actual,
-                            point,
-                            mode=locator["mode"],
-                            terminal=terminal,
-                            io_remaining=budget.remaining,
-                        )
+                    capture_point(actual,point,locator['mode'],terminal,locator['epoch'])
             except FileNotFoundError:
                 # Most errors are wrapped safely below; no current point at launch
                 # is an explicit capture gap, never fabricated rows.
@@ -870,34 +992,21 @@ def observe(spec_path, pid, start_ticks, control_fd):
             writer_call(writer.flush_due)
             if terminal:
                 admit()
+                if telemetry_selection_factory is None or transport is None:
+                    writer_call(writer.record_control,dict(event='source_binding_missing',reason='explicit_transport_or_factory_missing'))
                 closed = writer_call(writer.close)
-                if locator["mode"] in ("direct", "staged"):
-                    make_binding(
-                        root,
-                        selection=selection,
-                        result_path="result/series_result.json",
-                        point_pins=pins,
-                        closed_path=closed,
-                        budget=budget,
-                        capture_status={
-                            "complete": not missing_sources
-                            and bool(cursors)
-                            and all(
-                                c.get("complete_at_observation")
-                                for c in cursors.values()
-                            ),
-                            "terminal_tail": "may_be_unobserved",
-                            "root_scope": "root_julia_process_including_threads",
-                            "journal_processed_bytes": journal_bytes,
-                            "live_publication_incomplete": publisher.disabled,
-                            "phase_sources_missing": bool(missing_sources),
-                            "observer_io_bytes_before_binding": budget.used,
-                            "writer_io_is_local_forecast": True,
-                        },
-                    )
+                if telemetry_selection_factory is None or transport is None:
+                    raise ValueError('source_binding_missing: explicit transport/factory and production ingress policy required')
+                if last_actual is None or not last_points:raise ValueError('selected source unavailable for exact close binding')
+                complete=not missing_sources and bool(cursors) and all(c['complete_at_observation'] for c in cursors.values())
+                status=dict(terminal_tail='closed_observed' if complete and all(closed_sources.values()) else 'known_incomplete' if missing_sources else 'unknown',
+                    scalar_live_route=locator['mode'] if not publisher.disabled else 'unavailable',
+                    scalar_live_reason='live_publication_incomplete' if publisher.disabled else None,
+                    performance_status='available' if complete else 'incomplete',reason=None if complete else 'phase_sources_or_tail_incomplete')
+                for point in last_points:bind_selected(last_actual,point,writer._previous_ref,status)
                 break
             time.sleep(2)
-    except (OSError, ValueError) as error:
+    except Exception as error:
         failure = error
         # Missing/incomplete capture is evidence; no unbudgeted inherited-log write.
     finally:
@@ -905,8 +1014,9 @@ def observe(spec_path, pid, start_ticks, control_fd):
             try:
                 admit()
                 writer_call(writer.close)
-            except OSError, ValueError:
+            except Exception:
                 pass
+        if phase_source is not None:phase_source.close()
         os.close(control_fd)
     return 0 if failure is None else 2
 
