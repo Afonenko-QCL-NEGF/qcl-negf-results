@@ -9,7 +9,7 @@ import re
 from typing import Mapping
 
 from qcl_negf_contracts import schema_validator
-from qcl_negf_contracts.messages import ContractError
+from qcl_negf_contracts.messages import ContractError, scientific_plan
 from qcl_negf_contracts.results import validate_final_observations, validate_nested_sweep_plan
 from .commits import decode_json, safe_path
 from .model import canonical_bytes, validate_model
@@ -32,6 +32,135 @@ class FinalObservationsDescription:
     original_evidence: Document
     integrity: Document
     io_counters: Mapping[str, int | None]
+
+
+@dataclass(frozen=True)
+class CheckpointInputsDescription:
+    """Detached original inputs of one selected checkpoint, without a verdict."""
+    source: Document
+    invocation: Document
+    checkpoint: Document
+    plan_ref: Document
+    model_ref: Document
+    plan_raw: bytes
+    model_raw: bytes
+    plan: Document
+    model: Document
+    integrity: Document
+    io_counters: Mapping[str, int | None]
+
+
+def _read_original_input(reader, reference, role, remaining):
+    from ._capture_io import regular, stamp
+    from .state import _BudgetStream
+    owner=next((row for row in reader._manifest['artifacts'] if row['path']==reference['path']),None)
+    if owner is None or _ref(owner)!=reference or owner['role']!=role or owner['profile']!='science' or owner['dependencies']:
+        raise ContractError('original input FileRef/dependencies differ','corrupt_result')
+    size=int(reference['bytes'])
+    if size>remaining:raise ContractError('original input exceeds metadata allowance','budget_exceeded')
+    path=safe_path(reader.root,reference['path'])
+    with regular(path,size=size) as raw:
+        before=stamp(raw,include_change=True)
+        stream=_BudgetStream(raw,reader._budget)
+        phase,reader._budget.phase=reader._budget.phase,'metadata'
+        try:payload=stream.read(size)
+        finally:reader._budget.phase=phase
+        current=path.stat(follow_symlinks=False)
+        bound=(current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns,current.st_ctime_ns)
+        if (reader._root_identity()!=reader._root_stamp or stamp(raw,include_change=True)!=before or bound!=before
+                or hashlib.sha256(payload).hexdigest()!=reference['sha256']):
+            raise ContractError('original input immutable binding changed','source_changed')
+        reader._note_source_binding(reference['path'], before)
+    return payload
+
+
+def describe_checkpoint_inputs(reader: StateReader, *, plan_ref: Document,
+                               model_ref: Document) -> CheckpointInputsDescription:
+    """Read explicit original FileRefs using one selected reader operation.
+
+    Counters describe this operation, not the reader's lifetime. The caller owns
+    aggregate credit across construction/repeated calls and actual creator proof.
+    No final request, restore, full tensor or scientific acceptance is assessed.
+    """
+    if not isinstance(reader, StateReader):
+        raise TypeError('explicit selected StateReader required')
+    with reader._consumer_operation(verify_source_stability=True):
+        maximum = reader.limits.maximum_metadata_bytes
+        common = schema_validator('result-common.schema.json')
+        file_schema = common.evolve(schema={'$ref': '#/$defs/FileRef', '$defs': common.schema['$defs']})
+        for reference in (plan_ref, model_ref):
+            _schema_check(file_schema, reference)
+        # Reserve caller refs before copying, then the complete borrowed context.
+        if 2*_metadata_weight((plan_ref, model_ref)) + reader._source_stability_bytes() > maximum:
+            raise ContractError('checkpoint input references exceed metadata allowance', 'budget_exceeded')
+        plan_ref, model_ref = copy.deepcopy(dict(plan_ref)), copy.deepcopy(dict(model_ref))
+        formats = {('qcl-negf.nested-sweep-plan.v1', 'text/plain'): 'nested_sweep',
+                   ('qcl-negf-scientific-plan-v2', 'application/json'): 'scientific_plan_v2'}
+        kind = formats.get((plan_ref['schema'], plan_ref['media_type']))
+        if kind is None or (model_ref['schema'], model_ref['media_type']) != (
+                'qcl-negf-resolved-configuration-v3', 'application/json'):
+            raise ContractError('unsupported original checkpoint input format', 'incompatible_contract')
+        if plan_ref['sha256'] != reader._manifest['identity']['plan_sha256']:
+            raise ContractError('original checkpoint plan identity digest differs', 'corrupt_result')
+        checkpoint = reader._load_checkpoint()
+        contexts = (reader._manifest, checkpoint, plan_ref, model_ref)
+        retained = []
+
+        def allowance(reserve=0):
+            available = maximum - _metadata_weight((contexts, retained)) - reader._source_stability_bytes() - reserve
+            if available < 1:
+                raise ContractError('aggregate checkpoint inputs exceed metadata allowance', 'budget_exceeded')
+            return available
+
+        def original_json(raw, name):
+            # Bound ordinary JSON object/string workspace before invoking the
+            # existing decoder. Punctuation inside strings only overestimates.
+            workspace = 512*(1+sum(raw.count(c) for c in (b'{', b'}', b'[', b']', b',', b':'))) + 4*len(raw)
+            allowance(workspace)
+            try:
+                return decode_json(raw, name)
+            except RecursionError as error:
+                raise ContractError('original checkpoint JSON depth exceeds parser allowance', 'budget_exceeded') from error
+
+        model_raw = _read_original_input(reader, model_ref, 'model', allowance())
+        retained.append(model_raw)
+        model = original_json(model_raw, 'original checkpoint model')
+        retained.append(model)
+        envelope = schema_validator('final-observations.schema.json')
+        _schema_check(envelope.evolve(schema={'$ref': '#/$defs/ModelEnvelope', '$defs': envelope.schema['$defs']}), model)
+        allowance(16*len(model_raw))  # Existing canonical encoder's temporary bytes.
+        validate_model(model)
+        if model['configuration_hash'] != reader._manifest['identity']['model_sha256']:
+            raise ContractError('original checkpoint model identity digest differs', 'corrupt_result')
+        plan_raw = _read_original_input(reader, plan_ref, 'plan', allowance())
+        retained.append(plan_raw)
+        if kind == 'nested_sweep':
+            plan = _portable_plan(plan_raw, allowance())
+        else:
+            plan = original_json(plan_raw, 'original checkpoint scientific plan')
+            scientific_plan(plan)
+            _schema_check(schema_validator('scientific-plan.schema.json'), plan)
+        retained.append(plan)
+        allowance()
+        # Only the small public metadata needs copying; decoded inputs and raw
+        # bytes already belong exclusively to this operation, never the reader.
+        output_metadata = (reader._state_ref, reader._manifest['invocation'],
+                           reader._manifest['checkpoint'], plan_ref, model_ref)
+        allowance(2*_metadata_weight(output_metadata) + 4096)
+        source, invocation, checkpoint_ref, plan_ref, model_ref = copy.deepcopy(output_metadata)
+        integrity = dict(scope='selected_checkpoint_original_inputs', source_state=copy.deepcopy(source),
+            checkpoint=copy.deepcopy(checkpoint_ref),
+            input_refs=dict(plan=copy.deepcopy(plan_ref), model=copy.deepcopy(model_ref)),
+            checks=['checkpoint_declaration_history_lineage', 'manifest_input_rows', 'original_file_bytes',
+                    'plan_raw_identity_sha256', 'model_native_profile', 'model_canonical_identity_sha256',
+                    'consumed_source_bindings_at_return'],
+            not_assessed=['full_core_payloads', 'resolver_provenance', 'actual_creator', 'core_restore', 'scientific_acceptance'])
+        allowance(_metadata_weight((output_metadata, source, invocation, checkpoint_ref, plan_ref, model_ref, integrity)))
+        description = CheckpointInputsDescription(source, invocation, checkpoint_ref, plan_ref, model_ref,
+            plan_raw, model_raw, plan, model, integrity, reader.io_counters)
+    # The source-stability context completes its actual consumed-binding check
+    # before a description (including one built from a cached CP) can escape.
+    return description
 
 
 def _portable_plan(raw: bytes, maximum_bytes: int) -> dict:
@@ -147,28 +276,7 @@ class FinalObservationsReader:
     def close(self):self._closed=True
 
     def _input(self, reference, role, remaining):
-        from ._capture_io import regular, stamp
-        from .state import _BudgetStream
-        reader=self._reader
-        owner=next((row for row in reader._manifest['artifacts'] if row['path']==reference['path']),None)
-        if owner is None or _ref(owner)!=reference or owner['role']!=role or owner['profile']!='science' or owner['dependencies']:
-            raise ContractError('original input FileRef/dependencies differ','corrupt_result')
-        size=int(reference['bytes'])
-        if size>remaining:raise ContractError('original input exceeds metadata allowance','budget_exceeded')
-        path=safe_path(reader.root,reference['path'])
-        with regular(path,size=size) as raw:
-            before=stamp(raw,include_change=True)
-            stream=_BudgetStream(raw,reader._budget)
-            phase,reader._budget.phase=reader._budget.phase,'metadata'
-            try:payload=stream.read(size)
-            finally:reader._budget.phase=phase
-            current=path.stat(follow_symlinks=False)
-            bound=(current.st_dev,current.st_ino,current.st_size,current.st_mtime_ns,current.st_ctime_ns)
-            if (reader._root_identity()!=reader._root_stamp or stamp(raw,include_change=True)!=before or bound!=before
-                    or hashlib.sha256(payload).hexdigest()!=reference['sha256']):
-                raise ContractError('original input immutable binding changed','source_changed')
-            reader._note_source_binding(reference['path'], before)
-        return payload
+        return _read_original_input(self._reader, reference, role, remaining)
 
     def _load(self):
         if self._closed:raise ValueError('final observations reader is closed')

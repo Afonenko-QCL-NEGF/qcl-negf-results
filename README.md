@@ -130,6 +130,53 @@ full-history consolidation are not alternative source selectors. See
 
 ## Raw stored final observations
 
+Original checkpoint inputs can also be read without final diagnostics or observations:
+
+```python
+from qcl_negf_results.final_observations import describe_checkpoint_inputs
+
+# Both refs are exact five-field FileRefs explicitly supplied for this selected
+# source. The checkpoint declaration itself does not store these original refs.
+inputs = describe_checkpoint_inputs(reader, plan_ref=plan_ref, model_ref=model_ref)
+original_plan_bytes = inputs.plan_raw
+original_model_bytes = inputs.model_raw
+```
+
+`CheckpointInputsDescription` contains the detached selected StateRef, invocation,
+checkpoint FileRef, full input FileRefs, unchanged raw bytes, decoded plan and complete
+native model envelope, assessed integrity scopes and physical I/O counters. The borrowed
+StateReader remains open. The selected manifest must contain the exact input rows with
+roles `plan`/`model`, profile `science` and empty dependencies. Original input bytes must
+exist at that source; the reader never selects a file by role/name or reconstructs a
+missing original input from its hash.
+
+The admitted plan formats are exactly `qcl-negf.nested-sweep-plan.v1` with `text/plain`
+(existing bounded portable YAML) and `qcl-negf-scientific-plan-v2` with `application/json`.
+The model is `qcl-negf-resolved-configuration-v3` with `application/json`, the closed
+native stationary input profile and `qcl-negf-canonical-bytes-v1`. Original plan byte SHA
+must match the selected identity's `plan_sha256`. Model **file** SHA authenticates the raw
+envelope independently of the canonical configuration hash, which must match both the
+envelope and selected identity's `model_sha256`. Integer/Boolean/Float64 types and signed
+zero are preserved. Other original formats and legacy migration are unsupported.
+
+One bounded operation shares CP/history/ancestor verification and both input reads, and
+guards their actual consumed bindings through return. It reads no full checkpoint tensor
+or final D/O owner; existing checkpoint witness proofs may require record evidence.
+Metadata allowance includes the raw and decoded inputs, conservative JSON parsing and
+canonical encoding workspace, detached output metadata and stability bookkeeping. A
+caller can explicitly raise existing limits after checking resources. These admission
+estimates are not a hard process RSS bound. Returned `io_counters` cover **this operation**;
+reader construction and previous calls are excluded. A consumer must reserve and track
+its own aggregate credit across repeated operations, including failed reads. Original
+bytes delivered once and hashed in memory count once as metadata delivery.
+
+This port verifies the original input profile and selected identity, without a final
+request coordinate/point-membership claim. It does not establish resolver/creator
+provenance, Core restore or scientific acceptance. AiiDA transport and original INPUT/
+CALL/CREATE joins remain the consumer's responsibility. Existing outward checkpoint
+SourceContext plan/model null fields are unchanged; this description is a separate
+operand. Missing inputs fail explicitly and never become zero or success.
+
 ```python
 from qcl_negf_results.final_observations import FinalObservationsReader
 
