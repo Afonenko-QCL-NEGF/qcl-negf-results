@@ -152,3 +152,122 @@ codec retain their owning gates. Export/process completion and byte consistency
 do not assess physical convergence or validate a model.
 
 See [reader, cursor, reduction and export examples](../README.md).
+
+## Whole native metadata context
+
+`qcl_negf_results.final_observations.describe_native_metadata_context` owns a
+single selected metadata read from construction through source-stability checks
+and close:
+
+```python
+manifest, checkpoint, inputs, diagnostics, observations = describe_native_metadata_context(
+    artifact_root,
+    state_ref=selected_state_ref,
+    expected_identity=complete_identity,
+    plan_ref=original_plan_file_ref,
+    model_ref=original_model_file_ref,
+    diagnostics_ref=selected_diagnostics_file_ref,  # None for checkpoint context
+    observations_ref=selected_observations_file_ref,  # both final refs or neither
+    limits=read_limits,
+    maximum_context_bytes=128 * 1024 * 1024,
+    maximum_retained_bytes=4 * 1024 * 1024,
+)
+```
+
+The function returns original manifest/checkpoint dictionaries and the existing
+`CheckpointInputsDescription`, `FinalDiagnosticsDescription` and
+`FinalObservationsDescription` types. For checkpoint context the final two
+members are `None`. Inputs must be builtin JSON metadata; schemas, complete
+identity, exact original FileRefs, role/profile, history/parent bindings, original
+plan bytes and model canonical identity retain their existing checks. Missing
+mandatory context is an error. There is no inferred final evidence or scientific
+acceptance and no numerical array selection.
+
+One physical stream-delivery budget is created **before** manifest initialization
+and shared by nested checkpoint, history, parent, input and native readers,
+source stability and handle close. A successful tuple contains identical final
+whole-call I/O counters in all descriptions. The counters include hashes and HDF
+metadata delivery; they are not physical disk traffic. Existing standalone
+reader operations retain their previous per-operation counters and limits.
+
+The optional keyword-only `maximum_context_bytes` defaults to 128 MiB and accepts
+an exact integer in `1..134217728`. It enforces an
+explicit aggregate metadata model, including reader caches and parent contexts,
+source guards, original raw input bytes, returned descriptions, temporary JSON
+and YAML trees, deep copies, nested Contracts clone/encode/validation forecasts,
+HDF raw-cache allowances and accounting headers. Admission occurs before each
+covered materialization; exhausted capacity raises `budget_exceeded` and returns
+no partial tuple. A **96 MiB validation reservation** is admitted before the first
+factory or reader initialization and remains charged through source stability
+and close. The original Contracts factory builds a fresh 36-document registry
+per call; those graphs and its retained process cache are included, never
+excluded as shared immutable state. The reservation covers 12 cached and three
+simultaneous direct bundles, wrapper/builder/layout/inspection workspace, and
+the shared standard metaschema graph. No factory or cache semantics are changed.
+
+The operation qualifies exact Contracts schemas/layout/source and the library
+content profile, currently CPython 3.14.7, jsonschema 4.26.0, referencing 0.37.0,
+rpds-py 2026.6.3 and attrs 26.1.0. It checks actual cached schema contents and
+registry aliases before initialization and after close. Bounded read-only
+inspection uses the pinned CPython unbounded-lru-cache layout; no cache clear,
+prewarm or garbage collection occurs. Unknown source/library/cache content or
+layout, mutation, reentry or concurrent operation raises `incompatible_contract`.
+Two exact rpds compiled-content profiles (prepared Python and existing Nix Python)
+are qualified separately; version equality alone never admits a binary. Other
+runtime profiles require a new owning source/profile proof.
+
+The three owner caches qualify the unique actual CPython C-held function
+referent, its owning source code/globals and its agreement with `__wrapped__`;
+the writable `__wrapped__` attribute alone is not execution authority. The
+factory's direct `files`, JSON module/`loads` and package bindings are checked
+in both Contracts modules before initialization and after close. Exact loaded
+stdlib code fingerprints, the finite `files` decorator closure/defaults and
+JSON defaults prevent a foreign callback from hiding behind matching aliases.
+These selected checks assume trusted CPython, stdlib internals, imports, guard
+machinery, OS and local filesystem. They are not a sandbox for arbitrary process
+memory or concurrent privileged mutation of those trusted facilities. No generic
+VM verifier, cache manager, factory replacement or new Contracts API is added.
+
+The identity guards share a separate prepaid **6 MiB profile-source read credit**
+across entry and exit checks. Each bounded read request, including an EOF probe,
+is charged before delivery and never refunded. Hashing uses at most 64 KiB per
+read; source rereads before compilation have exact bounded lengths and SHA checks.
+Private test/probe hooks record requested and delivered bytes. These identity
+reads, the factory's original schema/package reads and vocabulary reads are not
+artifact stream delivery. Public `io_counters` keep their existing keys and
+artifact scope; they are not a total filesystem-I/O or physical disk counter.
+The outer caller must account for package-source scope separately. Local package
+vocabulary decoding still has its own forecasts; interpreter baseline is not a
+process memory guarantee.
+
+The model uses 64 units per scalar occurrence, `128 + 6*length` per string/bytes
+occurrence, and 128 plus entries for a container; an array index adds 64.
+Container aliases within the retained forest count once, distinct copies count
+separately. The accounting header is 64 KiB plus 2 KiB per preflight and 128 units per visited container
+plus 65 traversal frames; active parser
+workspace and declared HDF raw caches remain charged until released. It is an
+operational admission model, **not** a total Python heap, HDF allocator or process
+RSS guarantee. `metadata_high_water_bytes` reports its admitted high-water mark.
+
+All returned objects are detached builtins/raw bytes or existing metadata
+Descriptions. Internal readers and HDF/file handles close before return; cancellation
+and failures close remaining owners and preserve a primary exception if cleanup
+also fails. A later call creates a fresh owner allowance; this does not refund or
+reset an outer caller's prepaid aggregate ledger.
+
+The optional keyword-only `maximum_retained_bytes` defaults to 4 MiB and accepts
+an exact positive integer up to 128 MiB. It bounds W of the **final returned tuple**,
+including all final whole-call counter headers, immediately before ownership
+transfer. Exceeding it raises `budget_exceeded`, closes owners and returns no
+partial tuple. Smaller arena limits can fail before initialization because the
+validation reservation alone requires 96 MiB. The original 4 MiB refusal remains
+a valid negative result; it is not reclassified as a successful final context.
+
+An outer consumer must prepay one sequential workspace and each retained output
+slot separately, keeping earlier outputs charged while the next call runs.
+Only complete detached return and close permit workspace reuse. Error/cancellation
+is terminal for that parser attempt; no credit is refunded or reset. Returned
+context does not supply creator/parent authority or replace original FileRefs.
+Constructor fixtures establish no actual producer, creator, native package,
+restore, whole-parser or scientific acceptance. Callers retain all required rows
+and report an exhausted or unprovable context as a hold.
