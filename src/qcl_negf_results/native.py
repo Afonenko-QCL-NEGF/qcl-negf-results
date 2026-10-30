@@ -1,6 +1,30 @@
 """Bounded native dataset access shared by validation and lossless history proofs."""
 from __future__ import annotations
 
+from .state import (_context_before, _context_decoding, _context_hold, _context_arena,
+                    _context_raw_tree_bound)
+
+
+def _package_json(name):
+    """Forecast owner-local vocabulary decoding, separately from artifact I/O."""
+    import json
+    from importlib.resources import files
+    from pathlib import Path
+    from qcl_negf_contracts.messages import ContractError
+    resource=files('qcl_negf_contracts').joinpath(name)
+    if _context_arena.get() is None:return json.loads(resource.read_text())
+    if not isinstance(resource,Path):
+        raise ContractError('package vocabulary size is unavailable before decoding','budget_exceeded')
+    size=resource.stat().st_size
+    _context_before('package vocabulary raw read '+name,extra=8*size+4096)
+    raw=resource.read_bytes()
+    if len(raw)!=size:raise ContractError('package vocabulary changed','source_changed')
+    # This is plain json.loads, with neither commits' object-pair hook nor its
+    # validate_json clone. The second tree covers the local profile projection.
+    _context_before('JSON package vocabulary '+name,
+        extra=2*_context_raw_tree_bound(raw)+4*len(raw)+4096,roots=(raw,))
+    return json.loads(raw)
+
 from collections.abc import Iterator
 import itertools
 from typing import Any
@@ -172,30 +196,34 @@ def _scba_count(parent: Any) -> int:
 
 
 def _native_header(group, maximum_bytes, *, with_size=False):
-    import h5py
-    from qcl_negf_contracts.messages import ContractError
-    result, consumed = {}, 0
-    for name in ('schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'):
-        if name not in group.attrs:
-            raise ContractError('required native5 metadata attribute missing', 'corrupt_result')
-        attribute = group.attrs.get_id(name)
-        datatype, space = attribute.get_type(), attribute.get_space()
-        try:
-            if (datatype.get_class() != h5py.h5t.STRING or datatype.is_variable_str()
-                    or datatype.get_size() > maximum_bytes or space.get_simple_extent_type() != h5py.h5s.SCALAR):
-                raise ContractError('native5 header requires bounded fixed-width scalar strings', 'corrupt_result')
-            consumed += datatype.get_size()
-            if consumed > maximum_bytes:
-                raise ContractError('aggregate native header exceeds metadata limit', 'budget_exceeded')
+    buffers=[None];live=[buffers]
+    with _context_hold(live):
+        import h5py
+        from qcl_negf_contracts.messages import ContractError
+        result, consumed = {}, 0
+        live.append(result)
+        for name in ('schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'):
+            if name not in group.attrs:
+                raise ContractError('required native5 metadata attribute missing', 'corrupt_result')
+            attribute = group.attrs.get_id(name)
+            datatype, space = attribute.get_type(), attribute.get_space()
             try:
-                result[name] = _text(group.attrs[name])
-            except UnicodeError as error:
-                raise ContractError('native5 header requires valid UTF-8', 'corrupt_result') from error
-        finally:
-            space.close()
-            datatype.close()
-            attribute.close()
-    return (result, consumed) if with_size else result
+                if (datatype.get_class() != h5py.h5t.STRING or datatype.is_variable_str()
+                        or datatype.get_size() > maximum_bytes or space.get_simple_extent_type() != h5py.h5s.SCALAR):
+                    raise ContractError('native5 header requires bounded fixed-width scalar strings', 'corrupt_result')
+                consumed += datatype.get_size()
+                if consumed > maximum_bytes:
+                    raise ContractError('aggregate native header exceeds metadata limit', 'budget_exceeded')
+                try:
+                    _context_before('native fixed header',extra=512+16*datatype.get_size())
+                    result[name] = _text(group.attrs[name])
+                except UnicodeError as error:
+                    raise ContractError('native5 header requires valid UTF-8', 'corrupt_result') from error
+            finally:
+                space.close()
+                datatype.close()
+                attribute.close()
+        return (result, consumed) if with_size else result
 
 
 def validate_native_handle(handle: Any, role: str | None = None,
@@ -226,83 +254,93 @@ def validate_native_handle(handle: Any, role: str | None = None,
 
 def native_metadata(handle, *, identity=None, invocation=None, representation=None,
                     maximum_bytes=16 * 1024 * 1024):
-    from importlib.resources import files
-    import json
-    import numpy as np
-    from qcl_negf_contracts.messages import ContractError
-    from .commits import decode_json
-    def fail(message):
-        raise ContractError(message, "corrupt_result")
-    group = handle["metadata"]
-    attrs = _native_header(group, maximum_bytes)
-    if attrs['artifact_role'] == 'physics.analysis' and attrs['schema'] == 'qcl-negf-physics-analysis-v5':
+    buffers=[None];live=[buffers]
+    with _context_hold(live):
+        from importlib.resources import files
+        import json
+        import numpy as np
+        from qcl_negf_contracts.messages import ContractError
+        from .commits import decode_json
+        def fail(message):
+            raise ContractError(message, "corrupt_result")
+        group = handle["metadata"]
+        attrs = _native_header(group, maximum_bytes)
+        if attrs['artifact_role'] == 'physics.analysis' and attrs['schema'] == 'qcl-negf-physics-analysis-v5':
+            actual = attrs['representation']
+            if actual not in ('final_diagnostics', 'final_observations') or representation not in (None, actual):
+                fail('native representation differs from owning declaration')
+            guard = final_diagnostics_metadata if actual == 'final_diagnostics' else final_observations_metadata
+            return guard(handle, identity=identity, invocation=invocation, maximum_bytes=maximum_bytes)
+        layout = _package_json("core_layout.json")["layout_sha256"]
+        if attrs['core_layout_sha256'] != layout:
+            raise ContractError("unsupported Core layout", "unsupported_format")
         actual = attrs['representation']
-        if actual not in ('final_diagnostics', 'final_observations') or representation not in (None, actual):
-            fail('native representation differs from owning declaration')
-        guard = final_diagnostics_metadata if actual == 'final_diagnostics' else final_observations_metadata
-        return guard(handle, identity=identity, invocation=invocation, maximum_bytes=maximum_bytes)
-    layout = json.loads(files("qcl_negf_contracts").joinpath("core_layout.json").read_text())["layout_sha256"]
-    if attrs['core_layout_sha256'] != layout:
-        raise ContractError("unsupported Core layout", "unsupported_format")
-    actual = attrs['representation']
-    if actual not in ("array_payload", "record_leaf") or representation is not None and actual != representation:
-        fail("native representation differs from ordered catalog/declaration")
-    result = dict(representation=actual)
-    for name, expected in (("identity_json", identity), ("invocation_json", invocation)):
-        if name not in group:
-            fail("native source identity metadata missing")
-        dataset = group[name]
-        # Fixed width makes the allocation bound inspectable before reading.
-        if dataset.shape != () or dataset.dtype.kind != "S" or dataset.dtype.itemsize > maximum_bytes:
-            fail("native identity requires bounded fixed-width UTF-8 scalar")
-        raw = bytes(dataset[()])
-        value = decode_json(raw, name)
-        if expected is not None and value != expected:
-            fail("native source identity/epoch differs from selected reference")
-        result[name] = value
-    return result
+        if actual not in ("array_payload", "record_leaf") or representation is not None and actual != representation:
+            fail("native representation differs from ordered catalog/declaration")
+        result = dict(representation=actual)
+        live.append(result)
+        for name, expected in (("identity_json", identity), ("invocation_json", invocation)):
+            if name not in group:
+                fail("native source identity metadata missing")
+            dataset = group[name]
+            # Fixed width makes the allocation bound inspectable before reading.
+            if dataset.shape != () or dataset.dtype.kind != "S" or dataset.dtype.itemsize > maximum_bytes:
+                fail("native identity requires bounded fixed-width UTF-8 scalar")
+            _context_before('native fixed UTF8 read',extra=512+16*dataset.dtype.itemsize)
+            raw = bytes(dataset[()]);buffers[0]=raw
+            _context_decoding(raw,name)
+            value = decode_json(raw, name)
+            if expected is not None and value != expected:
+                fail("native source identity/epoch differs from selected reference")
+            result[name] = value
+        return result
 
 
 def final_diagnostics_metadata(handle, *, identity, invocation, maximum_bytes):
     """Bound fixed UTF8 scalar metadata before any high-level string read."""
-    import h5py
-    import json
-    from importlib.resources import files
-    from qcl_negf_contracts.messages import ContractError
-    from .commits import decode_json
-    def fail(message, code='corrupt_result'):
-        raise ContractError(message, code)
-    attrs, consumed = _native_header(handle['metadata'], maximum_bytes, with_size=True)
-    layout = json.loads(files('qcl_negf_contracts').joinpath('core_layout.json').read_text())['layout_sha256']
-    if (attrs['schema'] != 'qcl-negf-physics-analysis-v5' or attrs['artifact_role'] != 'physics.analysis'
-            or attrs['schema_version'] != '5.0' or attrs['contract_set'] != CONTRACT_SET
-            or attrs['representation'] != 'final_diagnostics' or attrs['core_layout_sha256'] != layout):
-        fail('analysis native5 schema/role/layout/representation differs')
-    result = dict(representation='final_diagnostics')
-    for path, key, expected in (('metadata/identity_json','identity_json',identity),
-            ('metadata/invocation_json','invocation_json',invocation),
-            ('final_diagnostics/declaration_json','declaration',None)):
-        if path not in handle or not isinstance(handle[path], h5py.Dataset):
-            fail('analysis fixed UTF8 metadata missing')
-        dataset = handle[path]
-        datatype, space = dataset.id.get_type(), dataset.id.get_space()
-        try:
-            if (space.get_simple_extent_type() != h5py.h5s.SCALAR
-                    or space.get_simple_extent_npoints() != 1 or datatype.get_class() != h5py.h5t.STRING
-                    or datatype.is_variable_str() or datatype.get_cset() != h5py.h5t.CSET_UTF8
-                    or datatype.get_size() < 1):
-                fail('analysis metadata requires fixed UTF8 scalar strings')
-            consumed += datatype.get_size()
-            if consumed > maximum_bytes:
-                fail('aggregate analysis metadata exceeds limit', 'budget_exceeded')
-        finally:
-            space.close(); datatype.close()
-        value = decode_json(bytes(dataset[()]), path)
-        if expected is not None and value != expected:
-            fail('native source identity/epoch differs from selected reference')
-        result[key] = value
-    result['metadata_bytes'] = consumed
-    return result
+    buffers=[None];live=[buffers]
+    with _context_hold(live):
+        import h5py
+        import json
+        from importlib.resources import files
+        from qcl_negf_contracts.messages import ContractError
+        from .commits import decode_json
+        def fail(message, code='corrupt_result'):
+            raise ContractError(message, code)
+        attrs, consumed = _native_header(handle['metadata'], maximum_bytes, with_size=True)
+        layout = _package_json('core_layout.json')['layout_sha256']
+        if (attrs['schema'] != 'qcl-negf-physics-analysis-v5' or attrs['artifact_role'] != 'physics.analysis'
+                or attrs['schema_version'] != '5.0' or attrs['contract_set'] != CONTRACT_SET
+                or attrs['representation'] != 'final_diagnostics' or attrs['core_layout_sha256'] != layout):
+            fail('analysis native5 schema/role/layout/representation differs')
+        result = dict(representation='final_diagnostics')
+        live.append(result)
+        for path, key, expected in (('metadata/identity_json','identity_json',identity),
+                ('metadata/invocation_json','invocation_json',invocation),
+                ('final_diagnostics/declaration_json','declaration',None)):
+            if path not in handle or not isinstance(handle[path], h5py.Dataset):
+                fail('analysis fixed UTF8 metadata missing')
+            dataset = handle[path]
+            datatype, space = dataset.id.get_type(), dataset.id.get_space()
+            try:
+                if (space.get_simple_extent_type() != h5py.h5s.SCALAR
+                        or space.get_simple_extent_npoints() != 1 or datatype.get_class() != h5py.h5t.STRING
+                        or datatype.is_variable_str() or datatype.get_cset() != h5py.h5t.CSET_UTF8
+                        or datatype.get_size() < 1):
+                    fail('analysis metadata requires fixed UTF8 scalar strings')
+                consumed += datatype.get_size()
+                if consumed > maximum_bytes:
+                    fail('aggregate analysis metadata exceeds limit', 'budget_exceeded')
+            finally:
+                space.close(); datatype.close()
+            _context_before('diagnostic fixed UTF8 read',extra=512+16*dataset.dtype.itemsize)
+            raw=bytes(dataset[()]);buffers[0]=raw;_context_decoding(raw,path)
+            value = decode_json(raw, path)
+            if expected is not None and value != expected:
+                fail('native source identity/epoch differs from selected reference')
+            result[key] = value
+        result['metadata_bytes'] = consumed
+        return result
 
 
 _FINAL_ARRAYS = {
@@ -415,7 +453,7 @@ def validate_native_array(handle, declaration):
         raise ContractError(message, "corrupt_result")
     if declaration.get("kind") != "array" or declaration.get("order") != "F":
         fail("native array requires column-major Core declaration")
-    layout = json.loads(files('qcl_negf_contracts').joinpath('core_layout.json').read_text())
+    layout = _package_json('core_layout.json')
     supported = {(node['eltype'], node['rank']) for node in layout['graph']['nodes'].values()
                  if node.get('kind') == 'array' and node.get('storage') == 'dataset'}
     if (declaration.get('eltype'), len(declaration.get('shape', []))) not in supported:
@@ -577,7 +615,7 @@ def _observation_profiles():
     """Closed local array vocabulary from the published owning schema."""
     import json
     from importlib.resources import files
-    definitions=json.loads(files('qcl_negf_contracts').joinpath('schemas/final-observations.schema.json').read_text())['$defs']
+    definitions=_package_json('schemas/final-observations.schema.json')['$defs']
     result={}
     for key,value in definitions.items():
         if key.startswith('Array_'):
@@ -591,66 +629,71 @@ def _observation_profiles():
 
 def final_observations_metadata(handle, *, identity, invocation, maximum_bytes):
     """Exact closed O1 tree and fixed UTF8 metadata; no numeric value reads."""
-    import h5py
-    import json
-    from importlib.resources import files
-    from qcl_negf_contracts.messages import ContractError
-    from .commits import decode_json
-    def fail(message,code='corrupt_result'):raise ContractError(message,code)
-    if set(handle)!={'metadata','final_observations'} or len(handle.attrs):fail('observations root layout differs')
-    for path,names in (('metadata',{'identity_json','invocation_json'}),
-                       ('final_observations',{'declaration_json','arrays'})):
-        group=handle[path]
-        if not isinstance(group,h5py.Group) or set(group)!=names:fail('observations closed group layout differs')
-    if (set(handle['metadata'].attrs)!={'schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'}
-            or len(handle['final_observations'].attrs)):
-        fail('observations group attributes differ')
-    attrs,consumed=_native_header(handle['metadata'],maximum_bytes,with_size=True)
-    layout=json.loads(files('qcl_negf_contracts').joinpath('core_layout.json').read_text())['layout_sha256']
-    if attrs!={'schema':'qcl-negf-physics-analysis-v5','schema_version':'5.0','contract_set':CONTRACT_SET,
-               'artifact_role':'physics.analysis','representation':'final_observations','core_layout_sha256':layout}:
-        fail('observations native5 schema/role/layout/representation differs')
-    result=dict(representation='final_observations');addresses=set()
-    for path,key,expected in (('metadata/identity_json','identity_json',identity),
-                              ('metadata/invocation_json','invocation_json',invocation),
-                              ('final_observations/declaration_json','declaration',None)):
-        if not isinstance(handle.get(path,getlink=True),h5py.HardLink):fail('observations metadata link forbidden')
-        dataset=handle[path]
-        if not isinstance(dataset,h5py.Dataset) or len(dataset.attrs):fail('observations scalar metadata layout differs')
-        datatype,space=dataset.id.get_type(),dataset.id.get_space()
-        try:
-            if (space.get_simple_extent_type()!=h5py.h5s.SCALAR or space.get_simple_extent_npoints()!=1
-                    or datatype.get_class()!=h5py.h5t.STRING or datatype.is_variable_str()
-                    or datatype.get_cset()!=h5py.h5t.CSET_UTF8 or datatype.get_size()<1):
-                fail('observations metadata requires fixed UTF8 scalar strings')
-            consumed+=datatype.get_size()
-            if consumed>maximum_bytes:fail('aggregate observations metadata exceeds limit','budget_exceeded')
-        finally:space.close();datatype.close()
-        value=decode_json(bytes(dataset[()]),path)
-        if expected is not None and value!=expected:fail('observations source identity/epoch differs')
-        result[key]=value;addresses.add(h5py.h5o.get_info(dataset.id).addr)
-    value=result['declaration']
-    if not isinstance(value,dict) or not isinstance(value.get('context'),dict) or not isinstance(value.get('views'),dict):
-        fail('observations declaration missing closed array contexts')
-    profiles=_observation_profiles();expected={name for name in profiles if (value['context'] if name in value['context'] else value['views']).get(name) is not None}
-    group=handle['final_observations/arrays']
-    if not isinstance(group,h5py.Group) or len(group.attrs) or len(group)>26 or set(group)!=expected:
-        fail('observations array inventory differs')
-    for path in ('metadata','final_observations','final_observations/arrays'):
-        if not isinstance(handle.get(path,getlink=True),h5py.HardLink):fail('observations group link forbidden')
-        address=h5py.h5o.get_info(handle[path].id).addr
-        if address in addresses:fail('observations object alias forbidden')
-        addresses.add(address)
-    for name in group:
-        if not isinstance(group.get(name,getlink=True),h5py.HardLink):fail('observations array link forbidden')
-        dataset=group[name]
-        if not isinstance(dataset,h5py.Dataset) or len(dataset.attrs) or dataset.external or dataset.is_virtual:
-            fail('observations array storage/attributes differ')
-        address=h5py.h5o.get_info(dataset.id).addr
-        if address in addresses:fail('observations object alias forbidden')
-        addresses.add(address)
-    result['metadata_bytes']=consumed
-    return result
+    buffers=[None];live=[buffers]
+    with _context_hold(live):
+        import h5py
+        import json
+        from importlib.resources import files
+        from qcl_negf_contracts.messages import ContractError
+        from .commits import decode_json
+        def fail(message,code='corrupt_result'):raise ContractError(message,code)
+        if set(handle)!={'metadata','final_observations'} or len(handle.attrs):fail('observations root layout differs')
+        for path,names in (('metadata',{'identity_json','invocation_json'}),
+                           ('final_observations',{'declaration_json','arrays'})):
+            group=handle[path]
+            if not isinstance(group,h5py.Group) or set(group)!=names:fail('observations closed group layout differs')
+        if (set(handle['metadata'].attrs)!={'schema','schema_version','contract_set','artifact_role','representation','core_layout_sha256'}
+                or len(handle['final_observations'].attrs)):
+            fail('observations group attributes differ')
+        attrs,consumed=_native_header(handle['metadata'],maximum_bytes,with_size=True)
+        layout=_package_json('core_layout.json')['layout_sha256']
+        if attrs!={'schema':'qcl-negf-physics-analysis-v5','schema_version':'5.0','contract_set':CONTRACT_SET,
+                   'artifact_role':'physics.analysis','representation':'final_observations','core_layout_sha256':layout}:
+            fail('observations native5 schema/role/layout/representation differs')
+        result=dict(representation='final_observations');addresses=set()
+        live.extend((result,addresses))
+        for path,key,expected in (('metadata/identity_json','identity_json',identity),
+                                  ('metadata/invocation_json','invocation_json',invocation),
+                                  ('final_observations/declaration_json','declaration',None)):
+            if not isinstance(handle.get(path,getlink=True),h5py.HardLink):fail('observations metadata link forbidden')
+            dataset=handle[path]
+            if not isinstance(dataset,h5py.Dataset) or len(dataset.attrs):fail('observations scalar metadata layout differs')
+            datatype,space=dataset.id.get_type(),dataset.id.get_space()
+            try:
+                if (space.get_simple_extent_type()!=h5py.h5s.SCALAR or space.get_simple_extent_npoints()!=1
+                        or datatype.get_class()!=h5py.h5t.STRING or datatype.is_variable_str()
+                        or datatype.get_cset()!=h5py.h5t.CSET_UTF8 or datatype.get_size()<1):
+                    fail('observations metadata requires fixed UTF8 scalar strings')
+                consumed+=datatype.get_size()
+                if consumed>maximum_bytes:fail('aggregate observations metadata exceeds limit','budget_exceeded')
+            finally:space.close();datatype.close()
+            _context_before('observations fixed UTF8 read',extra=512+16*dataset.dtype.itemsize)
+            raw=bytes(dataset[()]);buffers[0]=raw;_context_decoding(raw,path)
+            value=decode_json(raw,path)
+            if expected is not None and value!=expected:fail('observations source identity/epoch differs')
+            result[key]=value;addresses.add(h5py.h5o.get_info(dataset.id).addr)
+        value=result['declaration']
+        if not isinstance(value,dict) or not isinstance(value.get('context'),dict) or not isinstance(value.get('views'),dict):
+            fail('observations declaration missing closed array contexts')
+        profiles=_observation_profiles();live.append(profiles);expected={name for name in profiles if (value['context'] if name in value['context'] else value['views']).get(name) is not None}
+        group=handle['final_observations/arrays']
+        if not isinstance(group,h5py.Group) or len(group.attrs) or len(group)>26 or set(group)!=expected:
+            fail('observations array inventory differs')
+        for path in ('metadata','final_observations','final_observations/arrays'):
+            if not isinstance(handle.get(path,getlink=True),h5py.HardLink):fail('observations group link forbidden')
+            address=h5py.h5o.get_info(handle[path].id).addr
+            if address in addresses:fail('observations object alias forbidden')
+            addresses.add(address)
+        for name in group:
+            if not isinstance(group.get(name,getlink=True),h5py.HardLink):fail('observations array link forbidden')
+            dataset=group[name]
+            if not isinstance(dataset,h5py.Dataset) or len(dataset.attrs) or dataset.external or dataset.is_virtual:
+                fail('observations array storage/attributes differ')
+            address=h5py.h5o.get_info(dataset.id).addr
+            if address in addresses:fail('observations object alias forbidden')
+            addresses.add(address)
+        result['metadata_bytes']=consumed
+        return result
 
 
 def validate_final_observations_array(handle,declaration):
