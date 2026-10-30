@@ -201,9 +201,26 @@ no partial tuple. A **96 MiB validation reservation** is admitted before the fir
 factory or reader initialization and remains charged through source stability
 and close. The original Contracts factory builds a fresh 36-document registry
 per call; those graphs and its retained process cache are included, never
-excluded as shared immutable state. The reservation covers 12 cached and three
+excluded as shared immutable state. The reservation covers the full shared cache
+of 15 fixed public Contracts results/telemetry schema names and three
 simultaneous direct bundles, wrapper/builder/layout/inspection workspace, and
-the shared standard metaschema graph. No factory or cache semantics are changed.
+the shared standard metaschema graph. In addition to the 12 science names, the
+shared cache admits `telemetry-envelope.schema.json`,
+`producer-phase-source.schema.json` and `producer-phase-segment.schema.json`:
+ordinary performance and producer-phase reads must remain interoperable with a
+later closed metadata call. This is a finite public-callsite domain, not every
+bundled schema or arbitrary caller-supplied cache key. No factory or cache
+semantics are changed; the operation never clears or prewarms a cache.
+
+For the qualified corpus, the 18 simultaneously retained schema bundles and
+shared 20 standard metaschemas weigh 90,020,238 W. The explicit fixed registry
+URI/wrapper surface allowance is 2,676,240 W (URI string W plus 512 per map/set
+entry and 16 KiB per validator). Keeping the separate 6 MiB builder/layout/
+inspection allowance gives 98,987,934 W, within the unchanged 100,663,296 W
+reservation. The largest canonical inspection/encoding workspace is 2,087,436 W
+inside that separate allowance. These are finite logical accounting estimates
+for the qualified implementation, not bounds on Python/Rust allocation or RSS.
+The public 128 MiB aggregate and 4 MiB retained defaults remain unchanged.
 
 The operation qualifies exact Contracts schemas/layout/source and the library
 content profile, currently CPython 3.14.7, jsonschema 4.26.0, referencing 0.37.0,

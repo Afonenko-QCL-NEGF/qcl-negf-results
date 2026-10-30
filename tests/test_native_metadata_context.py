@@ -255,11 +255,13 @@ def test_validation_envelope_refuses_old_capacity_before_factory_or_root(tmp_pat
     assert calls==[]
 
 
+@pytest.mark.parametrize('schema',['result-manifest.schema.json','telemetry-envelope.schema.json',
+    'producer-phase-source.schema.json','producer-phase-segment.schema.json'])
 @pytest.mark.parametrize('mutation',['schema','execution'])
-def test_mutated_cached_schema_holds_before_factory_or_root(tmp_path,monkeypatch,mutation):
+def test_mutated_cached_schema_holds_before_factory_or_root(tmp_path,monkeypatch,mutation,schema):
     import qcl_negf_contracts.results as contracts
     args,_,_,_=context_fixture(tmp_path)
-    cached=contracts._validator('result-manifest.schema.json')
+    cached=contracts._validator(schema)
     old=cached.schema.get('title');present='title' in cached.schema;execution=cached._validators
     if mutation=='schema':cached.schema['title']='unqualified mutated cache'
     else:cached._validators=[]
@@ -319,16 +321,17 @@ def test_parent_primary_and_cancellation_on_original_owner_paths(tmp_path,monkey
     assert closed and all(r._closed and not r._handles for r in closed)
 
 
-def test_actual_prewarmed12_and_retained_first_output(tmp_path,monkeypatch):
+def test_actual_full_shared_cache_and_retained_first_output(tmp_path,monkeypatch):
     import sys,weakref
     import qcl_negf_contracts as contracts
     import qcl_negf_contracts.results as contract_results
     from qcl_negf_results import state
     args,manifest,_,_=context_fixture(tmp_path,final=True)
     kinds={v[0] for v in contract_results._SCHEMAS.values()}|{
-        'core-state.schema.json','result-common.schema.json','scientific-plan.schema.json','nested-sweep-plan.schema.json'}
+        'core-state.schema.json','result-common.schema.json','scientific-plan.schema.json','nested-sweep-plan.schema.json',
+        'producer-phase-segment.schema.json','producer-phase-source.schema.json','telemetry-envelope.schema.json'}
     cached=[contract_results._validator(k) for k in kinds]
-    assert len(cached)==contract_results._validator.cache_info().currsize==12
+    assert len(cached)==contract_results._validator.cache_info().currsize==15
     refs=[weakref.ref(r) for v in cached for r in (v._registry,v._resolver._registry)]
     maxima=[];calls=[];arenas=[];original_arena=api._MetadataArena
     class MeasuredArena(original_arena):
@@ -356,14 +359,14 @@ def test_actual_prewarmed12_and_retained_first_output(tmp_path,monkeypatch):
     finally:sys.setprofile(old)
     assert first[0]==second[0]==manifest and first[4] is not None and second[4] is not None
     assert state._context_weight(first)==retained<=4*M
-    assert max(maxima)>74_682_150 and max(maxima)<96*M  # includes real shared standard metaschemas
+    assert max(maxima)==90_020_238 and max(maxima)<96*M  # includes real shared standard metaschemas
     assert calls and arenas[0].validation_reservation==96*M
     assert 96*M<=second[2].io_counters['metadata_high_water_bytes']<=128*M
     assert arenas[0].profile_bytes_read>5*M and arenas[1].profile_bytes_read==arenas[0].profile_bytes_read
     assert 0<arenas[1].profile_io_remaining<1*M
     assert set(first[2].io_counters)=={'bytes_read_total','sha_bytes','hdf_bytes','metadata_bytes',
         'logical_selected_bytes','maximum_io_bytes','maximum_context_bytes','metadata_high_water_bytes'}
-    print('PREWARM12',dict(max_schema_forest=max(maxima),retained=retained,calls=calls,counters=second[2].io_counters))
+    print('FULL_SHARED_CACHE15',dict(max_schema_forest=max(maxima),retained=retained,calls=calls,counters=second[2].io_counters))
 
 
 def test_unknown_loaded_library_and_after_close_cache_mutation_hold(tmp_path,monkeypatch):
@@ -529,3 +532,37 @@ def test_after_close_factory_binding_mutation_holds_without_transfer(tmp_path,mo
     monkeypatch.setattr(StateReader,'close',closing)
     with pytest.raises(ContractError,match='validation profile'):bridge()(**args)
     assert closed and all(r._closed and not r._handles for r in closed) and not calls
+
+
+def test_public_science_then_phase_and_performance_reads_preserve_closed_context(tmp_path):
+    """Ordinary technical readers must not poison the shared science cache."""
+    from qcl_negf_results.capture import PhaseCaptureSource
+    from qcl_negf_results.final_diagnostics import FinalDiagnosticsReader
+    from qcl_negf_results.performance_views import read_performance_context,read_performance_summary
+    from qcl_negf_results.telemetry import TelemetryWriter
+    from qcl_negf_results.state import _IOBudget
+    from native_consumer_fixture import technical_source,sealed_phase,telemetry_input
+    args,manifest,checkpoint,value=context_fixture(tmp_path/'closed',final=True)
+    first=bridge()(**args);saved=deepcopy(first)
+    with StateReader(args['artifact_root'],state_ref=args['state_ref'],expected_identity=args['expected_identity'],limits=args['limits']) as reader:
+        inputs=api.describe_checkpoint_inputs(reader,plan_ref=args['plan_ref'],model_ref=args['model_ref'])
+        with FinalDiagnosticsReader(reader,artifact_ref=args['diagnostics_ref']) as final:diagnostic=final.describe()
+        with api.FinalObservationsReader(reader,artifact_ref=args['observations_ref']) as final:observation=final.describe()
+    c=technical_source(tmp_path/'technical');producer=tmp_path/'producer'
+    sealed_phase(producer,c['state']['identity'])
+    descriptor=dict(status='available',session_id='native',current_path='phase-current.json',reason=None)
+    with PhaseCaptureSource(producer,descriptor=descriptor,expected_identity=c['state']['identity'],route_epoch=0) as phase:
+        batch=phase.harvest(None,budget=_IOBudget(M))
+        assert batch is not None
+        writer=TelemetryWriter(c['technical'],{},{},transport=c['transport'])
+        writer.stage_phase_batch(batch);writer.close()
+    selection=telemetry_input(c,writer)
+    with StateReader(c['science'],state_ref=c['state'],expected_identity=c['state']['identity']) as reader:
+        assertions,rows=read_performance_context(reader,telemetry=selection)
+        assert assertions and rows
+        assert read_performance_summary(reader,telemetry=selection)['status']=='available'
+    second=bridge()(**args)
+    assert first==saved and first==second
+    assert second[0]==manifest and second[1]==checkpoint
+    assert second[2].plan_raw==inputs.plan_raw and second[2].model_raw==inputs.model_raw
+    assert second[3].declaration==diagnostic.declaration and second[4].declaration==observation.declaration==value
