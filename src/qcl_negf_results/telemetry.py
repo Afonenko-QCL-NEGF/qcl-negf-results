@@ -197,31 +197,33 @@ def _nodes(value):
 def _observed(method):
     @wraps(method)
     def operation(self,*args,**kwargs):
-        if self.technical_version != 2 or self._operation_depth:return method(self,*args,**kwargs)
-        _count(self._operation_stop+1)
-        self._io_remaining=min(4194304,kwargs.get('maximum_io_bytes',4194304))
-        forecast=self._forecast_total
-        self._operation_depth+=1
-        cpu=self._cost_cpu_position;written=self._cost_written_position;failed=False
-        try:return method(self,*args,**kwargs)
-        except BaseException:
-            failed=True
-            raise
-        finally:
-            self._operation_depth-=1
-            self._cost_cpu_position=time.process_time()
-            values=dict(process_cpu_seconds=self._cost_cpu_position-cpu,
-                        bytes_written=None if failed else self._metadata_written-written)
-            self._cost_written_position=self._metadata_written
-            if method.__name__=='flush':values['flushes']=1
-            for key in _COST_METRICS:
-                value=values.get(key)
-                item=dict(known=(_count(value) if key not in _COST_FLOATS else value) if value is not None else None,
-                          covered='1' if value is not None else '0',unavailable='0' if value is not None else '1',
-                          overflow='0',reasons=[] if value is not None else ['missing_observation'])
-                self._cost_metrics[key]=_accumulate(self._cost_metrics[key],item,key not in _COST_FLOATS)
-            self._operation_stop+=1
-            self._io_forecast_pending+=self._forecast_total-forecast
+        if self.technical_version != 2:return method(self,*args,**kwargs)
+        with self.lock:
+            if self._operation_depth:return method(self,*args,**kwargs)
+            _count(self._operation_stop+1)
+            self._io_remaining=min(4194304,kwargs.get('maximum_io_bytes',4194304))
+            forecast=self._forecast_total
+            self._operation_depth+=1
+            cpu=self._cost_cpu_position;written=self._cost_written_position;failed=False
+            try:return method(self,*args,**kwargs)
+            except BaseException:
+                failed=True
+                raise
+            finally:
+                self._operation_depth-=1
+                self._cost_cpu_position=time.process_time()
+                values=dict(process_cpu_seconds=self._cost_cpu_position-cpu,
+                            bytes_written=None if failed else self._metadata_written-written)
+                self._cost_written_position=self._metadata_written
+                if method.__name__=='flush':values['flushes']=1
+                for key in _COST_METRICS:
+                    value=values.get(key)
+                    item=dict(known=(_count(value) if key not in _COST_FLOATS else value) if value is not None else None,
+                              covered='1' if value is not None else '0',unavailable='0' if value is not None else '1',
+                              overflow='0',reasons=[] if value is not None else ['missing_observation'])
+                    self._cost_metrics[key]=_accumulate(self._cost_metrics[key],item,key not in _COST_FLOATS)
+                self._operation_stop+=1
+                self._io_forecast_pending+=self._forecast_total-forecast
     return operation
 
 
@@ -1667,25 +1669,44 @@ class TelemetryWriter:
         Additional phase refs exclude accepted ranges already carried by the
         commit. This snapshot selects bytes, and does not certify their owner.
         """
-        from .commits import decode_json
-        from .state import _metadata_weight
         with self.lock:
             self.close()  # Pending publication/primary errors retain their identity.
-            raw = self._published_context_raw
-            if raw is None or len(raw) > 1024*1024:
-                raise ValueError('closed context metadata allowance exceeded')
-            value = decode_json(raw, 'exact published close context')
-            # Debit decoded snapshot, validation/return copies and commit encoding
-            # before allocating any detached return or readback payload.
-            if (_metadata_weight((raw, value, self._previous)) +
-                    2*_metadata_weight(value) + 4*_metadata_weight(self._previous)) > 1024*1024:
-                raise ValueError('combined closed context metadata allowance exceeded')
-            if len(value['phase_context_refs']) > 128 or len(value['resume_context_refs']) > 16:
-                raise ValueError('closed context reference page exceeded')
-            self._check_retained(self.root/value['commit_ref']['path'], json_bytes(self._previous))
-            # Decoding allocated this detached tree; immutable stored raw is not
-            # exposed and repeated calls cannot observe caller mutations.
-            return (value['commit_ref'], tuple(value['phase_context_refs']), tuple(value['resume_context_refs']))
+            return self._published_context()
+
+    def published_context(self) -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]:
+        """Detach the last acknowledged transaction without flushing or closing.
+
+        Buffered rows remain uncommitted. An uncertain publication requires
+        explicit flush recovery before a snapshot can be returned.
+        """
+        with self.lock:
+            return self._published_context_operation()
+
+    @_observed
+    def _published_context_operation(self):
+        return self._published_context()
+
+    def _published_context(self):
+        """Detach/read back within the caller's locked operation allowance."""
+        from .commits import decode_json
+        from .state import _metadata_weight
+        if self._publication_pending is not None:
+            raise ValueError('pending publication requires explicit flush recovery')
+        raw = self._published_context_raw
+        if raw is None or len(raw) > 1024*1024:
+            raise ValueError('published context metadata allowance exceeded')
+        value = decode_json(raw, 'exact published context')
+        # Debit decoded snapshot, validation/return copies and commit encoding
+        # before allocating any detached return or readback payload.
+        if (_metadata_weight((raw, value, self._previous)) +
+                2*_metadata_weight(value) + 4*_metadata_weight(self._previous)) > 1024*1024:
+            raise ValueError('combined published context metadata allowance exceeded')
+        if len(value['phase_context_refs']) > 128 or len(value['resume_context_refs']) > 16:
+            raise ValueError('published context reference page exceeded')
+        self._check_retained(self.root/value['commit_ref']['path'], json_bytes(self._previous))
+        # Decoding allocated this detached tree; immutable stored raw is not
+        # exposed and repeated calls cannot observe caller mutations.
+        return (value['commit_ref'], tuple(value['phase_context_refs']), tuple(value['resume_context_refs']))
 
     def __enter__(self) -> "TelemetryWriter":
         return self

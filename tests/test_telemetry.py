@@ -536,6 +536,10 @@ def test_T10_explicit_collector_page_rotation_admits_seventeenth_source_and_exac
     final=json.loads(writer.close().read_bytes());summary=json.loads((writer.root/final['summary']['path']).read_bytes())
     assert summary['totals']['accepted_source_rows']=='36' and len(final['source_cursors'])==1
     assert final['source_cursors'][0]['cursor']['next_row']=='2'
+    snapshot = writer.published_context()
+    assert snapshot[1] == (old_completion,) and snapshot[2] == (resume,)
+    snapshot[2][0]['commit_ref']['path'] = 'caller-mutated-resume.json'
+    assert writer.published_context()[2] == (resume,)
 
 
 def test_T10_new_publication_requires_completed_old_physical_rows_and_forgeries_change_no_cursor(tmp_path):
@@ -607,7 +611,8 @@ def test_T0_close_context_detaches_exact_durable_close_and_reconciles_lost_ack(t
     assert (tmp_path / frozen[0]['path']).read_bytes() == raw
 
 
-def test_T0_close_context_preserves_explicit_retained_completion_path(tmp_path):
+@pytest.mark.parametrize("context_kind", ["closed", "published"])
+def test_T0_close_context_preserves_explicit_retained_completion_path(tmp_path, context_kind):
     """Equivalent raw bytes at another selected path must not rewrite that ref."""
     from native_consumer_fixture import sealed_phase
     from result_v2_fixture import IDENTITY
@@ -633,7 +638,15 @@ def test_T0_close_context_preserves_explicit_retained_completion_path(tmp_path):
         sealed_phase(producer, IDENTITY, previous=first['publication_ref'], generation=2)
         returning = source.harvest(batch.cursor, budget=_IOBudget(1 << 20))
         writer.stage_phase_batch(returning, phase_context_refs=(completion,))
-        assert writer.close_context()[1] == (completion,)
+        if context_kind == 'published':
+            writer.flush()
+            snapshot = writer.published_context()
+            assert writer.closed is False
+        else:
+            snapshot = writer.close_context()
+        assert snapshot[1] == (completion,)
+        snapshot[1][0]['retained_publication_ref']['path'] = 'caller-mutation.json'
+        assert writer.published_context()[1] == (completion,)
 
 
 def s3_writer(root, **kwargs):
@@ -900,3 +913,337 @@ def test_S3_resume_partial_physical_source(tmp_path):
     resumed.stage_phase_batch(parts[1]);resumed.flush()
     assert resumed._previous_summary['totals']['accepted_source_rows']=='2'
     assert resumed._previous_summary['cumulative']['phases']['entries'][0]['metrics']['duration_seconds']['known']==5.
+
+
+@pytest.mark.parametrize('technical_version', [1, 2])
+def test_published_context_selects_last_ack_without_flushing_buffered_rows(tmp_path, technical_version):
+    import copy
+    import hashlib
+    writer = s3_writer(tmp_path) if technical_version == 2 else TelemetryWriter(tmp_path, {}, {})
+    writer.record_resource({'wall_seconds': 1.})
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    state = (writer.generation, writer.closed, writer.pending_rows,
+             copy.deepcopy(writer.source_cursors), copy.deepcopy(writer.staged_source_cursors))
+    snapshot = writer.published_context()
+    ref, phases, resumes = snapshot
+    raw = (tmp_path / ref['path']).read_bytes()
+    assert ref['sha256'] == hashlib.sha256(raw).hexdigest()
+    assert ref['bytes'] == str(len(raw))
+    commit = json.loads(raw)
+    summary = json.loads((tmp_path / commit['summary']['path']).read_bytes())
+    assert commit['generation'] == '1' and commit['closed'] is False
+    assert summary['totals']['rows']['resources'] == '0'
+    assert phases == () and resumes == ()
+    assert state == (writer.generation, writer.closed, writer.pending_rows,
+                     writer.source_cursors, writer.staged_source_cursors)
+    assert before == {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    frozen = copy.deepcopy(snapshot)
+    ref['path'] = 'caller-mutated.json'
+    assert writer.published_context() == frozen
+    writer.flush()
+    advanced = writer.published_context()
+    assert json.loads((tmp_path / advanced[0]['path']).read_bytes())['generation'] == '2'
+    assert writer.closed is False and writer.pending_rows == 0
+
+
+@pytest.mark.parametrize('technical_version', [1, 2])
+def test_published_context_matches_close_snapshot_after_durable_close(tmp_path, technical_version):
+    writer = s3_writer(tmp_path) if technical_version == 2 else TelemetryWriter(tmp_path, {}, {})
+    writer.record_resource({'wall_seconds': 1.})
+    closed = writer.close_context()
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    generation = writer.generation
+    assert writer.published_context() == closed
+    assert writer.published_context() == closed
+    assert writer.closed is True and writer.generation == generation == 2
+    assert json.loads((tmp_path / closed[0]['path']).read_bytes())['closed'] is True
+    assert before == {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+
+
+@pytest.mark.parametrize('technical_version', [1, 2])
+def test_published_context_refuses_before_first_ack_without_publishing(tmp_path, technical_version):
+    writer = TelemetryWriter.__new__(TelemetryWriter)
+    transport = dict(selection=dict(calcjob_uuid='job', execution_id='ex', attempt=1,
+                                   plan_fingerprint='a'*64), frozen_plan=None)
+    writer._initialize_writer(tmp_path, {}, {}, publish=False, technical_version=technical_version,
+                              transport=transport if technical_version == 2 else None)
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError):
+        writer.published_context()
+    assert writer.generation == 0 and writer.closed is False
+    assert before == {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+
+
+@pytest.mark.parametrize('technical_version', [1, 2])
+def test_published_context_refuses_uncertain_tail_until_explicit_flush_recovery(tmp_path, monkeypatch, technical_version):
+    import qcl_negf_results.telemetry as module
+    writer = s3_writer(tmp_path) if technical_version == 2 else TelemetryWriter(tmp_path, {}, {})
+    writer.record_resource({'wall_seconds': 1.})
+    original = module.publish_pointer
+    def lost_ack(*args, **kwargs):
+        original(*args, **kwargs)
+        raise OSError('published context original lost ACK')
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'publish_pointer', lost_ack)
+        with pytest.raises(OSError, match='original lost ACK'):
+            writer.flush()
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert writer.generation == 1
+    with pytest.raises(ValueError, match='pending'):
+        writer.published_context()
+    assert writer.generation == 1 and writer.closed is False
+    assert before == {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    writer.flush()
+    ref, _, _ = writer.published_context()
+    commit = json.loads((tmp_path / ref['path']).read_bytes())
+    assert commit['generation'] == '2' and commit['closed'] is False
+    summary = json.loads((tmp_path / commit['summary']['path']).read_bytes())
+    assert summary['totals']['rows']['resources'] == '1'
+
+
+@pytest.mark.parametrize('technical_version', [1, 2])
+def test_published_context_rechecks_exact_selected_commit_bytes(tmp_path, technical_version):
+    writer = s3_writer(tmp_path) if technical_version == 2 else TelemetryWriter(tmp_path, {}, {})
+    ref, _, _ = writer.published_context()
+    path = tmp_path / ref['path']
+    raw = path.read_bytes()
+    path.write_bytes(b' ' + raw[1:])
+    with pytest.raises(ValueError, match='bytes changed'):
+        writer.published_context()
+    assert writer.generation == 1 and writer.closed is False
+
+
+def test_published_context_reuses_combined_metadata_credit_before_return(tmp_path):
+    from qcl_negf_results.commits import json_bytes
+    writer = TelemetryWriter(tmp_path, {}, {})
+    # Owned adversarial captured metadata: each page/count fits independently,
+    # but raw + decoded objects + detached returns must share the same allowance.
+    value = json.loads(writer._published_context_raw)
+    reference = dict(value['commit_ref'], path='selected/' + 'x'*512 + '.json')
+    value['phase_context_refs'] = [dict(publication_ref=reference, segment_ref=reference,
+        retained_publication_ref=reference, retained_segment_ref=reference) for _ in range(128)]
+    writer._published_context_raw = json_bytes(value)
+    assert len(writer._published_context_raw) < 1024*1024
+    with pytest.raises(ValueError, match='combined.*context metadata allowance'):
+        writer.published_context()
+    assert writer.generation == 1 and writer.closed is False
+
+
+def test_published_context_retains_caller_io_admission(tmp_path):
+    from qcl_negf_results._capture_io import ObserverIO
+    writer = TelemetryWriter(tmp_path, {}, {})
+    writer.metadata_budget = ObserverIO(0)
+    with pytest.raises(ValueError, match='credit exhausted'):
+        writer.published_context()
+    assert writer.metadata_budget.used == 0
+    writer.metadata_budget = ObserverIO(1024*1024)
+    ref, _, _ = writer.published_context()
+    assert writer.metadata_budget.read_bytes == int(ref['bytes'])
+    assert writer.metadata_budget.write_bytes == 0
+
+
+@pytest.mark.parametrize('technical_version', [1, 2])
+@pytest.mark.parametrize('operation', ['flush', 'close_context'])
+def test_published_context_serializes_with_ack_and_close(tmp_path, technical_version, operation):
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+    writer = s3_writer(tmp_path) if technical_version == 2 else TelemetryWriter(tmp_path, {}, {})
+    writer.record_resource({'wall_seconds': 1.})
+    entered, done = threading.Event(), threading.Event()
+    def snapshot():
+        entered.set()
+        try:
+            return writer.published_context()
+        finally:
+            done.set()
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        with writer.lock:
+            future = pool.submit(snapshot)
+            assert entered.wait(2)
+            assert not done.wait(.05)
+            getattr(writer, operation)()
+        result = future.result(timeout=2)
+    commit = json.loads((tmp_path / result[0]['path']).read_bytes())
+    assert commit['generation'] == '2'
+    assert commit['closed'] is (operation == 'close_context')
+    assert writer.generation == 2
+
+
+def test_published_context_owns_each_read_operation_without_a_lifetime_io_cap(tmp_path):
+    from qcl_negf_results._capture_io import ObserverIO
+    writer = s3_writer(tmp_path)
+    ref, _, _ = writer.published_context()
+    size = int(ref['bytes'])
+    count = (4*1024*1024 // size) + 2
+    writer.metadata_budget = ObserverIO(8*1024*1024)
+    for _ in range(count):
+        current, _, _ = writer.published_context()
+        assert current == ref
+    assert writer.metadata_budget.read_bytes == count*size
+    assert writer.metadata_budget.write_bytes == 0
+    assert writer.generation == 1 and writer.closed is False
+
+
+class _WriterLockAttempt:
+    """Signal contention while delegating every acquisition to the real RLock."""
+    def __init__(self, lock, thread_name, attempted):
+        self.lock = lock
+        self.thread_name = thread_name
+        self.attempted = attempted
+
+    def __enter__(self):
+        import threading
+        if threading.current_thread().name == self.thread_name:
+            self.attempted.set()
+        return self.lock.__enter__()
+
+    def __exit__(self, *args):
+        return self.lock.__exit__(*args)
+
+
+@pytest.mark.parametrize('order', ['flush_waiting', 'snapshot_inflight'])
+def test_observed_concurrent_snapshot_and_flush_keep_distinct_intervals(tmp_path, monkeypatch, order):
+    import threading
+    writer = s3_writer(tmp_path)
+    writer.record_resource({'wall_seconds': 2.})
+    before = writer._operation_stop
+    attempted = threading.Event()
+    writer.lock = _WriterLockAttempt(writer.lock, 'public-flush', attempted)
+    answers, errors = {}, []
+    def flush():
+        try:
+            answers['flush'] = writer.flush()
+        except BaseException as error:
+            errors.append(error)
+    second = threading.Thread(target=flush, name='public-flush')
+    if order == 'flush_waiting':
+        with writer.lock:
+            second.start()
+            assert attempted.wait(3)
+            answers['snapshot'] = writer.published_context()
+        second.join(5)
+    else:
+        reading, release = threading.Event(), threading.Event()
+        original = writer._check_retained
+        def pause_readback(*args, **kwargs):
+            if threading.current_thread().name == 'public-snapshot':
+                reading.set()
+                assert release.wait(3)
+            return original(*args, **kwargs)
+        monkeypatch.setattr(writer, '_check_retained', pause_readback)
+        def snapshot():
+            try:
+                answers['snapshot'] = writer.published_context()
+            except BaseException as error:
+                errors.append(error)
+        first = threading.Thread(target=snapshot, name='public-snapshot')
+        first.start()
+        try:
+            assert reading.wait(3)
+            second.start()
+            assert attempted.wait(3)
+        finally:
+            release.set()
+            first.join(5)
+            if second.ident is not None:
+                second.join(5)
+        assert not first.is_alive()
+    assert not second.is_alive() and not errors
+    snapshot = json.loads((writer.root / answers['snapshot'][0]['path']).read_bytes())
+    committed = json.loads(answers['flush'].read_bytes())
+    assert snapshot['generation'] == '1' and committed['generation'] == '2'
+    assert writer._operation_stop == before + 2
+    assert writer._operation_depth == 0 and writer.closed is False
+    # The current publication excludes its own tail, but must include the
+    # separate completed snapshot interval preceding the flush.
+    delta = committed['cost_delta']
+    assert int(delta['stop_operation']) == before + 1
+    assert delta['metrics']['process_cpu_seconds']['covered'] == '2'
+    assert delta['metrics']['read_seconds']['known'] is None
+    assert delta['metrics']['read_seconds']['unavailable'] == '2'
+    for metric in delta['metrics'].values():
+        assert sum(int(metric[name]) for name in ('covered', 'unavailable', 'overflow')) == 2
+
+
+def test_observed_concurrent_retention_keeps_its_tight_io_admission(tmp_path, monkeypatch):
+    import threading
+    writer = s3_writer(tmp_path)
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    started, attempted, release = threading.Event(), threading.Event(), threading.Event()
+    writer.lock = _WriterLockAttempt(writer.lock, 'public-retention', attempted)
+    original = writer._check_retained
+    def pause_readback(*args, **kwargs):
+        if threading.current_thread().name == 'public-snapshot':
+            started.set()
+            assert release.wait(3)
+        return original(*args, **kwargs)
+    monkeypatch.setattr(writer, '_check_retained', pause_readback)
+    answers, errors = {}, {}
+    def snapshot():
+        try:
+            answers['snapshot'] = writer.published_context()
+        except BaseException as error:
+            errors['snapshot'] = error
+    def retain():
+        try:
+            answers['retention'] = writer.retain_window(maximum_retained_bytes=0,
+                minimum_free_bytes=0, maximum_io_bytes=0)
+        except BaseException as error:
+            errors['retention'] = error
+    first = threading.Thread(target=snapshot, name='public-snapshot')
+    second = threading.Thread(target=retain, name='public-retention')
+    first.start()
+    try:
+        assert started.wait(3)
+        second.start()
+        assert attempted.wait(3)
+    finally:
+        release.set()
+        first.join(5)
+        if second.ident is not None:
+            second.join(5)
+    assert not first.is_alive() and not second.is_alive()
+    assert 'snapshot' not in errors and 'snapshot' in answers
+    assert isinstance(errors.get('retention'), ValueError)
+    assert 'operation I/O allowance' in str(errors['retention'])
+    assert writer._operation_stop == 2 and writer._operation_depth == 0
+    assert writer.generation == 1 and writer.closed is False
+    assert before == {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    assert writer._cost_metrics['bytes_written']['known'] is None
+    assert writer._cost_metrics['bytes_written']['unavailable'] == '1'
+
+
+def test_observed_genuine_nested_flush_and_close_keep_one_outer_interval(tmp_path):
+    writer = s3_writer(tmp_path)
+    writer.ingest_spans([{'phase': 'fixture', 'duration_seconds': .25}], source_cursors={})
+    assert writer._operation_stop == 1 and writer._operation_depth == 0
+    assert writer.generation == 2
+    assert writer._previous_summary['totals']['rows']['spans'] == '1'
+    closed = writer.close_context()
+    assert writer._operation_stop == 2 and writer._operation_depth == 0
+    assert writer.closed is True and writer.generation == 3
+    assert writer.published_context() == closed
+    assert writer._operation_stop == 3
+
+
+@pytest.mark.parametrize('failure_type', [ValueError, KeyboardInterrupt])
+def test_observed_exception_and_cancellation_release_ownership(tmp_path, monkeypatch, failure_type):
+    from concurrent.futures import ThreadPoolExecutor
+    writer = s3_writer(tmp_path)
+    before = {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    primary = failure_type('original observer failure')
+    def fail_readback(*args, **kwargs):
+        raise primary
+    with monkeypatch.context() as patch:
+        patch.setattr(writer, '_check_retained', fail_readback)
+        with pytest.raises(failure_type) as caught:
+            writer.published_context()
+        assert caught.value is primary
+    assert writer._operation_stop == 1 and writer._operation_depth == 0
+    assert writer._cost_metrics['bytes_written']['known'] is None
+    assert writer._cost_metrics['bytes_written']['unavailable'] == '1'
+    assert before == {p: p.read_bytes() for p in tmp_path.rglob('*') if p.is_file()}
+    with ThreadPoolExecutor(max_workers=1) as pool:
+        ref, _, _ = pool.submit(writer.published_context).result(timeout=3)
+    assert json.loads((writer.root / ref['path']).read_bytes())['generation'] == '1'
+    assert writer._operation_stop == 2 and writer.closed is False
