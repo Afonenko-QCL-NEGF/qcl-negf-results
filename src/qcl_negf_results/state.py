@@ -169,18 +169,23 @@ _VALIDATION_SCHEMAS = {
     'https://qcl-negf.invalid/schema/validation-diagnostics.schema.json': '35ecb1710da9f36cd510fc147c4974c92aef56a5b897ad1fac0cc31573268aaa'}
 _VALIDATION_LAYOUT = '6515d7d00f248a16ff4d439ee66a2c757b5507c4c6cd29b0b6c4cdb481afe5ad'
 _VALIDATION_ROW_FIELDS = ('domain_revision', 'discretization_id', 'basis_id', 'stage', 'outer_iteration', 'inner_iteration')
+# Shared Contracts.results cache: fixed results + telemetry public callsites.
+# All 15 cached bundles plus 3 direct bundles fit the qualified 96 MiB W reserve.
 _VALIDATION_KINDS = ('checkpoint-declaration.schema.json',
     'core-state.schema.json',
     'final-diagnostics.schema.json',
     'final-observations.schema.json',
     'nested-sweep-plan.schema.json',
+    'producer-phase-segment.schema.json',
+    'producer-phase-source.schema.json',
     'result-common.schema.json',
     'result-cursor.schema.json',
     'result-manifest.schema.json',
     'result-pointer.schema.json',
     'scientific-catalog.schema.json',
     'scientific-plan.schema.json',
-    'scientific-record.schema.json')
+    'scientific-record.schema.json',
+    'telemetry-envelope.schema.json')
 
 
 _VALIDATION_LIBRARY_CODES = {'keywords': {'$dynamicRef': '7795e960ce3eef69f742a40e5d450a60726e306c29eeba0b42eec2a49a043a3d',
@@ -440,7 +445,7 @@ def _validation_profile(arena, previous=None):
         standard[uri]=resource.contents
     require(len(standard)==20 and len(REGISTRY._anchors)==9)
     for uri,document in standard.items():require(canonical(document)==_VALIDATION_SCHEMAS.get(uri))
-    validators,info=cache(results._validator,12)
+    validators,info=cache(results._validator,len(_VALIDATION_KINDS))
     identities={}
     base='https://qcl-negf.invalid/schema/'
     for name,validator in validators.items():
