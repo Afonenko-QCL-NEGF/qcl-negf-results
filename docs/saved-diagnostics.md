@@ -197,7 +197,7 @@ source guards, original raw input bytes, returned descriptions, temporary JSON
 and YAML trees, deep copies, nested Contracts clone/encode/validation forecasts,
 HDF raw-cache allowances and accounting headers. Admission occurs before each
 covered materialization; exhausted capacity raises `budget_exceeded` and returns
-no partial tuple. A **96 MiB validation reservation** is admitted before the first
+no partial tuple. A **112 MiB validation reservation** is admitted before the first
 factory or reader initialization and remains charged through source stability
 and close. The original Contracts factory builds a fresh 36-document registry
 per call; those graphs and its retained process cache are included, never
@@ -213,14 +213,20 @@ bundled schema or arbitrary caller-supplied cache key. No factory or cache
 semantics are changed; the operation never clears or prewarms a cache.
 
 For the qualified corpus, the 18 simultaneously retained schema bundles and
-shared 20 standard metaschemas weigh 90,020,238 W. The explicit fixed registry
+shared 20 standard metaschemas weigh 94,695,342 W. The explicit fixed registry
 URI/wrapper surface allowance is 2,676,240 W (URI string W plus 512 per map/set
 entry and 16 KiB per validator). Keeping the separate 6 MiB builder/layout/
-inspection allowance gives 98,987,934 W, within the unchanged 100,663,296 W
-reservation. The largest canonical inspection/encoding workspace is 2,087,436 W
+inspection allowance gives 103,663,038 W, leaving 13,777,474 W inside the
+117,440,512 W reservation. The largest canonical inspection/encoding workspace is 2,087,436 W
 inside that separate allowance. These are finite logical accounting estimates
 for the qualified implementation, not bounds on Python/Rust allocation or RSS.
 The public 128 MiB aggregate and 4 MiB retained defaults remain unchanged.
+The larger telemetry sideband corpus requires this separately qualified reserve;
+the previous 96 MiB reserve would be short by 2,999,742 W for the same full domain.
+This operational revision changes no schema constraints, cache semantics or
+physical inputs. A caller can explicitly admit a larger detached result within
+the public retained ceiling; the default 4 MiB remains a refusal for complete
+original-input final contexts that exceed it.
 
 The operation qualifies exact Contracts schemas/layout/source and the library
 content profile, currently CPython 3.14.7, jsonschema 4.26.0, referencing 0.37.0,
@@ -277,7 +283,7 @@ an exact positive integer up to 128 MiB. It bounds W of the **final returned tup
 including all final whole-call counter headers, immediately before ownership
 transfer. Exceeding it raises `budget_exceeded`, closes owners and returns no
 partial tuple. Smaller arena limits can fail before initialization because the
-validation reservation alone requires 96 MiB. The original 4 MiB refusal remains
+validation reservation alone requires 112 MiB. The original 4 MiB refusal remains
 a valid negative result; it is not reclassified as a successful final context.
 
 An outer consumer must prepay one sequential workspace and each retained output
