@@ -17,11 +17,13 @@ def main() -> None:
         capture = argparse.ArgumentParser(prog='qcl-negf-results capture-run')
         capture.add_argument('--spec', type=Path, required=True)
         capture.add_argument('--solver', required=True)
+        capture.add_argument('--native-execution', type=Path)
         capture.add_argument('arguments', nargs=argparse.REMAINDER)
         args = capture.parse_args(sys.argv[2:])
         arguments = args.arguments[1:] if args.arguments[:1] == ['--'] else args.arguments
         from .capture import capture_run
-        raise SystemExit(capture_run(args.spec, args.solver, arguments))
+        raise SystemExit(capture_run(args.spec, args.solver, arguments,
+                                    native_execution_path=args.native_execution))
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest='command', required=True)
     for name in ('preview', 'export'):

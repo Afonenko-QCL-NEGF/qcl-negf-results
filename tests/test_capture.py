@@ -659,3 +659,279 @@ def test_T10_F1_observe_lost_head_preserves_rows_without_success_binding(tmp_pat
     assert summary['totals']['accepted_aggregate_calls'] == '3'
     assert commit['source_cursors'][0]['cursor']['next_row'] == '2'
     assert (context['science'] / selected['manifest']['path']).read_bytes() == sentinel
+
+
+def _T1_native_job(tmp_path):
+    """Literal operational inputs and tiny engineering source, no actor authority."""
+    import hashlib
+    from native_consumer_fixture import technical_source, sealed_phase, outward_series
+    from qcl_negf_results.commits import json_bytes
+    job = tmp_path / 'upload with spaces'
+    job.mkdir()
+    result = tmp_path / "jobs with 'quote and space" / 'native' / 'domain'
+    c = technical_source(result, checkpoint=True, execution='exec')
+    plan_raw = (c['root'] / c['plan']['path']).read_bytes()
+    plan = json.loads(plan_raw)
+    manifest = c['science'] / c['state']['manifest']['path']
+    graph_raw = b' \n' + json_bytes(json.loads(manifest.read_bytes())['provenance']) + b'\n'
+    uid = lambda n: f'00000000-0000-4000-8000-{n:012d}'
+    claim = lambda n, raw: dict(node_uuid=uid(n), bytes=str(len(raw)), sha256=hashlib.sha256(raw).hexdigest())
+    native = dict(schema='qcl-negf.aiida-native-execution.v1', request_id=uid(1), execution_id='exec',
+        input_plan=claim(2, plan_raw), source_graph=claim(3, graph_raw), access_receipt_ref='access-receipt',
+        storage=dict(namespace_id='native', storage_identity='storage', relative_execution_root='native/domain',
+            computer_uuid=uid(4), execution_binding_uuid=uid(5), retention_policy_id='retention',
+            retention_owner_id='owner', hold_ref='hold', access_binding_ref='access'),
+        code=dict(code_uuid=uid(6), computer_uuid=uid(4), solver_executable='/nix/store/synthetic/bin/qcl-negf',
+            release_id='synthetic', build_receipt_ref='build'))
+    (job / 'plan.json').write_bytes(plan_raw)
+    (job / 'source-graph.json').write_bytes(graph_raw)
+    (job / 'native-execution.json').write_bytes(b' \n' + json_bytes(native) + b'\n')
+    selection = dict(calcjob_uuid=uid(7), execution_id='exec', attempt=3, plan_fingerprint=plan['fingerprint'])
+    spec = dict(schema='qcl-negf.capture-spec.v1', selection=selection,
+        plan=dict(path='plan.json', bytes=len(plan_raw), sha256=hashlib.sha256(plan_raw).hexdigest()),
+        capture_token='c' * 32, allocation_id=f'calcjob-process:{uid(7)}:3', allocated_logical_cpus=None,
+        scratch_root=None, credits=dict(performance_bytes=32 << 20, scalar_bytes=0, io_bytes=128 << 20, reserve_bytes=0))
+    (job / 'capture-spec.json').write_bytes(json_bytes(spec))
+    (job / 'capture-source.json').write_bytes(json_bytes(dict(schema='qcl-negf.capture-source.v1',
+        capture_token='c' * 32, execution_id='exec', plan_fingerprint=selection['plan_fingerprint'],
+        mode='direct', actual_root=str(result), epoch=0)))
+    sealed_phase(result, c['state']['identity'])
+    phase = dict(status='available', session_id='native', current_path='phase-current.json', reason=None)
+    (result / 'series_result.json').write_bytes(json_bytes(outward_series(c['state'], phase, fingerprint=plan['fingerprint'])))
+    args = ('run-plan', 'plan.json', str(result), '--execution-id', 'exec', '--source-graph', 'source-graph.json')
+    return dict(job=job, result=result, context=c, manifest=manifest, native=native, spec=spec, arguments=args)
+
+
+def test_T1_native_fixed_ingress_keeps_raw_without_fabricating_original_transport(tmp_path, monkeypatch):
+    """External canonical root must capture phases, never guess source transport."""
+    import qcl_negf_results.capture as module
+    fixture = _T1_native_job(tmp_path)
+    before = {str(p.relative_to(fixture['result'])): p.read_bytes()
+              for p in fixture['result'].rglob('*') if p.is_file()}
+    monkeypatch.setattr(module, 'proc_sample', lambda *a, **k: dict(wall_seconds=2., monotonic_ns=2_000_000_000,
+        cpu_time_seconds=None, missing_reason='synthetic process sample unavailable'))
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 7\n'); os.close(write_fd)
+    assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+        native_execution_path=fixture['job'] / 'native-execution.json', solver_arguments=fixture['arguments']) == 2
+    technical = fixture['job'] / 'performance'
+    pointer = next(technical.glob('sessions/*/current.json'))
+    commit_ref = json.loads(pointer.read_bytes())['commit']
+    commit = json.loads((technical / commit_ref['path']).read_bytes())
+    summary = json.loads((technical / commit['summary']['path']).read_bytes())
+    assert commit['closed'] is True and commit['transport']['selection']['attempt'] == 3
+    assert commit['source_cursors'][0]['identity']['attempt'] == '1'
+    assert commit['source_cursors'][0]['binding']['status'] == 'unbound'
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert summary['control_events'] == [dict(event='source_binding_missing', count='1')]
+    assert not (technical / 'performance-binding.json').exists()
+    assert not (technical / 'performance-bindings').exists()
+    assert not (fixture['job'] / 'live').exists()
+    assert {str(p.relative_to(fixture['result'])): p.read_bytes()
+            for p in fixture['result'].rglob('*') if p.is_file()} == before
+
+
+def test_T1_cli_native_path_literal_argv_one_solver_and_primary_exit(tmp_path):
+    """The real child must receive native context without shell re-parsing argv."""
+    fixture = _T1_native_job(tmp_path)
+    solver = tmp_path / 'sentinel solver'
+    marker = tmp_path / 'literal-argv.json'
+    solver.write_text('#!' + sys.executable + '\nimport json, pathlib, sys\n'
+        + 'with pathlib.Path(' + repr(str(marker)) + ').open("x") as out: json.dump(sys.argv[1:], out)\nraise SystemExit(23)\n')
+    solver.chmod(0o700)
+    process = subprocess.run([sys.executable, '-c', 'from qcl_negf_results.cli import main; main()', 'capture-run',
+        '--spec', str(fixture['job'] / 'capture-spec.json'), '--solver', str(solver),
+        '--native-execution', str(fixture['job'] / 'native-execution.json'), '--', *fixture['arguments']],
+        cwd=fixture['job'], capture_output=True, timeout=15)
+    assert process.returncode == 23, process.stderr.decode()
+    assert json.loads(marker.read_bytes()) == list(fixture['arguments'])
+    assert len(list((fixture['job'] / 'performance').glob('sessions/*/current.json'))) == 1
+    assert process.stdout == process.stderr == b''
+
+
+@pytest.mark.parametrize('fault', ['callback', 'transport', 'plan', 'graph', 'output', 'locator', 'attempt', 'duplicate', 'scratch', 'credit'])
+def test_T1_native_invalid_inputs_fail_before_observer_output(tmp_path, fault):
+    import qcl_negf_results.capture as module
+    fixture = _T1_native_job(tmp_path)
+    args = list(fixture['arguments'])
+    kwargs = {}
+    if fault == 'callback':
+        kwargs['telemetry_selection_factory'] = lambda *_: pytest.fail('native caller callback executed')
+    elif fault == 'transport':
+        kwargs['transport'] = dict(selection=fixture['spec']['selection'], frozen_plan=None)
+    elif fault in ('plan', 'graph'):
+        target = fixture['job'] / ('plan.json' if fault == 'plan' else 'source-graph.json')
+        target.write_bytes(target.read_bytes() + b' ')
+    elif fault == 'output':
+        args[2] = str(tmp_path / 'foreign')
+    elif fault == 'locator':
+        target = fixture['job'] / 'capture-source.json'
+        value = json.loads(target.read_bytes()); value['actual_root'] = str(tmp_path / 'foreign')
+        target.write_text(json.dumps(value))
+    elif fault == 'attempt':
+        args += ['--attempt', '3']
+    elif fault == 'duplicate':
+        args += ['--execution-id', 'exec']
+    elif fault == 'scratch':
+        args += ['--scratch-root', str(tmp_path / 'scratch')]
+    elif fault == 'credit':
+        target = fixture['job'] / 'capture-spec.json'
+        value = json.loads(target.read_bytes()); value['credits']['io_bytes'] = 16384
+        target.write_text(json.dumps(value))
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 0\n'); os.close(write_fd)
+    assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+        native_execution_path=fixture['job'] / 'native-execution.json', solver_arguments=tuple(args), **kwargs) == 2
+    assert not (fixture['job'] / 'performance').exists()
+
+
+def test_T1_terminal_attaches_public_close_phase_resume_without_changing_callback(tmp_path, monkeypatch):
+    """Dropping exact old completion/resume refs must break actual close binding."""
+    import hashlib
+    from native_consumer_fixture import technical_source, sealed_phase, outward_series
+    from result_v2_fixture import reference
+    from qcl_negf_results.commits import json_bytes
+    from qcl_negf_results.telemetry import TelemetryWriter
+    from qcl_negf_results.state import StateReader, _IOBudget
+    from qcl_negf_results.performance_views import TelemetrySelection, read_performance_context
+    import qcl_negf_results.capture as module
+    job = tmp_path / 'job'; job.mkdir()
+    result = job / 'result'
+    c = technical_source(result, checkpoint=True, execution='exec')
+    technical = job / 'performance'; technical.mkdir()
+    (technical / c['source_binding']['path']).write_bytes((c['technical'] / c['source_binding']['path']).read_bytes())
+    sentinel = (c['science'] / c['state']['manifest']['path']).read_bytes()
+    producer = tmp_path / 'producer'
+    first = sealed_phase(producer, c['state']['identity'])
+    descriptor = dict(status='available', session_id='native', current_path='phase-current.json', reason=None)
+    with module.PhaseCaptureSource(producer, descriptor=descriptor, expected_identity=c['state']['identity'], route_epoch=0) as source:
+        batch = source.harvest(None, budget=_IOBudget(1 << 20))
+        writer = TelemetryWriter(technical, {}, {}, transport=c['transport'])
+        writer.stage_phase_batch(batch)
+        accepted = json.loads(writer.flush().read_bytes())['accepted_ranges'][0]
+        old_path = writer.rotate(); old = json.loads(old_path.read_bytes())
+        resume = dict(commit_ref=reference(technical, str(old_path.relative_to(technical)), 'qcl-negf.telemetry-commit.v1'), summary_ref=old['summary'])
+        completion = dict(publication_ref=accepted['publication'], segment_ref=accepted['segment'],
+            retained_publication_ref=accepted['retained_publication'], retained_segment_ref=accepted['retained_segment'])
+        writer.record_resource(dict(wall_seconds=1.)); writer.flush()
+        sealed_phase(producer, c['state']['identity'], previous=first['publication_ref'], generation=2)
+        writer.stage_phase_batch(source.harvest(batch.cursor, budget=_IOBudget(1 << 20)),
+            phase_context_refs=(completion,), resume_context_refs=(resume,))
+    unavailable = dict(status='unavailable', session_id=None, current_path=None, reason='not_recorded')
+    (result / 'series_result.json').write_bytes(json_bytes(outward_series(c['state'], unavailable)))
+    raw = json_bytes(dict(fingerprint='a' * 64, points=[dict(id=c['state']['identity']['point_id'], execution_id='exec')]))
+    (job / 'plan.json').write_bytes(raw)
+    (job / 'capture-spec.json').write_bytes(json_bytes(dict(schema='qcl-negf.capture-spec.v1', selection=c['transport']['selection'],
+        plan=dict(path='plan.json', bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest()), capture_token='c' * 32,
+        allocation_id='allocation', allocated_logical_cpus=None, scratch_root=None,
+        credits=dict(performance_bytes=32 << 20, scalar_bytes=0, io_bytes=128 << 20, reserve_bytes=0))))
+    (job / 'capture-source.json').write_bytes(json_bytes(dict(schema='qcl-negf.capture-source.v1', capture_token='c' * 32,
+        execution_id='exec', plan_fingerprint='a' * 64, mode='direct', actual_root=str(result), epoch=0)))
+    calls = []
+    def factory(reader, close_ref):
+        calls.append(reader.source.state)
+        return TelemetrySelection(technical, commit_ref=close_ref, source_binding_ref=c['source_binding'], expected_transport=c['transport'],
+            source_transport=c['source_transport'], canonical_plan_root=c['root'], canonical_plan_ref=c['plan'], expected_producer_provenance=c['producer_provenance'])
+    observed_files = []
+    make_binding = module.make_binding
+    def capture_binding(reader, *, telemetry, destination, capture_status, budget=None):
+        value = make_binding(reader, telemetry=telemetry, destination=destination, capture_status=capture_status, budget=budget)
+        inputs = telemetry.document()
+        inputs['binding_ref'] = reference(technical, str(destination.relative_to(technical)), 'qcl-negf.telemetry-binding.v1')
+        selected = TelemetrySelection(technical, canonical_plan_root=telemetry.canonical_plan_root, **inputs)
+        observed_files.extend(read_performance_context(reader, telemetry=selected)[1])
+        return value
+    monkeypatch.setattr(module, 'make_binding', capture_binding)
+    monkeypatch.setattr('qcl_negf_results.telemetry.TelemetryWriter', lambda *a, **k: writer)
+    monkeypatch.setattr(module, 'proc_sample', lambda *a, **k: dict(wall_seconds=2., monotonic_ns=2_000_000_000,
+        cpu_time_seconds=None, missing_reason='synthetic sample'))
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 0\n'); os.close(write_fd)
+    assert module.observe(job / 'capture-spec.json', 42, 7, read_fd,
+        transport=c['transport'], telemetry_selection_factory=factory) == 0
+    assert calls == [c['state']]
+    assert any(ref == completion['retained_segment_ref'] for _, ref, _ in observed_files)
+    assert any(ref == resume['commit_ref'] for _, ref, _ in observed_files)
+    binding = reference(technical, 'performance-binding.json', 'qcl-negf.telemetry-binding.v1')
+    selected = TelemetrySelection(technical, commit_ref=writer.close_context()[0], source_binding_ref=c['source_binding'],
+        expected_transport=c['transport'], source_transport=c['source_transport'], canonical_plan_root=c['root'],
+        canonical_plan_ref=c['plan'], expected_producer_provenance=c['producer_provenance'], binding_ref=binding,
+        phase_context_refs=(completion,), resume_context_refs=(resume,))
+    with StateReader(c['science'], state_ref=c['state'], expected_identity=c['state']['identity']) as reader:
+        _, files = read_performance_context(reader, telemetry=selected)
+    assert any(ref == completion['retained_segment_ref'] for _, ref, _ in files)
+    assert any(ref == resume['commit_ref'] for _, ref, _ in files)
+    assert (c['science'] / c['state']['manifest']['path']).read_bytes() == sentinel
+
+
+@pytest.mark.parametrize('route', ['capture_run', 'runner', 'runner-term'])
+def test_T1_F1_actual_observer_retains_two_phase_rows_and_original_raw(tmp_path, monkeypatch, route):
+    """A __main__/canonical PhaseBatch split must not pass as a closed capture."""
+    from qcl_negf_results.capture import capture_run
+    fixture = _T1_native_job(tmp_path)
+    source = fixture['result']; job = fixture['job']
+    before = {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()}
+    assert len(before) == 22
+    inputs = {name: (job / name).read_bytes() for name in ('plan.json', 'source-graph.json', 'native-execution.json')}
+    marker = tmp_path / 'single-launch.json'
+    solver = tmp_path / 'one SENTINEL solver'
+    solver.write_text('#!' + sys.executable + '\nimport json, pathlib, signal, sys, time\n'
+        + 'def stop(*_): raise SystemExit(143)\n'
+        + 'signal.signal(signal.SIGTERM, stop)\n'
+        + 'with pathlib.Path(' + repr(str(marker)) + ').open("x") as out: json.dump(sys.argv[1:], out)\n'
+        + ('while True: time.sleep(.01)\n' if route == 'runner-term' else 'raise SystemExit(29)\n'))
+    solver.chmod(0o700)
+    if route == 'capture_run':
+        code = capture_run(job / 'capture-spec.json', str(solver), fixture['arguments'],
+                           native_execution_path=job / 'native-execution.json')
+    else:
+        template = os.environ.get('QCL_NEGF_TEST_RUNNER_LAUNCHER')
+        if not template:
+            pytest.skip('paired SOURCE/L requires the explicitly selected frozen Runner launcher')
+        capture = tmp_path / 'real Results CLI'
+        capture.write_text('#!' + sys.executable + '\nfrom qcl_negf_results.cli import main\nmain()\n')
+        capture.chmod(0o700)
+        launcher = tmp_path / 'frozen Runner launcher'
+        launcher.write_text(Path(template).read_text().replace('@bash@', '/bin/bash')
+            .replace('@solver@', str(solver)).replace('@capture@', str(capture)))
+        launcher.chmod(0o700)
+        env = dict(os.environ, QCL_NEGF_CAPTURE_SPEC=str(job / 'capture-spec.json'),
+                   QCL_NEGF_NATIVE_CAPTURE_INPUT=str(job / 'native-execution.json'))
+        process = subprocess.Popen([str(launcher), *fixture['arguments']], cwd=job, env=env,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            if route == 'runner-term':
+                deadline = time.monotonic() + 5
+                while not marker.exists():
+                    assert time.monotonic() < deadline and process.poll() is None
+                    time.sleep(.01)
+                process.send_signal(signal.SIGTERM)
+            stdout, stderr = process.communicate(timeout=15)
+            code = process.returncode
+            assert stdout == stderr == b''
+        finally:
+            if process.poll() is None:
+                process.kill(); process.communicate(timeout=3)
+    assert code == (143 if route == 'runner-term' else 29)
+    assert json.loads(marker.read_bytes()) == list(fixture['arguments'])
+    technical = job / 'performance'
+    pointers = list(technical.glob('sessions/*/current.json'))
+    assert len(pointers) == 1
+    reference = json.loads(pointers[0].read_bytes())['commit']
+    commit = json.loads((technical / reference['path']).read_bytes())
+    summary = json.loads((technical / commit['summary']['path']).read_bytes())
+    assert commit['closed'] is True
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert len(commit['source_cursors']) == 1
+    assert commit['source_cursors'][0]['binding']['status'] == 'unbound'
+    assert commit['source_cursors'][0]['identity']['attempt'] == '1'
+    assert commit['transport']['selection']['attempt'] == 3
+    assert summary['control_events'] == [dict(event='source_binding_missing', count='1')]
+    retained = [p.read_bytes() for p in technical.glob('sessions/*/raw/*')]
+    assert (source / 'phase-segment-1.json').read_bytes() in retained
+    assert (source / 'phase-publication-1.json').read_bytes() in retained
+    assert not (technical / 'performance-binding.json').exists()
+    assert not (technical / 'performance-bindings').exists()
+    assert not (job / 'live').exists()
+    assert {str(p.relative_to(source)): p.read_bytes() for p in source.rglob('*') if p.is_file()} == before
+    assert {name: (job / name).read_bytes() for name in inputs} == inputs

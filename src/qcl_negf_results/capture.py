@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -687,7 +688,95 @@ def _spec(path, *, budget=None):
     return root, value, known
 
 
-def _locator(root, spec, *, budget=None):
+def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budget):
+    """Fixed worker input assertions, never an original creator/access proof.
+
+    The existing native execution document has no selected source transport.
+    This ingress can associate resource capture with the enclosing launch, but
+    cannot manufacture a selected TelemetrySelection from a native counter.
+    """
+    from qcl_negf_contracts import schema_validator
+    from qcl_negf_contracts.artifacts import relative_path
+    from qcl_negf_contracts.messages import scientific_plan
+    from .state import _metadata_weight
+    from .performance_views import _bounded_objects
+
+    if (not isinstance(arguments, (tuple, list)) or len(arguments) != 7
+            or any(type(word) is not str for word in arguments)
+            or sum(len(word.encode('utf-8')) for word in arguments) > 16384
+            or tuple(arguments[:2]) != ('run-plan', 'plan.json')
+            or tuple(arguments[3:]) != ('--execution-id', spec['selection']['execution_id'],
+                                      '--source-graph', 'source-graph.json')
+            or spec['scratch_root'] is not None or spec['plan']['path'] != 'plan.json'):
+        raise ValueError('unsupported original native run-plan argv')
+    path = Path(os.path.abspath(native_execution_path))
+    if path != root / 'native-execution.json':
+        raise ValueError('native execution must be the explicit original workdir input')
+    native, native_raw = small_json(path, 16384, budget=budget)
+    if (set(native) != {'schema', 'request_id', 'execution_id', 'storage', 'source_graph',
+                       'code', 'input_plan', 'access_receipt_ref'}
+            or native['schema'] != 'qcl-negf.aiida-native-execution.v1'
+            or native['execution_id'] != spec['selection']['execution_id']):
+        raise ValueError('original native execution input differs')
+    plan, plan_raw = small_json(root / 'plan.json', MIB, budget=budget)
+    graph, graph_raw = small_json(root / 'source-graph.json', MIB, budget=budget)
+    if (_metadata_weight((native, native_raw, plan, plan_raw, graph, graph_raw, arguments, spec)) > MIB):
+        raise ValueError('combined native input metadata allowance exhausted')
+    _bounded_objects((native, plan, graph), 4096)
+    scientific_plan(plan)
+    schema_validator('scientific-plan.schema.json').validate(plan)
+    graph_validator = schema_validator('model-help.schema.json')
+    graph_validator.evolve(schema={'$ref': '#/$defs/SourceGraph', '$defs': graph_validator.schema['$defs']}).validate(graph)
+    if (plan['fingerprint'] != spec['selection']['plan_fingerprint']
+            or len(plan_raw) != spec['plan']['bytes'] or digest(plan_raw) != spec['plan']['sha256']
+            or len({row['path'] for row in graph['components']}) != len(graph['components'])):
+        raise ValueError('original native plan/source graph differs')
+    uuid = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
+    def require_uuid(value):
+        if type(value) is not str or uuid.fullmatch(value) is None:
+            raise ValueError('canonical original native UUID required')
+    def opaque(value):
+        if (type(value) is not str or not 1 <= len(value) <= 256 or value.startswith('/')
+                or any(ord(c) < 32 or ord(c) == 127 for c in value)):
+            raise ValueError('bounded original native opaque reference required')
+    require_uuid(native['request_id']); require_uuid(spec['selection']['calcjob_uuid'])
+    opaque(native['access_receipt_ref'])
+    for key, raw in (('input_plan', plan_raw), ('source_graph', graph_raw)):
+        claim = native[key]
+        if (type(claim) is not dict or set(claim) != {'node_uuid', 'bytes', 'sha256'}
+                or claim['bytes'] != str(len(raw)) or claim['sha256'] != digest(raw)):
+            raise ValueError('original native input whole byte claim differs')
+        require_uuid(claim['node_uuid'])
+    storage = native['storage']; code = native['code']
+    if (type(storage) is not dict or set(storage) != {'namespace_id', 'storage_identity', 'relative_execution_root',
+            'computer_uuid', 'execution_binding_uuid', 'retention_policy_id', 'retention_owner_id', 'hold_ref', 'access_binding_ref'}
+            or type(code) is not dict or set(code) != {'code_uuid', 'computer_uuid', 'solver_executable', 'release_id', 'build_receipt_ref'}):
+        raise ValueError('original native storage/code keys differ')
+    for value in (storage['computer_uuid'], storage['execution_binding_uuid'], code['computer_uuid'], code['code_uuid']):
+        require_uuid(value)
+    atom = schema_validator('result-common.schema.json')
+    for value in (storage['namespace_id'], code['release_id']):
+        atom.evolve(schema={'$ref': '#/$defs/Id', '$defs': atom.schema['$defs']}).validate(value)
+    for value in (storage['storage_identity'], storage['retention_policy_id'], storage['retention_owner_id'],
+                  storage['hold_ref'], storage['access_binding_ref'], code['build_receipt_ref']):
+        opaque(value)
+    if (code['computer_uuid'] != storage['computer_uuid'] or type(code['solver_executable']) is not str
+            or re.fullmatch(r'/nix/store/[A-Za-z0-9][A-Za-z0-9+._?-]*/bin/qcl-negf', code['solver_executable']) is None):
+        raise ValueError('original native code/storage declaration differs')
+    relative_path(storage['relative_execution_root'])
+    output = Path(arguments[2]); suffix = Path(storage['relative_execution_root']).parts
+    if (not output.is_absolute() or str(output) != os.path.abspath(output)
+            or output.parts[-len(suffix):] != suffix or output.is_relative_to(root) or root.is_relative_to(output)):
+        raise ValueError('original native output argv/storage suffix differs')
+    # The absolute trusted jobs_root and actual InstalledCode/wrapper origins
+    # remain controller/Platform gates; suffix/JSON/token are not authority.
+    transport = dict(selection=deepcopy(spec['selection']), frozen_plan=dict(
+        path='plan.json', bytes=str(len(plan_raw)), sha256=digest(plan_raw),
+        schema=plan['schema'], media_type='application/json'))
+    return output, transport
+
+
+def _locator(root, spec, *, budget=None, native_output=None):
     value, _ = small_json(root / "capture-source.json", 16384, budget=budget)
     if (
         not isinstance(value, dict)
@@ -715,8 +804,10 @@ def _locator(root, spec, *, budget=None):
     if str(actual) != os.path.abspath(actual):
         raise ValueError("actual source root is not canonical")
     if value["mode"] in ("direct", "staged"):
-        if actual != root / "result":
+        if actual != (root / "result" if native_output is None else native_output):
             raise ValueError("direct/staged locator outside selected job result")
+    elif native_output is not None:
+        raise ValueError('native scratch capture is not qualified')
     elif (
         spec["scratch_root"] is None
         or not actual.is_relative_to(Path(spec["scratch_root"]))
@@ -755,7 +846,8 @@ def _final_points(actual, selection, known, *, budget=None):
     return points,[p['selected_state'] for p in points if p['selected_state'] is not None]
 
 
-def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetry_selection_factory=None):
+def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetry_selection_factory=None,
+            native_execution_path=None, solver_arguments=()):
     """Only this disposable process imports Arrow or touches job/scratch/NFS files."""
     budget = ObserverIO(16384)
     try:
@@ -764,7 +856,13 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         os.close(control_fd)
         return 2 # No traceback/inherited-log write before capture credit.
     selection = spec["selection"]
+    native_output = None
     try:
+        if native_execution_path is not None:
+            if transport is not None or telemetry_selection_factory is not None:
+                raise ValueError('native ingress cannot accept caller transport/factory assertions')
+            native_output, transport = _native_capture_inputs(root, spec, native_execution_path,
+                solver_arguments, budget=budget)
         if telemetry_selection_factory is not None and not callable(telemetry_selection_factory):
             raise ValueError('trusted programmatic telemetry input factory required')
         if transport is not None:
@@ -795,6 +893,10 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         reserve_bytes=credits["reserve_bytes"],
         budget=budget,
     )
+    if native_output is not None:
+        # Existing scalar descriptors are workdir-relative. Do not invent an
+        # external-root alias or copy route before its owning access contract.
+        publisher.disabled = True
     writer = None
     failure = None
     closed = None
@@ -893,9 +995,10 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         else:missing_sources.add(point['point_id'])
         publisher.publish(actual,point,mode=mode,terminal=terminal,io_remaining=budget.remaining)
 
-    def bind_selected(actual,point,close_ref,capture_status):
+    def bind_selected(actual,point,close_context,capture_status):
         from .state import StateReader,ResultReadLimits,_IOBudget
         from .performance_views import TelemetrySelection
+        close_ref, phase_refs, resume_refs = close_context
         if point['selected_state'] is None:raise ValueError('selected native state required for binding')
         source=actual if point['artifact_root']=='.' else beneath(actual,point['artifact_root'])
         io=_IOBudget(min(budget.remaining,4*MIB));reader=StateReader.__new__(StateReader);charged=0
@@ -908,6 +1011,22 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
             budget.account(io.bytes_read_total-charged);charged=io.bytes_read_total
             if not isinstance(selected,TelemetrySelection) or selected.expected_transport!=transport or selected.commit_ref!=close_ref or selected.artifact_root!=writer.root:
                 raise ValueError('factory selection differs from exact close/initial transport/root')
+            inputs = selected.document()
+            from .state import _metadata_weight
+            if (_metadata_weight((inputs, phase_refs, resume_refs)) +
+                    2*_metadata_weight((phase_refs, resume_refs))) > MIB:
+                raise ValueError('combined terminal close context metadata allowance exhausted')
+            for field, extra, key in (('phase_context_refs', phase_refs, 'publication_ref'),
+                                      ('resume_context_refs', resume_refs, 'commit_ref')):
+                rows = inputs[field]
+                for row in extra:
+                    matches = [existing for existing in rows if existing[key]['path'] == row[key]['path']]
+                    if matches and any(existing != row for existing in matches):
+                        raise ValueError('factory context conflicts with exact public close snapshot')
+                    if not matches:
+                        rows.append(deepcopy(row))
+            selected = TelemetrySelection(selected.artifact_root,
+                canonical_plan_root=selected.canonical_plan_root, **inputs)
             name='performance-binding.json' if len(last_points)==1 else 'performance-bindings/'+digest(json_bytes(point['selected_state']))+'.json'
             make_binding(reader,telemetry=selected,destination=writer.root/name,capture_status=capture_status,budget=budget)
             charged=io.bytes_read_total  # make_binding already charged its exact delta
@@ -931,7 +1050,7 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 raise ValueError("capture unavailable: no credit locator before terminal")
             except BlockingIOError:
                 time.sleep(2)
-        _locator(root, spec, budget=budget)  # Refuse corrupt/foreign before ANY output.
+        _locator(root, spec, budget=budget, native_output=native_output)  # Refuse foreign before ANY output.
         from .telemetry import TelemetryWriter
         admit()
         writer = writer_call(TelemetryWriter,
@@ -967,7 +1086,7 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                     writer_call(writer.flush_due)
                     time.sleep(2)
                     continue
-                locator, actual = _locator(root, spec, budget=budget)
+                locator, actual = _locator(root, spec, budget=budget, native_output=native_output)
                 if locator["epoch"] < previous_epoch:
                     raise ValueError("actual source epoch reversed")
                 previous_epoch = locator["epoch"]
@@ -994,7 +1113,8 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 admit()
                 if telemetry_selection_factory is None or transport is None:
                     writer_call(writer.record_control,dict(event='source_binding_missing',reason='explicit_transport_or_factory_missing'))
-                close_ref, _, _ = writer_call(writer.close_context)
+                close_context = writer_call(writer.close_context)
+                close_ref, _, _ = close_context
                 closed = writer.root / close_ref['path']
                 if telemetry_selection_factory is None or transport is None:
                     raise ValueError('source_binding_missing: explicit transport/factory and production ingress policy required')
@@ -1004,7 +1124,7 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                     scalar_live_route=locator['mode'] if not publisher.disabled else 'unavailable',
                     scalar_live_reason='live_publication_incomplete' if publisher.disabled else None,
                     performance_status='available' if complete else 'incomplete',reason=None if complete else 'phase_sources_or_tail_incomplete')
-                for point in last_points:bind_selected(last_actual,point,close_ref,status)
+                for point in last_points:bind_selected(last_actual,point,close_context,status)
                 break
             time.sleep(2)
     except Exception as error:
@@ -1022,11 +1142,13 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
     return 0 if failure is None else 2
 
 
-def capture_run(spec_path, solver, arguments):
+def capture_run(spec_path, solver, arguments, *, native_execution_path=None):
     spec_path = str(Path(spec_path).absolute())
+    arguments = tuple(arguments)
+    native_path = None if native_execution_path is None else str(Path(native_execution_path).absolute())
 
     def factory(pid, start, fd):
-        return [
+        command = [
             sys.executable,
             "-m",
             "qcl_negf_results.capture",
@@ -1036,13 +1158,25 @@ def capture_run(spec_path, solver, arguments):
             str(start),
             str(fd),
         ]
+        if native_path is not None:
+            command.extend(['--native-execution', native_path, '--', *arguments])
+        return command
 
     return supervise([solver, *arguments], observer_factory=factory)
 
 
 if __name__ == "__main__":
-    if len(sys.argv) != 6 or sys.argv[1] != "observe":
+    if len(sys.argv) < 6 or sys.argv[1] != "observe":
         raise SystemExit(2)
+    native_path = None; arguments = ()
+    if len(sys.argv) != 6:
+        if len(sys.argv) < 10 or sys.argv[6] != '--native-execution' or sys.argv[8] != '--':
+            raise SystemExit(2)
+        native_path, arguments = sys.argv[7], tuple(sys.argv[9:])
+    # -m defines this file as __main__. Dispatch through the canonical module
+    # so producer batches and the strict writer share the same PhaseBatch class.
+    from .capture import observe as canonical_observe
     raise SystemExit(
-        observe(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]))
+        canonical_observe(sys.argv[2], int(sys.argv[3]), int(sys.argv[4]), int(sys.argv[5]),
+                native_execution_path=native_path, solver_arguments=arguments)
     )
