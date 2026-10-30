@@ -19,7 +19,9 @@ read_performance_context(reader: StateReader, *,
     -> tuple[bytes, tuple[tuple[str, dict, bytes], ...]]
 writer.close_context() -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]
 observe(spec_path, pid, start_ticks, control_fd, *, transport=None,
-    telemetry_selection_factory=None) -> int
+    telemetry_selection_factory=None, native_execution_path=None,
+    solver_arguments=()) -> int
+capture_run(spec_path, solver, arguments, *, native_execution_path=None) -> int
 ```
 
 `TelemetrySelection` detaches bounded caller INPUT assertions and complete five-field FileRefs. It
@@ -31,7 +33,7 @@ nor an arbitrary dictionary supplies provenance authority. Actual immutable AiiD
 association and the paired Runner/launcher operational admission policy are independent mandatory
 production gates.
 
-The factory receives the selected reader and exact closed commit FileRef. Its selection must match
+The programmatic factory receives the selected reader and exact closed commit FileRef. Its selection must match
 the initial explicit Transport, exact close and technical root. Transport uses the full public
 schema before observer output. `None` means unassociated: CLI capture cannot fabricate the transport
 or a canonical plan from the display fingerprint. It retains capture-error evidence and returns 2
@@ -60,6 +62,58 @@ lost acknowledgements retain the original pending transaction for reconciliation
 newest lookup selects this close. The observer uses this public returned commit for terminal
 binding; its existing same-owner rotation helpers retain their previous role.
 
+Terminal binding attaches the additional phase/resume references inside Results to the factory's
+public detached selection. The callback remains `(reader, close_ref)`. Equal rows deduplicate;
+conflicting references for an original publication/commit path fail before the binding is written.
+The detached combined metadata and public selection row limits still apply. This retains the exact
+old-completion/resume context for `read_performance_context`; it never reads private writer fields
+or discovers another close through a pointer.
+
+## Fixed native ingress
+
+The optional native CLI form is literal argv, without a shell:
+
+```text
+qcl-negf-results capture-run --spec capture-spec.json --solver INTERNAL_SOLVER \
+  --native-execution native-execution.json -- \
+  run-plan plan.json ORIGINAL_ABSOLUTE_OUTPUT --execution-id E --source-graph source-graph.json
+```
+
+The immutable Runner wrapper owns its paired native marker branch; this Results increment alone
+does not activate an AiiDA script or qualify the installed wrapper. The supervisor starts exactly
+one solver before its observer. It forwards the native path and the same original solver arguments
+to the disposable child. Only that child reads the original plan/source-graph/native-execution
+files. It never imports a module string or deserializes a callback. Ordinary inputs remain optional
+and unchanged; mixing native ingress with caller `transport` or a programmatic factory is refused
+before observer output.
+
+The fixed parser checks bounded original raw input claims, the public scientific plan and
+SourceGraph grammar, exact run-plan arguments, execution/full fingerprint, and the absolute output
+suffix declared by `relative_execution_root`. Only direct/staged locator roots equal to that exact
+output are accepted. Native `--attempt`, duplicate/additional options, native scratch, rewritten raw
+inputs and foreign locators are refused. Transport attempt comes from the original capture spec;
+the native point attempt and source/route epochs remain distinct. All original input reads and
+native validation share the existing observer I/O credit, 1 MiB aggregate native metadata and
+4096-object limits. This adds no lifetime grant or credit reset.
+
+These checks establish input assertions. They do not authenticate the absolute trusted jobs-root
+prefix, actual InstalledCode/release/internal-wrapper origin, original source creator or current
+storage access. Those remain controller/Platform gates. In particular the existing native input
+and manifest `Invocation{source_epoch}` do not supply original selected source transport. Native
+ingress therefore retains phase/resource raw and a `source_binding_missing` control event, closes
+the technical transaction and returns observer status 2 without a fabricated selected binding.
+It does not infer a produced/borrowed association from a point counter, source relation or graph.
+An owning AiiDA/Platform contract must supply that missing original operand before native selected
+performance can become available; this port does not change their public APIs.
+
+The existing scalar descriptor has a workdir-relative artifact root. External native canonical
+roots keep that scalar route unavailable, rather than publish an escaping path or invent a copy
+policy. Raw telemetry is retained; scientific source files and the solver exit/signal/reap behavior
+are unchanged. This is SOURCE/L ingress support, not native qualification, an offline raw carrier,
+retention policy, long-run acceptance or a numerical experiment.
+
+## Selected raw contexts
+
 `read_performance_context()` uses the same loader, public current-delta validator and operation
 guards as summary reading. It returns serialized **input assertions** followed by exact consumed
 original file bytes. The assertion bytes have the existing `TelemetrySelection.document()` grammar;
@@ -83,8 +137,9 @@ session cap 16; callers can only tighten them through `PerformanceLimits`. Prosp
 storage is debited before copying mutable refs. Source guards complete before any return escapes;
 late replacement, missing context, cancellation or exhausted credit returns no partial snapshot.
 Operation counters remain public on the reader; the owning caller accounts aggregate credit across
-reader construction and repeated operations. These APIs add no lifetime renewal, retention pruning,
-native CLI ingress or AiiDA repository carrier. Those remain separate required production work.
+reader construction and repeated operations. These reader/writer APIs add no lifetime renewal,
+retention pruning, native origin qualification or AiiDA repository carrier. Those remain separate
+required production work.
 
 Performance metadata is bounded by 1 MiB, delivered I/O by 4 MiB, response JSON by 2 MiB, objects by
 4096 and supplied context pages by 16; limits only tighten. The response reports execution-attempt
