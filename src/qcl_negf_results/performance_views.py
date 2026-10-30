@@ -34,7 +34,7 @@ class PerformanceLimits:
 
     def __post_init__(self):
         if any(
-            not integer(v, 1, self.__dataclass_fields__[k].default)
+            not integer(v, 1, 16384 if k=='maximum_objects' else self.__dataclass_fields__[k].default)
             for k, v in vars(self).items()
         ):
             raise ValueError(
@@ -63,7 +63,7 @@ def _selection(value):
 
 
 def _bounded_objects(roots, maximum_objects):
-    if not integer(maximum_objects, 1, 4096):
+    if not integer(maximum_objects, 1, 16384):
         raise ValueError("maximum_objects may only tighten the public bound")
     pending = list(roots)
     count = 0
@@ -187,6 +187,14 @@ def _read_reference(reader,root,reference,limits,bindings):
 
 
 def _load_telemetry(reader,telemetry,limits,bindings,*,creating_binding=False,retain_raw=False):
+    if isinstance(telemetry,TelemetrySelection):
+        selected_ref=telemetry.commit_ref
+        if not isinstance(selected_ref,dict):fail('invalid_input','explicit technical FileRef object required')
+        schema=selected_ref.get('schema')
+        if schema=='qcl-negf.telemetry-commit.v2':
+            return _load_telemetry2(reader,telemetry,limits,bindings,creating_binding=creating_binding,retain_raw=retain_raw)
+        if schema!='qcl-negf.telemetry-commit.v1':fail('unsupported_format','unsupported explicit technical commit reference')
+    if limits.maximum_objects>4096:raise ValueError('v1 effective maximum_objects remains4096')
     if not isinstance(reader,StateReader) or not isinstance(telemetry,TelemetrySelection):
         raise TypeError('explicit StateReader and TelemetrySelection required')
     data=telemetry.document();root=telemetry.artifact_root
@@ -317,7 +325,7 @@ def read_performance_summary(reader: StateReader,*,telemetry: TelemetrySelection
             units=dict(cpu='seconds',covered_capacity='logical_core_seconds',memory='bytes'),
             integrity_scope='selected_bytes_and_supplied_context_relations',
             integrity=dict(original_selected_metadata_bytes=True,commit_delta_contexts='public_validator_exact_current_delta',
-                provenance_origin='caller_assertions; actual P07/AiiDA INPUT_CREATE verification separate',catalogs_or_parquet_opened=False),
+                provenance_origin='caller_assertions; actual P07/AiiDA INPUT_CREATE verification separate',catalogs_or_parquet_opened=loaded.get('technical_version')==2),
             io_counters=reader.io_counters)
         answer=_exact(answer)
         if len(json_bytes(answer))>limits.maximum_json_bytes:fail('budget_exceeded','performance response exceeds cap')
@@ -363,3 +371,134 @@ def read_performance_context(reader: StateReader, *, telemetry: TelemetrySelecti
             fail('budget_exceeded','combined raw context return exceeds metadata allowance')
         _check_bindings(bindings)
     return selection_raw,files
+
+
+def _load_telemetry2(reader,telemetry,limits,bindings,*,creating_binding=False,retain_raw=False):
+    if not isinstance(reader,StateReader) or not isinstance(telemetry,TelemetrySelection):
+        raise TypeError('explicit StateReader and TelemetrySelection required')
+    data=telemetry.document();root=telemetry.artifact_root
+    references=[];cache={};raw_contexts=[];raw_paths={};payloads={}
+    common=schema_validator('result-common.schema.json')
+    file_validator=common.evolve(schema={'$ref':'#/$defs/FileRef','$defs':common.schema['$defs']})
+    def read(scope,ref,logical_scope='technical'):
+        _schema_check(file_validator,ref)
+        if ref.get('schema')=='qcl-negf.telemetry-catalog.v3' and int(ref['bytes'])>65536:
+            fail('budget_exceeded','retained catalog raw ceiling exceeded before open')
+        key=(str(Path(scope).absolute()),json_bytes(ref))
+        rowkey=(logical_scope,ref['path'])
+        if retain_raw and rowkey in raw_paths and raw_paths[rowkey]!=key[1]:
+            fail('corrupt_result','conflicting full references for one retained context path')
+        if key not in cache:
+            retained=_metadata_weight((telemetry._raw,data,cache,bindings,references,raw_contexts,raw_paths))
+            reserve=(2*_metadata_weight(ref)+512) if retain_raw else 0
+            incoming = int(ref['bytes']) if ref['media_type']=='application/json' or retain_raw else 65536
+            if incoming+reserve>limits.maximum_metadata_bytes-retained:
+                fail('budget_exceeded','aggregate metadata credit exhausted before selected read')
+            if ref['media_type']=='application/json':
+                value=_read_reference(reader,scope,ref,limits,bindings)
+                if value[0].get('schema')!=ref['schema']:
+                    fail('unsupported_format','retained metadata content/reference schema differs')
+            else:
+                from .catalog import _retained_payload
+                descriptor=payloads.get(json_bytes(ref))
+                if descriptor is None:fail('corrupt_result','payload absent from authenticated retained catalog')
+                value=_retained_payload(scope,descriptor,budget=reader._budget,
+                    maximum_metadata_bytes=limits.maximum_metadata_bytes-retained,
+                    bindings=bindings,retain_raw=retain_raw)
+            # Every selected decoded cache member spends this operation's
+            # object credit before validation/use, including opaque after leaves.
+            _bounded_objects((data,cache,value),limits.maximum_objects)
+            if _metadata_weight((telemetry._raw,data,cache,bindings,references,key,value,raw_contexts,raw_paths))>limits.maximum_metadata_bytes:
+                fail('budget_exceeded','decoded selected metadata exceeds combined allowance')
+            cache[key]=value
+            references.append((Path(scope),ref))
+        if retain_raw and rowkey not in raw_paths:
+            if (_metadata_weight((telemetry._raw,data,cache,bindings,references,raw_contexts,raw_paths))+
+                    2*_metadata_weight((logical_scope,ref,cache[key][1]))+512)>limits.maximum_metadata_bytes:
+                fail('budget_exceeded','retained raw context allowance exceeded before staging')
+            raw_contexts.append((logical_scope,ref,cache[key][1]))
+            raw_paths[rowkey]=key[1]
+        return cache[key]
+    from qcl_negf_contracts.telemetry import validate_telemetry_catalog
+    if retain_raw:
+        manifest,_=read(reader.root,reader.source.state['manifest'],'scientific')
+        if encode(manifest)!=encode(reader._manifest):fail('source_changed','retained scientific manifest differs from selected reader')
+    commit,commit_raw=read(root,data['commit_ref'])
+    if commit.get('schema')!='qcl-negf.telemetry-commit.v2':fail('unsupported_format','explicit retained commit2 required')
+    validator=schema_validator('telemetry-envelope.schema.json')
+    _schema_check(validator.evolve(schema={'$ref':'#/$defs/TelemetryCommit2','$defs':validator.schema['$defs']}),commit)
+    summary,summary_raw=read(root,commit['summary']);validate_telemetry_summary(summary)
+    for key in ('session','transport','generation','closed','source_cursors'):
+        if encode(dict(value=commit[key]))!=encode(dict(value=summary[key])):fail('identity_mismatch','retained commit/summary transaction differs')
+    catalog,_=read(root,commit['catalog']);validate_telemetry_catalog(catalog,expected_transport=data['expected_transport'])
+    if int(commit['catalog']['bytes'])>65536:fail('budget_exceeded','retained catalog raw bytes exceed64KiB')
+    previous=previous_summary=previous_catalog=None
+    if commit['previous'] is not None:
+        pair=commit['previous'];previous,_=read(root,pair['commit']);previous_summary,_=read(root,pair['summary'])
+        if previous.get('schema')!='qcl-negf.telemetry-commit.v2':fail('unsupported_format','mixed previous technical version')
+        _schema_check(validator.evolve(schema={'$ref':'#/$defs/TelemetryCommit2','$defs':validator.schema['$defs']}),previous)
+        previous_catalog,_=read(root,previous['catalog'])
+        validate_telemetry_catalog(previous_catalog,expected_transport=data['expected_transport'])
+    phase_refs=commit['contexts']['phase_context_refs']
+    expected_resumes=[dict(commit_ref=r['commit'],summary_ref=r['summary']) for r in commit['contexts']['resume_context_refs']]
+    if (data['phase_context_refs'] and data['phase_context_refs']!=phase_refs
+            or data['resume_context_refs'] and data['resume_context_refs']!=expected_resumes):
+        fail('corrupt_result','external contexts differ from exact committed retained inventory')
+    contexts=[]
+    for row in phase_refs:
+        publication,_=read(root,row['retained_publication_ref']);segment,_=read(root,row['retained_segment_ref'])
+        contexts.append(dict(publication=publication,publication_ref=row['publication_ref'],segment=segment,segment_ref=row['segment_ref']))
+    resume=[]
+    for pair in commit['contexts']['resume_context_refs']:
+        c,_=read(root,pair['commit']);ss,_=read(root,pair['summary'])
+        resume.append(dict(commit=c,commit_ref=pair['commit'],summary=ss,summary_ref=pair['summary']))
+    kwargs={} if previous is None else dict(previous=previous,previous_ref=commit['previous']['commit'],
+        previous_summary=previous_summary,previous_summary_ref=commit['previous']['summary'],previous_catalog=previous_catalog)
+    validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],catalog=catalog,
+        phase_contexts=contexts,resume_contexts=resume,**kwargs)
+    # Current after membership is complete. Previous catalog leaves are opaque
+    # descriptors: only their whole bytes, never transitive physical members.
+    for descriptor in catalog['artifacts']:
+        reference=descriptor['ref']
+        if reference['media_type']=='application/vnd.apache.parquet':payloads[json_bytes(reference)]=descriptor
+        value,_=read(root,reference)
+        if reference['media_type']=='application/json':
+            from .catalog import _retained_metadata
+            _retained_metadata(value,reference,expected_transport=data['expected_transport'])
+    source_binding,source_raw=read(root,data['source_binding_ref'])
+    plan,plan_raw=read(telemetry.canonical_plan_root,data['canonical_plan_ref'],'canonical_plan')
+    _schema_check(schema_validator('scientific-plan.schema.json'),plan)
+    context=dict(expected_state=reader.source.state,expected_transport=data['expected_transport'],manifest=reader._manifest,
+        manifest_ref=reader.source.state['manifest'],source_transport=data['source_transport'],canonical_plan_ref=data['canonical_plan_ref'],
+        expected_producer_provenance=data['expected_producer_provenance'])
+    validate_telemetry_source_binding(source_binding,**context)
+    if commit['transport']!=data['expected_transport']:fail('identity_mismatch','technical transport differs from caller context')
+    binding=None
+    if commit['closed'] and data['binding_ref'] is None and not creating_binding:
+        fail('selection_required','closed selected telemetry requires exact retained close binding')
+    if data['binding_ref'] is not None:
+        binding,_=read(root,data['binding_ref'])
+        validate_telemetry_binding(binding,commit=commit,commit_ref=data['commit_ref'],summary=summary,summary_ref=commit['summary'],
+            source_binding=source_binding,source_binding_ref=data['source_binding_ref'],**context)
+    object_roots=(data,commit,summary,source_binding,plan,binding,previous,previous_summary,contexts,resume,catalog,previous_catalog,cache)
+    if retain_raw:
+        # One combined object credit, including the manifest and prospective
+        # detached FileRefs/containers, not a fresh allowance for the return.
+        object_roots+=(manifest,telemetry._raw,tuple(raw_contexts))
+        sessions={json_bytes(row['session']) for row in (commit,previous,*(c['commit'] for c in resume)) if row is not None}
+        if len(sessions)>limits.maximum_sessions:
+            fail('budget_exceeded','retained context session allowance exceeded')
+    retained_objects=_bounded_objects(object_roots,limits.maximum_objects)
+    if _metadata_weight((data,cache,bindings,raw_contexts,raw_paths))>limits.maximum_metadata_bytes:
+        fail('budget_exceeded','aggregate selected technical metadata exceeds allowance')
+    if data['observed_unix'] is not None and data['observed_unix']<commit['published_unix']:
+        fail('invalid_input','explicit observation precedes selected publication')
+    result=dict(commit=commit,commit_raw=commit_raw,summary=summary,summary_raw=summary_raw,source_binding=source_binding,
+        source_binding_raw=source_raw,plan=plan,plan_raw=plan_raw,binding=binding,input=data,references=references,
+        technical_version=2,catalog=catalog,previous_catalog=previous_catalog)
+    if retain_raw:
+        # Keep the actual consumed decoded/raw context alive for combined return
+        # accounting; this is internal, never a second public validator branch.
+        result.update(raw_contexts=raw_contexts,working_context=(cache,bindings,raw_paths,previous,previous_summary,contexts,resume,catalog,previous_catalog),
+            retained_objects=retained_objects)
+    return result

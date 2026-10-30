@@ -253,6 +253,7 @@ def _manifest_closure(manifest: dict[str, Any], index: dict[str, Any]) -> None:
         _schema_check(common.evolve(schema={'$ref': '#/$defs/StateRef', '$defs': common.schema['$defs']}), state)
         if state['manifest']['path'] not in mapping or mapping[state['manifest']['path']]['reference'] != state['manifest']:
             raise ContractError('source manifest locator missing or changed', 'corrupt_result')
+        _retained_v2_cutoff(manifest)
 
 
 def _receipt_closure(receipt: dict[str, Any] | None, index: dict[str, Any]) -> None:
@@ -263,14 +264,14 @@ def _receipt_closure(receipt: dict[str, Any] | None, index: dict[str, Any]) -> N
         raise ContractError("receipt and archive identify different snapshots or profiles", "corrupt_result")
 
 
-def _read_archive(path: Path, root: Path | None, report: Callable[..., None], *, manifest_out=None) -> dict[str, Any]:
+def _read_archive(path: Path, root: Path | None, report: Callable[..., None], *, manifest_out=None, technical_out=None) -> dict[str, Any]:
     try:
-        return _read_archive_contents(path, root, report, manifest_out=manifest_out)
+        return _read_archive_contents(path, root, report, manifest_out=manifest_out, technical_out=technical_out)
     except (tarfile.TarError, lzma.LZMAError, EOFError) as error:
         raise ContractError('invalid complete archive stream: ' + str(error), 'corrupt_result') from error
 
 
-def _read_archive_contents(path: Path, root: Path | None, report: Callable[..., None], *, manifest_out=None) -> dict[str, Any]:
+def _read_archive_contents(path: Path, root: Path | None, report: Callable[..., None], *, manifest_out=None, technical_out=None) -> dict[str, Any]:
     with tarfile.open(path, "r:xz") as archive:
         first = archive.next()
         if first is not None and first.name == 'part.json':
@@ -330,6 +331,9 @@ def _read_archive_contents(path: Path, root: Path | None, report: Callable[..., 
         while archive.fileobj.read(BLOCK):
             pass  # Force XZ footer and checksum verification beyond tar padding.
         _manifest_closure(manifest, index)
+        technical = _verify_retained_v2(manifest, index,
+            lambda name: archive.extractfile(name) if root is None else (root / relative_path(name)).open('rb'))
+        if technical_out is not None and technical is not None: technical_out.update(technical)
         # Old hash-valid exports may contain HDF5 values stored outside their
         # object. Verify ownership independently before claiming closure or
         # publishing a restored tree. Tar members provide seekable file objects;
@@ -456,9 +460,9 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
                 raise ContractError("archive checksum differs from receipt", "corrupt_result")
         if path.stat().st_size != receipt["bytes"]:
             raise ContractError("archive size differs from receipt", "corrupt_result")
-    manifest = {}
+    manifest = {}; technical = {}
     if destination is None:
-        index = _read_archive(path, None, _quiet, manifest_out=manifest)
+        index = _read_archive(path, None, _quiet, manifest_out=manifest, technical_out=technical)
         _receipt_closure(receipt, index)
     else:
         destination = Path(destination)
@@ -468,7 +472,7 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
         with tempfile.TemporaryDirectory(prefix=".qcl-receive-", dir=destination.parent) as temporary:
             root = Path(temporary) / "restored"
             root.mkdir()
-            index = _read_archive(path, root, _quiet)
+            index = _read_archive(path, root, _quiet, technical_out=technical)
             _receipt_closure(receipt, index)
             manifest = _json_object((root / 'manifest.json').read_bytes())
             if index['profile'] == 'full-state':
@@ -482,7 +486,8 @@ def receive(paths: Sequence[Path], destination: Path | None = None, *,
             'profile': index['profile'],
             'capabilities': manifest.get('capabilities', []),
             'source_root': str(destination / 'source') if destination is not None and index['profile'] == 'full-state' else None,
-            'source_state': manifest['source_state'] if manifest and index['profile'] == 'full-state' else None}
+            'source_state': manifest['source_state'] if manifest and index['profile'] == 'full-state' else None,
+            **({'technical_verification': technical} if technical else {})}
 
 
 def main() -> None:
@@ -499,6 +504,207 @@ def main() -> None:
         print(json.dumps(receive(args.archives, args.destination, receipt=receipt), indent=2))
     except (ContractError, OSError, ValueError, EOFError, tarfile.TarError, lzma.LZMAError) as error:
         parser.exit(2, str(error) + "\n")
+
+
+
+def _retained_v2_cutoff(manifest):
+    """Classify the explicit new boundary; never reinterpret it as legacy v1."""
+    cutoff = manifest.get('cutoff')
+    records = [r for r in _rows(manifest.get('records')) if r.get('technical') is True]
+    schema = cutoff.get('commit', {}).get('schema') if isinstance(cutoff, dict) else None
+    declared = (schema == 'qcl-negf.telemetry-commit.v2' or
+        isinstance(cutoff, dict) and 'technical_contract' in cutoff or
+        any('technical_contract' in r for r in records))
+    if schema is not None and schema not in ('qcl-negf.telemetry-commit.v1', 'qcl-negf.telemetry-commit.v2'):
+        raise ContractError('unsupported explicit technical cutoff version', 'unsupported_format')
+    if not declared: return None
+    if schema != 'qcl-negf.telemetry-commit.v2' or len(records) != 1:
+        raise ContractError('retained technical cutoff requires exactly one v2 record', 'corrupt_result')
+    record = records[0]
+    expected = dict(technical_contract='qcl-negf.telemetry-retained.v2', scope='retained_technical_window',
+                   cumulative_scope='enclosing_transport_since_v2_genesis')
+    for key, value in expected.items():
+        if cutoff.get(key) != value or record.get(key) != value:
+            raise ContractError('retained technical record/cutoff scope differs', 'corrupt_result')
+    if (cutoff.get('prior_capture') not in ('none', 'unimported')
+            or record.get('prior_capture') != cutoff['prior_capture']
+            or record.get('catalog') != cutoff.get('catalog')
+            or record.get('source_commit_sha256') != cutoff['commit']['sha256']
+            or record.get('source_state') != manifest['source_state']
+            or record.get('omitted_by_policy') != []):
+        raise ContractError('retained technical selection/capture inventory differs', 'corrupt_result')
+    return cutoff
+
+
+def _verify_retained_v2(manifest, index, open_object):
+    """Verify contained original v2 bytes/relations, without original source roots.
+
+    This is declared source consistency, never authentication of AiiDA origin,
+    a read lease, active native access, or scientific acceptance.
+    """
+    cutoff = _retained_v2_cutoff(manifest)
+    if cutoff is None: return None
+    from qcl_negf_contracts import schema_validator
+    from qcl_negf_contracts.results import validate_manifest
+    from qcl_negf_contracts.telemetry import (validate_telemetry_commit, validate_telemetry_catalog,
+        validate_telemetry_source_binding, validate_telemetry_binding)
+    from .state import _IOBudget, _BudgetStream, _metadata_weight, _schema_check
+    from .catalog import _retained_parquet_header
+    from .performance_views import _bounded_objects
+    common = schema_validator('result-common.schema.json')
+    reference_validator = common.evolve(schema={'$ref':'#/$defs/FileRef', '$defs':common.schema['$defs']})
+    technical = {(r['scope'], r['reference']['path']):r for r in manifest['technical_locator']}
+    scientific = {r['reference']['path']:r for r in manifest['source_locator']}
+    cache = {}; used = set(); payloads = {}; budget = _IOBudget(4*1024*1024)
+    def read(scope, ref, *, promise=True):
+        _schema_check(reference_validator, ref); relative_path(ref['path'])
+        row = scientific.get(ref['path']) if scope == 'scientific' else technical.get((scope, ref['path']))
+        if row is None or row['reference'] != ref:
+            raise ContractError('missing or conflicting exact retained locator', 'corrupt_result')
+        key = (scope, ref['path'])
+        if scope != 'scientific' and promise: used.add(key)
+        if key in cache: return cache[key]
+        size = int(ref['bytes']); budget.require(size)
+        retained = _metadata_weight((technical, scientific, cache, used, payloads))
+        if ref['schema'] == 'qcl-negf.telemetry-catalog.v3' and size > 65536:
+            raise ContractError('retained catalog raw ceiling exceeded before open', 'budget_exceeded')
+        if ref['media_type'] == 'application/json' and 2*size+retained > 1024*1024:
+            raise ContractError('retained archive metadata credit exhausted before open', 'budget_exceeded')
+        with open_object(row['object']) as raw:
+            stream = _BudgetStream(raw, budget)
+            if stream.seek(0, 2) != size:
+                raise ContractError('retained original object size differs', 'corrupt_result')
+            stream.seek(0)
+            if ref['media_type'] == 'application/json':
+                data = stream.read(size)
+                if len(data) != size or hashlib.sha256(data).hexdigest() != ref['sha256']:
+                    raise ContractError('retained original metadata bytes differ', 'corrupt_result')
+                value = decode_json(data, 'retained archive metadata')
+                if value.get('schema') != ref['schema']:
+                    raise ContractError('retained metadata content/reference version differs', 'unsupported_format')
+                cache[key] = value, data
+            else:
+                descriptor = payloads.get(json_bytes(ref))
+                if descriptor is None or ref['media_type'] != 'application/vnd.apache.parquet':
+                    raise ContractError('unselected or unsupported retained payload', 'corrupt_result')
+                digest = hashlib.sha256()
+                while block := stream.read(65536): digest.update(block)
+                if digest.hexdigest() != ref['sha256']:
+                    raise ContractError('retained original Parquet checksum differs', 'corrupt_result')
+                _retained_parquet_header(stream, descriptor, maximum_metadata_bytes=1024*1024-retained)
+                cache[key] = None, None
+        if _metadata_weight((technical, scientific, cache, used, payloads)) > 1024*1024:
+            raise ContractError('combined retained archive metadata exceeds allowance', 'budget_exceeded')
+        return cache[key]
+    commit, _ = read('telemetry', cutoff['commit'])
+    envelope = schema_validator('telemetry-envelope.schema.json')
+    _schema_check(envelope.evolve(schema={'$ref':'#/$defs/TelemetryCommit2', '$defs':envelope.schema['$defs']}), commit)
+    summary, _ = read('telemetry', commit['summary'])
+    catalog, _ = read('telemetry', commit['catalog'])
+    validate_telemetry_catalog(catalog, expected_transport=commit['transport'])
+    previous = previous_summary = previous_catalog = None
+    if commit['previous'] is not None:
+        pair = commit['previous']; previous, _ = read('telemetry', pair['commit']); previous_summary, _ = read('telemetry', pair['summary'])
+        _schema_check(envelope.evolve(schema={'$ref':'#/$defs/TelemetryCommit2', '$defs':envelope.schema['$defs']}), previous)
+        previous_catalog, _ = read('telemetry', previous['catalog'])
+    contexts = []
+    for row in commit['contexts']['phase_context_refs']:
+        publication, _ = read('telemetry', row['retained_publication_ref']); segment, _ = read('telemetry', row['retained_segment_ref'])
+        contexts.append(dict(publication=publication, publication_ref=row['publication_ref'], segment=segment, segment_ref=row['segment_ref']))
+    resume = []
+    for pair in commit['contexts']['resume_context_refs']:
+        c, _ = read('telemetry', pair['commit']); s, _ = read('telemetry', pair['summary'])
+        resume.append(dict(commit=c, commit_ref=pair['commit'], summary=s, summary_ref=pair['summary']))
+    kwargs = {} if previous is None else dict(previous=previous, previous_ref=commit['previous']['commit'],
+        previous_summary=previous_summary, previous_summary_ref=commit['previous']['summary'], previous_catalog=previous_catalog)
+    validate_telemetry_commit(commit, summary=summary, summary_ref=commit['summary'], catalog=catalog,
+        phase_contexts=contexts, resume_contexts=resume, **kwargs)
+    if (cutoff['catalog'] != commit['catalog'] or cutoff.get('source_cursors') != commit['source_cursors']
+            or cutoff['prior_capture'] != summary['cumulative']['prior_capture']
+            or cutoff['cumulative_scope'] != summary['cumulative']['scope']):
+        raise ContractError('retained cutoff differs from exact selected transaction', 'corrupt_result')
+    for row in catalog['artifacts']:
+        if row['ref']['media_type'] == 'application/vnd.apache.parquet': payloads[json_bytes(row['ref'])] = row
+        value, _ = read('telemetry', row['ref'])
+        if row['ref']['media_type'] == 'application/json':
+            from .catalog import _retained_metadata
+            _retained_metadata(value, row['ref'], expected_transport=commit['transport'])
+    selected = manifest['source_state']; source, _ = read('scientific', selected['manifest']); validate_manifest(source)
+    # Match a returned close only to this exact transaction, never a newest page.
+    bindings = []
+    for key, row in technical.items():
+        if key[0] == 'telemetry' and row['reference']['schema'] == 'qcl-negf.telemetry-binding.v2':
+            candidate, _ = read('telemetry', row['reference'], promise=False)
+            _schema_check(envelope.evolve(schema={'$ref':'#/$defs/TelemetryBinding2', '$defs':envelope.schema['$defs']}), candidate)
+            if isinstance(candidate.get('commit'), dict) and candidate['commit'].get('ref') == cutoff['commit']:
+                bindings.append((row['reference'], candidate))
+    if len(bindings) > 1 or commit['closed'] and len(bindings) != 1:
+        raise ContractError('retained close binding is missing or ambiguous', 'corrupt_result')
+    binding = bindings[0][1] if bindings else None
+    if binding is not None:
+        read('telemetry', bindings[0][0])
+        proof_ref = binding['source_binding']['ref']; proof, _ = read('telemetry', proof_ref)
+    else:
+        candidates = []
+        for key, row in technical.items():
+            if key[0] == 'telemetry' and row['reference']['schema'] == 'qcl-negf.telemetry-source-binding.v1':
+                candidate, _ = read('telemetry', row['reference'], promise=False)
+                _schema_check(envelope.evolve(schema={'$ref':'#/$defs/TelemetrySourceBinding', '$defs':envelope.schema['$defs']}), candidate)
+                if candidate.get('selected_state') == selected and candidate.get('enclosing_transport') == commit['transport']:
+                    candidates.append((row['reference'], candidate))
+        if len(candidates) != 1:
+            raise ContractError('exact source binding is missing or ambiguous', 'corrupt_result')
+        proof_ref, proof = candidates[0]
+        read('telemetry', proof_ref)
+    _schema_check(envelope.evolve(schema={'$ref':'#/$defs/TelemetrySourceBinding', '$defs':envelope.schema['$defs']}), proof)
+    plan, _ = read('canonical_plan', proof['canonical_plan']); _schema_check(schema_validator('scientific-plan.schema.json'), plan)
+    context = dict(expected_state=selected, expected_transport=commit['transport'], manifest=source,
+        manifest_ref=selected['manifest'], source_transport=proof['source_transport'], canonical_plan_ref=proof['canonical_plan'],
+        expected_producer_provenance=source['provenance'])
+    validate_telemetry_source_binding(proof, **context)
+    if binding is not None:
+        validate_telemetry_binding(binding, commit=commit, commit_ref=cutoff['commit'], summary=summary,
+            summary_ref=commit['summary'], source_binding=proof, source_binding_ref=proof_ref, **context)
+    if used != set(technical):
+        raise ContractError('extra unselected retained technical locator', 'corrupt_result')
+    selected_objects = {r['object'] for r in manifest['source_locator']} | {r['object'] for r in manifest['technical_locator']}
+    selected_objects.update(p['object'] for p in manifest.get('telemetry_compaction', []))
+    if selected_objects != {r['path'] for r in index['objects']}:
+        raise ContractError('extra unselected retained transport object', 'corrupt_result')
+    # Existing compaction algorithm/encoding stays unchanged. Bind its declared
+    # original order and exact row coverage to this authenticated after snapshot.
+    for proof_row in manifest.get('telemetry_compaction', []):
+        table = proof_row.get('table'); expected = []; originals = []; position = 0
+        for row in catalog['artifacts']:
+            if row['table'] == table:
+                stop = position+int(row['rows'])
+                expected.append(dict(sha256=row['ref']['sha256'], bytes=int(row['ref']['bytes']), row_start=position, row_stop=stop)); position=stop
+                originals.append(technical[('telemetry', row['ref']['path'])]['object'])
+        if (not expected or json_bytes(proof_row.get('source_segments')) != json_bytes(expected)
+                or type(proof_row.get('rows')) is not int or proof_row['rows'] != position
+                or type(proof_row.get('source_files')) is not int or proof_row['source_files'] != len(expected)
+                or proof_row.get('source_commit_sha256') != cutoff['commit']['sha256']):
+            raise ContractError('compaction is outside retained catalog order/row coverage', 'corrupt_result')
+        # Reuse the unchanged fixed-4096 validity/native-bit codec on actual
+        # contained streams. No temporary payload copies or source-root paths.
+        from contextlib import contextmanager
+        from .compaction import _CompactionRead, _payload_hash
+        class ArchiveBits(_CompactionRead):
+            @contextmanager
+            def open(self, name):
+                with open_object(name) as raw:
+                    yield _BudgetStream(raw, self.budget)
+        bits = ArchiveBits(32*1024*1024, budget)
+        before = _payload_hash(originals, bits)
+        after = _payload_hash([proof_row['object']], bits)
+        if (before != after or before != proof_row.get('logical_payload_sha256')
+                or after != proof_row.get('verified_payload_sha256')):
+            raise ContractError('contained compaction changed retained scalar bits', 'corrupt_result')
+    _bounded_objects((manifest['technical_locator'], cache, commit, summary, catalog, previous, previous_summary, previous_catalog, contexts, resume, proof, binding, plan), 16384)
+    return dict(technical_contract='qcl-negf.telemetry-retained.v2', scope='retained_technical_window',
+        commit=cutoff['commit'], catalog=cutoff['catalog'], cumulative_scope=cutoff['cumulative_scope'],
+        prior_capture=cutoff['prior_capture'], provenance_origin='not_authenticated_offline',
+        historical_catalog_descriptors='opaque_not_recursive_retention_promises')
 
 
 if __name__ == "__main__":

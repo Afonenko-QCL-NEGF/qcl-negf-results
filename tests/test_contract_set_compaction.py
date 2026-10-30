@@ -299,3 +299,146 @@ def test_T10_exact_technical_export_bytes_ignore_reader_cache_warming(tmp_path):
         assert 0<reader.io_counters['bytes_read_total']<=reader.limits.maximum_io_bytes
     assert first['snapshot_identity']==second['snapshot_identity'] and first['sha256']==second['sha256']
     assert (tmp_path/'cold'/first['archive']).read_bytes()==(tmp_path/'warm'/second['archive']).read_bytes()
+
+
+def s2_archive_wire(tmp_path,*,fault=None,profile='science',parquet=False,compact=False):
+    """Assemble exact v2 wire objects beside an unchanged scientific export.
+
+    This is a manufactured carrier, not the future S3 writer/export activation.
+    """
+    import copy
+    from test_performance_views import s2_wire_case
+    from result_v2_fixture import put
+    from qcl_negf_results.state import StateReader
+    from qcl_negf_results.archive import build_archive
+    from qcl_negf_results.commits import json_bytes
+    c=s2_wire_case(tmp_path/'wire',parquet=parquet or compact or fault=='footer_rows',declared_rows=3 if fault=='footer_rows' else 2,parquet_files=2 if compact else 1,checkpoint=profile=='full-state')
+    v=c['wire'];root=c['technical'];binding_ref=c['selection'].binding_ref
+    if fault in ('forged_cost','wrong_origin'):
+        summary=copy.deepcopy(v['summary']);commit=copy.deepcopy(v['commit'])
+        if fault=='forged_cost':summary['cumulative']['cost']['metrics']['read_seconds']['known']=999.
+        else:
+            source=json.loads((root/c['source_binding']['path']).read_bytes());source['producer_provenance']['revision']='f'*40
+            c['source_binding']=put(root,c['source_binding']['path'],source,source['schema'])
+        v['summary']=summary;v['summary_ref']=put(root,v['summary_ref']['path'],summary,summary['schema'])
+        commit['summary']=v['summary_ref'];v['commit']=commit;v['commit_ref']=put(root,v['commit_ref']['path'],commit,commit['schema'])
+        binding=json.loads((root/binding_ref['path']).read_bytes())
+        for key,ref in (('commit',v['commit_ref']),('summary',v['summary_ref']),('source_binding',c['source_binding'])):
+            binding[key]=dict(ref=copy.deepcopy(ref),raw_utf8=(root/ref['path']).read_text())
+        binding_ref=put(root,binding_ref['path'],binding,binding['schema'])
+    with StateReader(c['science'],state_ref=c['state'],expected_identity=c['state']['identity']) as reader:
+        receipt=export_snapshot(reader,tmp_path/'scientific-seed',profile=profile,byte_budget=32*1024*1024,reserve_bytes=0)
+    manifest,members=unpack(receipt,tmp_path/'scientific-seed')
+    scope_fields=dict(technical_contract='qcl-negf.telemetry-retained.v2',scope='retained_technical_window',
+        catalog=copy.deepcopy(v['catalog_ref']),cumulative_scope='enclosing_transport_since_v2_genesis',prior_capture='none')
+    cutoff=dict(commit=copy.deepcopy(v['commit_ref']),source_cursors=[],uncommitted='not_included',pending_rows=None,**copy.deepcopy(scope_fields))
+    record=dict(technical=True,source_state=copy.deepcopy(c['state']),source_commit_sha256=v['commit_ref']['sha256'],included=[],omitted_by_policy=[],**copy.deepcopy(scope_fields))
+    refs=[('telemetry',ref,root) for ref in [v['commit_ref'],v['summary_ref'],v['catalog_ref'],c['source_binding'],binding_ref]]
+    if len(c['wire_history'])>1:
+        prior=c['wire_history'][-2];refs += [('telemetry',prior[key],root) for key in ('commit_ref','summary_ref','catalog_ref')]
+    refs += [('telemetry',row['ref'],root) for row in v['catalog']['artifacts']]
+    refs += [('canonical_plan',c['plan'],c['root'])]
+    seen=set();technical=[]
+    if fault=='extra_unselected':
+        old=c['wire_history'][0];ref=put(root,'extra-historical-summary.json',old['summary'],old['summary']['schema']);refs.append(('telemetry',ref,root))
+    for scope,ref,base in refs:
+        key=(scope,ref['path'])
+        if key in seen:continue
+        seen.add(key)
+        if fault=='missing_promised' and ref==c['wire_history'][-2]['catalog_ref']:continue
+        raw=(base/ref['path']).read_bytes();suffix='.parquet' if ref['media_type']=='application/vnd.apache.parquet' else '.json';name='objects/'+ref['sha256']+suffix
+        members[name]=raw
+        if not any(row['path']==name for row in manifest['files']):manifest['files'].append(dict(path=name,sha256=ref['sha256'],bytes=len(raw),media_type=ref['media_type']))
+        technical.append(dict(scope=scope,reference=copy.deepcopy(ref),object=name))
+        descriptor=next((row for row in v['catalog']['artifacts'] if row['ref']==ref),None)
+        record['included'].append(dict(source_scope=scope,source_path=ref['path'],role='performance.provenance' if descriptor is None else descriptor['role'],
+            schema=ref['schema'],sha256=ref['sha256'],object=name,dependencies=[],table=None if descriptor is None else descriptor['table']))
+    if fault=='wrong_scope':cutoff['scope']=record['scope']='execution_attempt'
+    if fault=='missing_cutoff_fields':cutoff.pop('technical_contract');record.pop('technical_contract')
+    if fault=='forged_locator':
+        for row in technical:
+            if row['reference']==v['summary_ref']:
+                row['reference']['path']='retained/forged-summary-alias.json'
+        for row in record['included']:
+            if row['source_path']==v['summary_ref']['path']:row['source_path']='retained/forged-summary-alias.json'
+    manifest.update(technical_locator=technical,cutoff=cutoff,telemetry_compaction=[])
+    manifest['records'].append(record)
+    manifest['snapshot_identity']=hashlib.sha256(json_bytes(dict(source=manifest['source_state'],profile=profile,cutoff=cutoff,
+        technical=[dict(scope=row['scope'],reference=row['reference']) for row in technical]))).hexdigest()
+    spool=tmp_path/'wire-spool';spool.mkdir();files={}
+    for row in manifest['files']:
+        path=spool/Path(row['path']).name;path.write_bytes(members[row['path']]);files[row['path']]=(path,row)
+    if compact:
+        from qcl_negf_results.compaction import compact_export_records
+        proofs=compact_export_records([record],files,spool,retain_original=True)
+        assert len(proofs)==1 and proofs[0]['rows']==4
+        if fault=='projection_order':
+            proofs[0]['source_segments'].reverse()
+            for index,source in enumerate(proofs[0]['source_segments']):source.update(row_start=2*index,row_stop=2*index+2)
+        if fault=='projection_bits':
+            target,descriptor=files[proofs[0]['object']]
+            table=pq.read_table(target);column=table['cpu_time_seconds'].to_pylist();column[0]=0.0
+            changed=table.set_column(table.schema.get_field_index('cpu_time_seconds'),'cpu_time_seconds',pa.array(column,type=pa.float64()))
+            pq.write_table(changed,target)
+            raw=target.read_bytes();digest=hashlib.sha256(raw).hexdigest();oldname=proofs[0]['object'];name='objects/'+digest+'.parquet'
+            descriptor.update(path=name,sha256=digest,bytes=len(raw));files[name]=files.pop(oldname)
+            proofs[0].update(object=name,compacted_bytes=len(raw))
+            for row in record['included']:
+                if row['object']==oldname:row.update(object=name,sha256=digest)
+        manifest['telemetry_compaction']=proofs
+        manifest['files']=[row for _,row in files.values()]
+    metadata={name:raw for name,raw in members.items() if name in ('plan.json','diagnostics.json','README.md')}
+    metadata['manifest.json']=json_bytes(manifest)
+    path,_,index=build_archive(spool,files,metadata,identity=manifest['snapshot_identity'],profile=profile)
+    return path,c,manifest,index
+
+
+def test_S2_offline_v2_archive_receive_reexport_keeps_opaque_historical_cut(tmp_path):
+    import shutil
+    from qcl_negf_results.archive import receive,build_archive
+    from qcl_negf_results.commits import json_bytes
+    archive,c,manifest,index=s2_archive_wire(tmp_path,parquet=True)
+    shutil.rmtree(c['root'])  # All original source/canonical/technical roots gone.
+    result=receive([archive],tmp_path/'offline')
+    assert result['verified'] is True
+    assert result['technical_verification']['scope']=='retained_technical_window'
+    assert result['technical_verification']['provenance_origin']=='not_authenticated_offline'
+    assert not any(row['reference']['path'].endswith('catalog-1.json') for row in manifest['technical_locator'])
+    restored=tmp_path/'offline';spool=tmp_path/'repack';spool.mkdir()
+    files={row['path']:(restored/row['path'],row) for row in manifest['files']}
+    metadata={name:(restored/name).read_bytes() for name in ('manifest.json','README.md') if (restored/name).exists()}
+    repacked,_,_=build_archive(spool,files,metadata,identity=manifest['snapshot_identity'],profile='science')
+    assert receive([repacked])['technical_verification']==result['technical_verification']
+
+
+@pytest.mark.parametrize('fault',['missing_promised','extra_unselected','forged_cost','wrong_origin','wrong_scope','missing_cutoff_fields','footer_rows','forged_locator'])
+def test_S2_offline_receive_rejects_hash_valid_but_invalid_retained_wire(tmp_path,fault):
+    from qcl_negf_results.archive import receive
+    path,c,manifest,index=s2_archive_wire(tmp_path,fault=fault)
+    with pytest.raises(ContractError):receive([path],tmp_path/'rejected')
+    assert not (tmp_path/'rejected').exists()
+
+
+@pytest.mark.parametrize('fault',[None,'projection_order','projection_bits'])
+def test_S2_compacted_archive_binds_catalog_order_and_actual_scalar_bits(tmp_path,fault):
+    from qcl_negf_results.archive import receive
+    path,c,manifest,index=s2_archive_wire(tmp_path,compact=True,fault=fault)
+    if fault is None:
+        assert receive([path])['technical_verification']['scope']=='retained_technical_window'
+    else:
+        with pytest.raises(ContractError):receive([path])
+
+
+def test_S2_full_state_receive_restores_science_and_same_retained_technical_cut(tmp_path):
+    import shutil
+    from qcl_negf_results.archive import receive
+    from qcl_negf_results.state import StateReader
+    path,c,manifest,index=s2_archive_wire(tmp_path,profile='full-state')
+    shutil.rmtree(c['root'])
+    result=receive([path],tmp_path/'restored')
+    assert result['technical_verification']['scope']=='retained_technical_window'
+    assert result['source_state']==manifest['source_state']
+    assert manifest['canonical_source_complete'] is True and manifest['scientific_accepted'] is None
+    with StateReader(result['source_root'],state_ref=result['source_state'],expected_identity=result['source_state']['identity']) as reader:
+        reader.import_history()
+        assert reader.history_batch(maximum_records=1).records[0]['schema']=='qcl-negf.scientific-record.v1'
