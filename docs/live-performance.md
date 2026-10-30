@@ -14,6 +14,10 @@ TelemetrySelection(artifact_root, *, commit_ref, source_binding_ref,
     observed_unix=None, phase_context_refs=(), resume_context_refs=())
 read_performance_summary(reader: StateReader, *,
     telemetry: TelemetrySelection | None, limits=None) -> dict
+read_performance_context(reader: StateReader, *,
+    telemetry: TelemetrySelection, limits: PerformanceLimits | None = None)
+    -> tuple[bytes, tuple[tuple[str, dict, bytes], ...]]
+writer.close_context() -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]
 observe(spec_path, pid, start_ticks, control_fd, *, transport=None,
     telemetry_selection_factory=None) -> int
 ```
@@ -45,6 +49,42 @@ retained pairs must bind the same bytes, hash, schema and media. `resume_context
 16 exact `{commit_ref, summary_ref}` pairs. These provide only missing prior completions to the full
 public current-delta validator. They are not trusted decoded evidence. All actual reads, hashes and
 source guards share the existing operation allowance.
+
+`close_context()` closes through the existing writer transaction and returns its exact commit
+FileRef, additional phase-context quadruples and resume-context pairs. Accepted phase ranges
+already carry their retained references in the commit, so the additional list excludes them. The
+writer captures these references before clearing staged contexts and exposes them only after the
+durable close and exact commit readback. Repeated calls select the same transaction and detach
+mutable return dictionaries; a caller cannot change the retained snapshot. Publication errors and
+lost acknowledgements retain the original pending transaction for reconciliation. No current or
+newest lookup selects this close. The observer uses this public returned commit for terminal
+binding; its existing same-owner rotation helpers retain their previous role.
+
+`read_performance_context()` uses the same loader, public current-delta validator and operation
+guards as summary reading. It returns serialized **input assertions** followed by exact consumed
+original file bytes. The assertion bytes have the existing `TelemetrySelection.document()` grammar;
+they are not measured raw or a producer certificate. Each file tuple is `(scope, whole_FileRef,
+original_raw_bytes)`, where scope is `scientific`, `canonical_plan` or `technical`. The closure
+contains the selected scientific manifest, original canonical plan, current commit/summary,
+immediate predecessor pair, accepted retained phase pairs, supplied old-completion/resume contexts,
+source binding and selected close binding. It includes neither scientific arrays nor an all-history
+proof of ancestor deltas. Closed selection still requires its exact binding.
+
+Files are deduplicated by scope and complete FileRef in first-consumed order. Conflicting refs for
+one scoped path fail. Original phase references retain their original paths; retained raw files
+keep their explicit retained refs. No path rewrite, summary reconstruction or directory scan fills
+missing raw. A consumer can materialize separate scoped roots and use the existing public reader
+again, but must independently verify actual original INPUT/CALL/CREATE provenance. This API does
+not certify native access, restore, science acceptance or original creator ownership.
+
+The raw return shares one combined 1 MiB metadata and 4096-object allowance with decoded contexts,
+guards, assertion bytes and detached return copies. Its I/O cap is 4 MiB, response cap 2 MiB and
+session cap 16; callers can only tighten them through `PerformanceLimits`. Prospective return
+storage is debited before copying mutable refs. Source guards complete before any return escapes;
+late replacement, missing context, cancellation or exhausted credit returns no partial snapshot.
+Operation counters remain public on the reader; the owning caller accounts aggregate credit across
+reader construction and repeated operations. These APIs add no lifetime renewal, retention pruning,
+native CLI ingress or AiiDA repository carrier. Those remain separate required production work.
 
 Performance metadata is bounded by 1 MiB, delivered I/O by 4 MiB, response JSON by 2 MiB, objects by
 4096 and supplied context pages by 16; limits only tighten. The response reports execution-attempt

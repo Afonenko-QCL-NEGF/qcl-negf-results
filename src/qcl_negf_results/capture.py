@@ -994,7 +994,8 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 admit()
                 if telemetry_selection_factory is None or transport is None:
                     writer_call(writer.record_control,dict(event='source_binding_missing',reason='explicit_transport_or_factory_missing'))
-                closed = writer_call(writer.close)
+                close_ref, _, _ = writer_call(writer.close_context)
+                closed = writer.root / close_ref['path']
                 if telemetry_selection_factory is None or transport is None:
                     raise ValueError('source_binding_missing: explicit transport/factory and production ingress policy required')
                 if last_actual is None or not last_points:raise ValueError('selected source unavailable for exact close binding')
@@ -1003,7 +1004,7 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                     scalar_live_route=locator['mode'] if not publisher.disabled else 'unavailable',
                     scalar_live_reason='live_publication_incomplete' if publisher.disabled else None,
                     performance_status='available' if complete else 'incomplete',reason=None if complete else 'phase_sources_or_tail_incomplete')
-                for point in last_points:bind_selected(last_actual,point,writer._previous_ref,status)
+                for point in last_points:bind_selected(last_actual,point,close_ref,status)
                 break
             time.sleep(2)
     except Exception as error:

@@ -8,6 +8,7 @@ import os
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from copy import deepcopy
 
 from qcl_negf_contracts.artifacts import relative_path
 from qcl_negf_contracts import schema_validator
@@ -73,8 +74,9 @@ def _bounded_objects(roots, maximum_objects):
             fail("budget_exceeded", "aggregate retained metadata object cap exceeded")
         if isinstance(node, dict):
             pending.extend(node.values())
-        elif isinstance(node, list):
+        elif isinstance(node, (list, tuple)):
             pending.extend(node)
+    return count
 
 
 def _exact(value):
@@ -184,23 +186,37 @@ def _read_reference(reader,root,reference,limits,bindings):
     return value,raw
 
 
-def _load_telemetry(reader,telemetry,limits,bindings,*,creating_binding=False):
+def _load_telemetry(reader,telemetry,limits,bindings,*,creating_binding=False,retain_raw=False):
     if not isinstance(reader,StateReader) or not isinstance(telemetry,TelemetrySelection):
         raise TypeError('explicit StateReader and TelemetrySelection required')
     data=telemetry.document();root=telemetry.artifact_root
-    references=[];cache={}
-    def read(scope,ref):
+    references=[];cache={};raw_contexts=[];raw_paths={}
+    def read(scope,ref,logical_scope='technical'):
         key=(str(Path(scope).absolute()),json_bytes(ref))
+        rowkey=(logical_scope,ref['path'])
+        if retain_raw and rowkey in raw_paths and raw_paths[rowkey]!=key[1]:
+            fail('corrupt_result','conflicting full references for one retained context path')
         if key not in cache:
-            retained=_metadata_weight((telemetry._raw,data,cache,bindings,references))
-            if int(ref['bytes'])>limits.maximum_metadata_bytes-retained:
+            retained=_metadata_weight((telemetry._raw,data,cache,bindings,references,raw_contexts,raw_paths))
+            reserve=(2*_metadata_weight(ref)+512) if retain_raw else 0
+            if int(ref['bytes'])+reserve>limits.maximum_metadata_bytes-retained:
                 fail('budget_exceeded','aggregate metadata credit exhausted before selected read')
             value=_read_reference(reader,scope,ref,limits,bindings)
-            if _metadata_weight((telemetry._raw,data,cache,bindings,references,key,value))>limits.maximum_metadata_bytes:
+            if _metadata_weight((telemetry._raw,data,cache,bindings,references,key,value,raw_contexts,raw_paths))>limits.maximum_metadata_bytes:
                 fail('budget_exceeded','decoded selected metadata exceeds combined allowance')
             cache[key]=value
             references.append((Path(scope),ref))
+        if retain_raw and rowkey not in raw_paths:
+            if (_metadata_weight((telemetry._raw,data,cache,bindings,references,raw_contexts,raw_paths))+
+                    2*_metadata_weight((logical_scope,ref,cache[key][1]))+512)>limits.maximum_metadata_bytes:
+                fail('budget_exceeded','retained raw context allowance exceeded before staging')
+            raw_contexts.append((logical_scope,ref,cache[key][1]))
+            raw_paths[rowkey]=key[1]
         return cache[key]
+    if retain_raw:
+        manifest,_=read(reader.root,reader.source.state['manifest'],'scientific')
+        if encode(manifest)!=encode(reader._manifest):
+            fail('source_changed','retained scientific manifest differs from selected reader')
     commit,commit_raw=read(root,data['commit_ref'])
     if commit.get('schema')!='qcl-negf.telemetry-commit.v1':fail('unsupported_format','separate technical commit required')
     validator=schema_validator('telemetry-envelope.schema.json')
@@ -239,7 +255,7 @@ def _load_telemetry(reader,telemetry,limits,bindings,*,creating_binding=False):
     kwargs={} if previous is None else dict(previous=previous,previous_ref=commit['previous'],previous_summary=previous_summary,previous_summary_ref=previous['summary'])
     validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],phase_contexts=contexts,resume_contexts=resume,**kwargs)
     source_binding,source_raw=read(root,data['source_binding_ref'])
-    plan,plan_raw=read(telemetry.canonical_plan_root,data['canonical_plan_ref'])
+    plan,plan_raw=read(telemetry.canonical_plan_root,data['canonical_plan_ref'],'canonical_plan')
     _schema_check(schema_validator('scientific-plan.schema.json'),plan)
     context=dict(expected_state=reader.source.state,expected_transport=data['expected_transport'],manifest=reader._manifest,
         manifest_ref=reader.source.state['manifest'],source_transport=data['source_transport'],canonical_plan_ref=data['canonical_plan_ref'],
@@ -253,13 +269,27 @@ def _load_telemetry(reader,telemetry,limits,bindings,*,creating_binding=False):
         binding,_=read(root,data['binding_ref'])
         validate_telemetry_binding(binding,commit=commit,commit_ref=data['commit_ref'],summary=summary,summary_ref=commit['summary'],
             source_binding=source_binding,source_binding_ref=data['source_binding_ref'],**context)
-    _bounded_objects((data,commit,summary,source_binding,plan,binding,previous,previous_summary,contexts,resume),limits.maximum_objects)
-    if _metadata_weight((data,cache,bindings))>limits.maximum_metadata_bytes:
+    object_roots=(data,commit,summary,source_binding,plan,binding,previous,previous_summary,contexts,resume)
+    if retain_raw:
+        # One combined object credit, including the manifest and prospective
+        # detached FileRefs/containers, not a fresh allowance for the return.
+        object_roots+=(manifest,telemetry._raw,tuple(raw_contexts))
+        sessions={json_bytes(row['session']) for row in (commit,previous,*(c['commit'] for c in resume)) if row is not None}
+        if len(sessions)>limits.maximum_sessions:
+            fail('budget_exceeded','retained context session allowance exceeded')
+    retained_objects=_bounded_objects(object_roots,limits.maximum_objects)
+    if _metadata_weight((data,cache,bindings,raw_contexts,raw_paths))>limits.maximum_metadata_bytes:
         fail('budget_exceeded','aggregate selected technical metadata exceeds allowance')
     if data['observed_unix'] is not None and data['observed_unix']<commit['published_unix']:
         fail('invalid_input','explicit observation precedes selected publication')
-    return dict(commit=commit,commit_raw=commit_raw,summary=summary,summary_raw=summary_raw,source_binding=source_binding,
+    result=dict(commit=commit,commit_raw=commit_raw,summary=summary,summary_raw=summary_raw,source_binding=source_binding,
         source_binding_raw=source_raw,plan=plan,plan_raw=plan_raw,binding=binding,input=data,references=references)
+    if retain_raw:
+        # Keep the actual consumed decoded/raw context alive for combined return
+        # accounting; this is internal, never a second public validator branch.
+        result.update(raw_contexts=raw_contexts,working_context=(cache,bindings,raw_paths,previous,previous_summary,contexts,resume),
+            retained_objects=retained_objects)
+    return result
 
 
 def validate_performance_binding(value,*,expected_state,expected_transport,commit,commit_ref,summary,summary_ref,
@@ -293,3 +323,43 @@ def read_performance_summary(reader: StateReader,*,telemetry: TelemetrySelection
         if len(json_bytes(answer))>limits.maximum_json_bytes:fail('budget_exceeded','performance response exceeds cap')
         _check_bindings(bindings)
         return answer
+
+
+def read_performance_context(reader: StateReader, *, telemetry: TelemetrySelection,
+                             limits: PerformanceLimits | None = None) -> tuple[bytes, tuple[tuple[str, dict, bytes], ...]]:
+    """Return bounded input assertions and original raw current-delta contexts.
+
+    The selection bytes serialize caller assertions. File bytes are the exact
+    consumed originals; neither is an actual producer/ownership certificate.
+    Scientific payload arrays and historical ancestor deltas are not read.
+    """
+    if not isinstance(reader,StateReader) or not isinstance(telemetry,TelemetrySelection):
+        raise TypeError('explicit StateReader and TelemetrySelection required')
+    limits=limits or PerformanceLimits()
+    if not isinstance(limits,PerformanceLimits):raise TypeError('PerformanceLimits required')
+    bindings={}
+    with reader._consumer_operation(limits.maximum_io_bytes,verify_source_stability=True,maximum_stability_bytes=limits.maximum_metadata_bytes):
+        loaded=_load_telemetry(reader,telemetry,limits,bindings,retain_raw=True)
+        rows=loaded['raw_contexts']
+        # The existing immutable encoding is assertion input, not measured raw.
+        selection_raw=telemetry._raw
+        # Reserve the detached return within the original aggregate credit.
+        # Rows have the same traversal shape before and after ref copying.
+        remaining_objects=limits.maximum_objects-loaded['retained_objects']
+        if remaining_objects<2:
+            fail('budget_exceeded','aggregate raw context return object cap exceeded')
+        _bounded_objects((selection_raw,rows),remaining_objects)
+        # Refs are the only mutable return objects. Debit their detached copies,
+        # output containers and raw buffers before allocating the return tree.
+        prospective=(_metadata_weight((loaded,bindings,selection_raw))+
+            sum(_metadata_weight(ref)+256 for _,ref,_ in rows)+256)
+        if prospective>limits.maximum_metadata_bytes:
+            fail('budget_exceeded','combined raw context return metadata allowance exceeded')
+        response_bytes=len(selection_raw)+sum(len(raw)+len(scope)+len(json_bytes(ref)) for scope,ref,raw in rows)
+        if response_bytes>limits.maximum_json_bytes:
+            fail('budget_exceeded','raw context response exceeds cap')
+        files=tuple((scope,deepcopy(ref),raw) for scope,ref,raw in rows)
+        if _metadata_weight((loaded,bindings,selection_raw,files))>limits.maximum_metadata_bytes:
+            fail('budget_exceeded','combined raw context return exceeds metadata allowance')
+        _check_bindings(bindings)
+    return selection_raw,files

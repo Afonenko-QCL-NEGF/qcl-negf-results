@@ -13,6 +13,59 @@ import pytest
 from qcl_negf_results.capture import journal_batch, proc_sample, supervise
 
 
+def test_T0_observer_public_close_readback_failure_preserves_science_and_no_binding(tmp_path, monkeypatch):
+    """Observer must use the durable public close result before binding science."""
+    import hashlib
+    from native_consumer_fixture import technical_source, sealed_phase, outward_series
+    from qcl_negf_results.commits import json_bytes
+    from qcl_negf_results.telemetry import TelemetryWriter
+    from qcl_negf_results.performance_views import TelemetrySelection
+    import qcl_negf_results.capture as module
+    job = tmp_path / 'job'
+    job.mkdir()
+    result = job / 'result'
+    c = technical_source(result, checkpoint=True, execution='exec')
+    state = c['state']
+    manifest = c['science'] / state['manifest']['path']
+    scientific_raw = manifest.read_bytes()
+    sealed_phase(result, state['identity'])
+    phase = dict(status='available', session_id='native', current_path='phase-current.json', reason=None)
+    selection = c['transport']['selection']
+    raw = json_bytes(dict(fingerprint=selection['plan_fingerprint'], points=[dict(id=state['identity']['point_id'], execution_id='exec')]))
+    (job / 'plan.json').write_bytes(raw)
+    (job / 'capture-spec.json').write_bytes(json_bytes(dict(schema='qcl-negf.capture-spec.v1', selection=selection,
+        plan=dict(path='plan.json', bytes=len(raw), sha256=hashlib.sha256(raw).hexdigest()), capture_token='c' * 32,
+        allocation_id='allocation', allocated_logical_cpus=2, scratch_root=None,
+        credits=dict(performance_bytes=32 << 20, scalar_bytes=0, io_bytes=32 << 20, reserve_bytes=0))))
+    (job / 'capture-source.json').write_bytes(json_bytes(dict(schema='qcl-negf.capture-source.v1', capture_token='c' * 32,
+        execution_id='exec', plan_fingerprint=selection['plan_fingerprint'], mode='direct', actual_root=str(result), epoch=0)))
+    (result / 'series_result.json').write_bytes(json_bytes(outward_series(state, phase)))
+    technical = job / 'performance'
+    technical.mkdir()
+    (technical / c['source_binding']['path']).write_bytes((c['technical'] / c['source_binding']['path']).read_bytes())
+    def factory(reader, close_ref):
+        return TelemetrySelection(technical, commit_ref=close_ref, source_binding_ref=c['source_binding'], expected_transport=c['transport'],
+            source_transport=c['source_transport'], canonical_plan_root=c['root'], canonical_plan_ref=c['plan'],
+            expected_producer_provenance=c['producer_provenance'])
+    close = TelemetryWriter.close_context
+    closed_refs = []
+    def fail_after_durable_close(writer):
+        ref, _, _ = close(writer)
+        closed_refs.append(ref)
+        raise OSError('T0 close context readback unavailable')
+    monkeypatch.setattr(TelemetryWriter, 'close_context', fail_after_durable_close)
+    monkeypatch.setattr(module, 'proc_sample', lambda *a, **k: dict(wall_seconds=2., monotonic_ns=2_000_000_000,
+        cpu_time_seconds=None, missing_reason='root_process_missing_or_identity_changed'))
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 0\n')
+    os.close(write_fd)
+    assert module.observe(job / 'capture-spec.json', 42, 7, read_fd,
+        transport=c['transport'], telemetry_selection_factory=factory) == 2
+    assert manifest.read_bytes() == scientific_raw
+    assert len(closed_refs) == 1 and json.loads((technical / closed_refs[0]['path']).read_bytes())['closed'] is True
+    assert not (technical / 'performance-binding.json').exists()
+
+
 def test_proc_root_process_counter_identity_and_missing_are_not_zero(tmp_path):
     root = tmp_path / "proc"
     point = root / "42"

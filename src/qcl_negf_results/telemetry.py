@@ -192,6 +192,7 @@ class TelemetryWriter:
         self._previous_summary = None
         self._previous_ref = None
         self._publication_pending = None
+        self._published_context_raw = None
         self._metadata_written = 0
         self._retained_bytes = 0
         self._began_cpu = time.process_time()
@@ -226,6 +227,7 @@ class TelemetryWriter:
         self.phase_aggregates = []
         self.accepted_ranges = []
         self.phase_contexts = []
+        self._phase_context_refs = []
         self._resume_contexts = []
         self._last_phase_contexts = {}
         self._last_phase_raw = {}
@@ -803,6 +805,13 @@ class TelemetryWriter:
             accepted=dict(source_key=sourcekey,publication=deepcopy(batch.publication_ref),segment=deepcopy(batch.segment_ref),
                 retained_publication=rawrefs[1],retained_segment=rawrefs[0],mode=batch.segment['mode'],
                 first_row=str(batch.first_row),stop_row=str(batch.stop_row),cursor=deepcopy(batch.cursor))
+            # Keep only the explicit original-to-retained refs used by this delta.
+            # Decoded validator contexts alone cannot reproduce an offline read.
+            reference_inputs = (*self._last_phase_raw.values(), *self._phase_context_refs,
+                *phase_context_refs, dict(publication_ref=batch.publication_ref,
+                    segment_ref=batch.segment_ref, retained_publication_ref=rawrefs[1], retained_segment_ref=rawrefs[0]))
+            by_publication = {json_bytes(row['publication_ref']): row for row in reference_inputs}
+            context_refs = [by_publication[json_bytes(row['publication_ref'])] for row in contexts.values()]
             rows=batch.segment['rows'][batch.first_row:batch.stop_row]
             totals=dict(self.accepted_totals);totals['accepted_source_rows']+=len(rows)
             if batch.stop_row==len(batch.segment['rows']):totals['coalesced_source_events']+=int(batch.segment['coalesced_events'])
@@ -834,7 +843,7 @@ class TelemetryWriter:
                 catalog=self._root_ref(self.catalog_watermark) if self.catalog_watermark is not None else None,source_cursors=list(cursors.values()),accepted_ranges=deepcopy(self.accepted_ranges)+[accepted])
             kwargs={} if self._previous is None else dict(previous=self._previous,previous_ref=self._previous_ref,previous_summary=self._previous_summary,previous_summary_ref=self._previous['summary'])
             validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],phase_contexts=list(contexts.values()),resume_contexts=list(resumes.values()),**kwargs)
-            if _metadata_weight((self.phase_aggregates,phases,self.phase_contexts,list(contexts.values()),self._last_phase_contexts,self._last_phase_raw,cursors,list(resumes.values()),input_guards,self._context_guards))>self.batch_bytes:
+            if _metadata_weight((self.phase_aggregates,phases,self.phase_contexts,list(contexts.values()),self._last_phase_contexts,self._last_phase_raw,cursors,list(resumes.values()),input_guards,self._context_guards)) + 2*_metadata_weight(context_refs)>self.batch_bytes:
                 raise ValueError('phase old/new working metadata exceeds byte bound')
             from .performance_views import _check_bindings
             _check_bindings(input_guards)
@@ -851,6 +860,7 @@ class TelemetryWriter:
                     additions.append(dict(ref,path=str(target.relative_to(self.directory)),bytes=int(ref['bytes']),role='performance.window',profile='science',dependencies=[]))
             self.artifacts.extend(additions)
             for ref in rawrefs:self._phase_raw[ref['path']]=deepcopy(ref)
+            self._phase_context_refs = deepcopy(context_refs)
             self.phase_contexts=list(contexts.values());self._resume_contexts=list(resumes.values());self.phase_aggregates=phases;self.accepted_totals=totals
             self.accepted_ranges.append(accepted);self.staged_source_cursors[sourcekey]=cursorrow;self._last_phase_contexts[sourcekey]=context
             self._last_phase_raw[sourcekey]=dict(publication_ref=deepcopy(batch.publication_ref),segment_ref=deepcopy(batch.segment_ref),
@@ -1083,9 +1093,21 @@ class TelemetryWriter:
             cref=dict(path=name,bytes=str(len(payload)),sha256=hashlib.sha256(payload).hexdigest(),media_type='application/json',schema=commit['schema'])
             cref=self._root_ref(cref)
             publications.append((name,payload))
+            accepted_publications = {json_bytes(row['publication']) for row in self.accepted_ranges}
+            context_value = dict(commit_ref=cref,
+                phase_context_refs=[row for row in self._phase_context_refs
+                    if json_bytes(row['publication_ref']) not in accepted_publications],
+                resume_context_refs=[dict(commit_ref=row['commit_ref'], summary_ref=row['summary_ref'])
+                    for row in self._resume_contexts])
+            from .state import _metadata_weight
+            # Ordinary publication keeps its existing writer allowance. A public
+            # context snapshot is optional if its own prospective encoding and
+            # detached copies cannot fit the tighter 1 MiB metadata allowance.
+            context_raw = (json_bytes(context_value)
+                if 4*_metadata_weight(context_value) <= 1024*1024 else None)
             self._publication_pending=dict(publications=publications,commit=commit,summary=summary,ref=cref,
                 watermark=watermark,artifact_count=artifact_count,committed=committed,
-                retained_bytes=self._retained_bytes+sum(a['bytes'] for a in self.artifacts))
+                retained_bytes=self._retained_bytes+sum(a['bytes'] for a in self.artifacts),context_raw=context_raw)
         pending=self._publication_pending
         for name,payload in pending['publications']:
             target=self.directory/name
@@ -1106,8 +1128,9 @@ class TelemetryWriter:
         self._previous=deepcopy(pending['commit']);self._previous_summary=deepcopy(pending['summary']);self._previous_ref=deepcopy(pending['ref'])
         self.generation=int(self._previous['generation']);self.catalog_watermark=pending['watermark'];self.artifact_count=pending['artifact_count']
         self._retained_bytes=pending['retained_bytes']
+        self._published_context_raw=pending['context_raw']
         self.source_cursors=deepcopy(pending['committed']);self.staged_source_cursors.clear();self.artifacts=[]
-        self.accepted_ranges=[];self.phase_contexts=[];self._resume_contexts=[];self._context_guards={};self._publication_pending=None
+        self.accepted_ranges=[];self.phase_contexts=[];self._phase_context_refs=[];self._resume_contexts=[];self._context_guards={};self._publication_pending=None
         return self.root/self._previous_ref['path']
 
     def close(self) -> Path:
@@ -1115,6 +1138,32 @@ class TelemetryWriter:
             if self.closed:
                 return self.directory / f"commit-{self.generation:06d}.json"
             return self._flush(closing=True)
+
+    def close_context(self) -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]:
+        """Close durably and detach refs for exactly that transaction's delta.
+
+        Additional phase refs exclude accepted ranges already carried by the
+        commit. This snapshot selects bytes, and does not certify their owner.
+        """
+        from .commits import decode_json
+        from .state import _metadata_weight
+        with self.lock:
+            self.close()  # Pending publication/primary errors retain their identity.
+            raw = self._published_context_raw
+            if raw is None or len(raw) > 1024*1024:
+                raise ValueError('closed context metadata allowance exceeded')
+            value = decode_json(raw, 'exact published close context')
+            # Debit decoded snapshot, validation/return copies and commit encoding
+            # before allocating any detached return or readback payload.
+            if (_metadata_weight((raw, value, self._previous)) +
+                    2*_metadata_weight(value) + 4*_metadata_weight(self._previous)) > 1024*1024:
+                raise ValueError('combined closed context metadata allowance exceeded')
+            if len(value['phase_context_refs']) > 128 or len(value['resume_context_refs']) > 16:
+                raise ValueError('closed context reference page exceeded')
+            self._check_retained(self.root/value['commit_ref']['path'], json_bytes(self._previous))
+            # Decoding allocated this detached tree; immutable stored raw is not
+            # exposed and repeated calls cannot observe caller mutations.
+            return (value['commit_ref'], tuple(value['phase_context_refs']), tuple(value['resume_context_refs']))
 
     def __enter__(self) -> "TelemetryWriter":
         return self
