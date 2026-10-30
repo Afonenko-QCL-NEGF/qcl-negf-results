@@ -634,3 +634,269 @@ def test_T0_close_context_preserves_explicit_retained_completion_path(tmp_path):
         returning = source.harvest(batch.cursor, budget=_IOBudget(1 << 20))
         writer.stage_phase_batch(returning, phase_context_refs=(completion,))
         assert writer.close_context()[1] == (completion,)
+
+
+def s3_writer(root, **kwargs):
+    transport = dict(selection=dict(calcjob_uuid='job', execution_id='ex', attempt=1,
+                                   plan_fingerprint='a'*64), frozen_plan=None)
+    return TelemetryWriter(root, {}, {}, transport=transport, technical_version=2, **kwargs)
+
+
+def test_S3_opt_in_genesis_and_refuse_old_root_before_writes(tmp_path):
+    from qcl_negf_contracts.telemetry import validate_telemetry_commit, validate_telemetry_catalog
+    writer = s3_writer(tmp_path/'new', prior_capture='unimported')
+    commit = json.loads(writer.flush().read_bytes())
+    summary = json.loads((writer.root/commit['summary']['path']).read_bytes())
+    catalog = json.loads((writer.root/commit['catalog']['path']).read_bytes())
+    assert commit['schema'] == 'qcl-negf.telemetry-commit.v2'
+    assert commit['summary']['schema'] == 'qcl-negf.telemetry-summary.v2'
+    assert summary['cumulative']['prior_capture'] == 'unimported'
+    assert 'unimported_capture' in summary['cumulative']['coverage']['reasons']
+    validate_telemetry_catalog(catalog, expected_transport=writer.transport)
+    validate_telemetry_commit(commit, summary=summary, summary_ref=commit['summary'], catalog=catalog)
+    before = {str(p.relative_to(writer.root)):p.read_bytes() for p in writer.root.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError, match='empty|fresh|owned'):
+        s3_writer(writer.root)
+    assert before == {str(p.relative_to(writer.root)):p.read_bytes() for p in writer.root.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError, match='transport'):
+        TelemetryWriter(tmp_path/'missing', {}, {}, technical_version=2)
+    assert not (tmp_path/'missing').exists()
+
+
+def test_S3_resource_window_keeps_previous_cut_and_cumulative_totals(tmp_path):
+    writer = s3_writer(tmp_path/'new', batch_rows=8)
+    for i in range(24):
+        writer.record_resource(dict(wall_seconds=float(i), rss_bytes=2048+i))
+        writer.flush()
+        writer.retain_window(maximum_retained_bytes=65536, minimum_free_bytes=0, maximum_io_bytes=4194304)
+    commit = json.loads((writer.root/writer._previous_ref['path']).read_bytes())
+    summary = json.loads((writer.root/commit['summary']['path']).read_bytes())
+    assert int(summary['totals']['rows']['resources']) == 24
+    assert int(summary['retention']['omitted_resource_rows']) > 0
+    assert int(summary['retention']['omitted_resource_rows']) + sum(int(a['rows']) for a in writer._catalog['artifacts'] if a['table']=='resources') == 24
+    assert int(summary['cumulative']['max_observed_rss_bytes']['value']) == 2071
+    assert (writer.root/commit['previous']['commit']['path']).is_file()
+    previous = json.loads((writer.root/commit['previous']['commit']['path']).read_bytes())
+    assert (writer.root/previous['catalog']['path']).is_file()
+    assert len(list(writer.root.rglob('catalog-*.json'))) <= 3
+    assert len(list(writer.root.rglob('commit-*.json'))) <= 3
+
+
+def test_S3_lost_pointer_ack_reuses_exact_prepared_transaction(tmp_path, monkeypatch):
+    import qcl_negf_results.telemetry as module
+    writer=s3_writer(tmp_path/'new')
+    writer.record_resource(dict(wall_seconds=1.))
+    original=module.publish_pointer
+    def lost_ack(path, ref):
+        original(path, ref)
+        raise OSError('lost ACK')
+    monkeypatch.setattr(module, 'publish_pointer', lost_ack)
+    with pytest.raises(OSError, match='lost ACK'):writer.flush()
+    staged={p.name:p.read_bytes() for p in writer.directory.glob('commit-*.json')}
+    monkeypatch.setattr(module, 'publish_pointer', original)
+    writer.flush()
+    assert staged == {p.name:p.read_bytes() for p in writer.directory.glob('commit-*.json')}
+    assert writer._previous_summary['totals']['rows']['resources']=='1'
+    assert writer._previous['cost_delta']['stop_operation']==writer._previous_summary['cumulative']['cost']['position']['stop_operation']
+
+
+def test_S3_phase_delta_not_local_replay_across_flush_rotation_and_restart(tmp_path):
+    from native_consumer_fixture import diagnostic_parts
+    writer=s3_writer(tmp_path/'new',batch_rows=8)
+    parts=diagnostic_parts(tmp_path/'source',(2.,3.))
+    writer.stage_phase_batch(parts[0]);writer.flush()
+    first=writer._previous_summary['cumulative']['phases']
+    assert sum(int(r['call_count']) for r in first['entries'])==1
+    writer.stage_phase_batch(parts[1]);writer.flush()
+    cumulative=writer._previous_summary['cumulative']
+    assert sum(int(r['call_count']) for r in cumulative['phases']['entries'])==2
+    assert cumulative['phases']['entries'][0]['metrics']['duration_seconds']['known']==5.
+    assert int(cumulative['phases']['entries'][0]['metrics']['process_cpu_seconds']['unavailable'])==1
+    observer=cumulative['cost']['position']['observer_id']
+    writer.rotate()
+    assert writer._previous_summary['cumulative']['cost']['position']['observer_id']==observer
+    assert writer._previous_summary['producer_phase_aggregates']==[]
+    assert sum(int(r['call_count']) for r in writer._previous_summary['cumulative']['phases']['entries'])==2
+    writer.record_resource(dict(wall_seconds=1.,rss_bytes=12345));writer.flush()
+    old=writer._previous_summary['cumulative']
+    resumed=TelemetryWriter.resume(writer.root,commit_ref=writer._previous_ref,expected_session=writer._previous['session'],hardware={},technical_version=2)
+    new=resumed._previous_summary['cumulative']
+    assert new['cost']['position']['observer_id']!=observer
+    assert int(new['cost']['uncovered_restarts'])==1
+    assert new['cost']['metrics']==old['cost']['metrics']
+    assert new['max_observed_rss_bytes']['value']=='12345'
+    assert new['coverage']['incomplete'] and 'collector_restart' in new['coverage']['reasons']
+    assert new['phases']==old['phases']
+
+
+def test_S3_failed_unlink_debt_is_authenticated_and_retried_after_barrier(tmp_path,monkeypatch):
+    writer=s3_writer(tmp_path/'new')
+    for i in range(3):writer.record_resource(dict(wall_seconds=float(i)));writer.flush()
+    original=Path.unlink
+    failed=[]
+    def deny(path,*args,**kwargs):
+        if path.name.startswith('resources-'):
+            failed.append(path);raise PermissionError('fixture unavailable unlink')
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(Path,'unlink',deny)
+    writer.retain_window(maximum_retained_bytes=0,minimum_free_bytes=0,maximum_io_bytes=4194304)
+    debts=writer._previous['window_delta']['pending_unlink']
+    assert failed and any(ref['path']==str(failed[0].relative_to(writer.root)) for ref in debts)
+    assert failed[0].exists()
+    monkeypatch.setattr(Path,'unlink',original)
+    writer.retain_window(maximum_retained_bytes=0,minimum_free_bytes=0,maximum_io_bytes=4194304)
+    assert not failed[0].exists()
+    writer.retain_window(maximum_retained_bytes=0,minimum_free_bytes=0,maximum_io_bytes=4194304)
+    assert all(ref['path']!=str(failed[0].relative_to(writer.root)) for ref in writer._previous['window_delta']['pending_unlink'])
+    assert len(writer._unlinked)<=128
+
+
+def test_S3_index_failure_keeps_old_files_and_exact_retry(tmp_path,monkeypatch):
+    writer=s3_writer(tmp_path/'new')
+    writer.record_resource(dict(wall_seconds=1.));writer.flush()
+    before={str(p.relative_to(writer.root)):p.read_bytes() for p in writer.root.rglob('*') if p.is_file()}
+    original=writer._metadata_write
+    def fail_index(path,*args,**kwargs):
+        if path==writer.root/'index.json':raise OSError('fixture index barrier')
+        return original(path,*args,**kwargs)
+    monkeypatch.setattr(writer,'_metadata_write',fail_index)
+    with pytest.raises(OSError,match='index barrier'):
+        writer.retain_window(maximum_retained_bytes=0,minimum_free_bytes=0,maximum_io_bytes=4194304)
+    assert all((writer.root/name).exists() for name in before)
+    staged=writer._publication_pending['ref'].copy()
+    monkeypatch.setattr(writer,'_metadata_write',original)
+    writer.flush()
+    assert writer._previous_ref==staged
+
+
+def test_S3_exact_pins_and_low_space_block_only_dependent_retirement(tmp_path,monkeypatch):
+    writer=s3_writer(tmp_path/'new')
+    writer.record_resource(dict(wall_seconds=1.));writer.flush()
+    protected=tuple(row['ref'] for row in writer._catalog['artifacts'] if row['table']=='resources')
+    writer.retain_window(maximum_retained_bytes=0,minimum_free_bytes=0,maximum_io_bytes=4194304,protected_refs=protected)
+    assert writer._previous_summary['retention']['pinned_retention_refused']
+    assert all((writer.root/ref['path']).exists() for ref in protected)
+    generation=writer.generation
+    with pytest.raises(ValueError,match='reserve'):
+        writer.retain_window(maximum_retained_bytes=0,minimum_free_bytes=2**63,maximum_io_bytes=4194304)
+    assert writer.generation==generation
+    writer.record_resource(dict(wall_seconds=2.));writer.flush()
+    assert writer._previous_summary['totals']['rows']['resources']=='2'
+
+
+def s3_selected(context,writer):
+    from native_consumer_fixture import telemetry_input
+    from qcl_negf_results.capture import make_binding
+    from qcl_negf_results.state import StateReader
+    from qcl_negf_results.performance_views import TelemetrySelection
+    from result_v2_fixture import reference
+    selected=telemetry_input(context,writer,bind_closed=False)
+    with StateReader(context['science'],state_ref=context['state'],expected_identity=context['state']['identity']) as reader:
+        value=make_binding(reader,telemetry=selected,destination=writer.root/'close-binding.json',capture_status=dict(
+            terminal_tail='unknown',scalar_live_route='unavailable',scalar_live_reason='fixture',performance_status='incomplete',reason='fixture'))
+    data=selected.document();data['binding_ref']=reference(writer.root,'close-binding.json',value['schema'])
+    return TelemetrySelection(writer.root,canonical_plan_root=selected.canonical_plan_root,**data)
+
+
+def s3_phase_batch(root,index,*,padding=0,phase=None,extra_metrics=()):
+    from native_consumer_fixture import sealed_phase
+    from result_v2_fixture import IDENTITY,put,reference
+    from qcl_negf_results.capture import PhaseCaptureSource,PhaseCaptureLimits
+    from qcl_negf_results.state import _IOBudget
+    raw=sealed_phase(root,IDENTITY)
+    source=dict(raw['segment']['source'],session_id='source-'+str(index),clock_domain_id='clock-'+str(index))
+    segment=dict(raw['segment'],source=source)
+    segment['rows'][0]['phase']=phase or 'phase-'+str(index)
+    segment['rows'][0]['metrics'].extend(extra_metrics)
+    sr=put(root,'segment.json',segment,segment['schema'])
+    if padding:
+        path=root/sr['path'];path.write_bytes(path.read_bytes()+b' '*padding)
+        sr=reference(root,'segment.json',segment['schema'])
+    publication=dict(raw['publication'],source=source,segment=sr)
+    pr=put(root,'publication.json',publication,publication['schema'])
+    current=dict(raw['current'],source=source,publication=pr)
+    put(root,'current.json',current,current['schema'])
+    with PhaseCaptureSource(root,descriptor=dict(status='available',session_id=source['session_id'],current_path='current.json',reason=None),
+            expected_identity=IDENTITY,route_epoch=0,limits=PhaseCaptureLimits(maximum_metadata_bytes=4<<20)) as source:
+        return source.harvest(None,budget=_IOBudget(4<<20))
+
+
+def test_S3_phase_key_overflow_preserves_all_calls_and_missing_metrics(tmp_path):
+    writer=s3_writer(tmp_path/'new')
+    for i in range(70):
+        if i and i%8==0:writer.rotate()
+        writer.stage_phase_batch(s3_phase_batch(tmp_path/str(i),i));writer.flush()
+        writer.retain_window(maximum_retained_bytes=65536,minimum_free_bytes=0,maximum_io_bytes=4194304)
+    phases=writer._previous_summary['cumulative']['phases']
+    assert len(phases['entries'])<=64
+    assert int(phases['overflow']['call_count'])>0
+    assert sum(int(r['call_count']) for r in phases['entries'])+int(phases['overflow']['call_count'])==210
+    assert phases['incomplete'] and 'phase_key_limit' in phases['reasons']
+    assert all(int(row['metrics']['process_cpu_seconds']['unavailable'])==int(row['call_count']) for row in [*phases['entries'],phases['overflow']])
+
+
+def test_S3_counter_overflow_and_io_refusal_precede_dependent_mutation(tmp_path):
+    writer=s3_writer(tmp_path/'new')
+    writer._operation_stop=2**64-1
+    with pytest.raises(ValueError,match='overflow'):writer.record_resource(dict(wall_seconds=1.))
+    assert writer.pending_rows==0 and writer.counts['resources']==0
+    writer._operation_stop=0
+    metric=dict(name='allocated_bytes',unit='B',sum=dict(kind='integer',type='Int64',decimal=str(2**63-1)),
+                measured_calls='2',unavailable_calls='0',reasons=[])
+    for i in range(2):
+        writer.stage_phase_batch(s3_phase_batch(tmp_path/str(i),i,phase='fixed',extra_metrics=(metric,)));writer.flush()
+    before=(writer.generation,dict(writer.accepted_totals),{str(p.relative_to(writer.root)):p.read_bytes() for p in writer.root.rglob('*') if p.is_file()})
+    with pytest.raises(ValueError,match='overflow'):
+        writer.stage_phase_batch(s3_phase_batch(tmp_path/'overflow',2,phase='fixed',extra_metrics=(metric,)))
+    assert writer.generation==before[0] and writer.accepted_totals==before[1]
+    assert before[2]=={str(p.relative_to(writer.root)):p.read_bytes() for p in writer.root.rglob('*') if p.is_file()}
+    with pytest.raises(ValueError,match='I/O allowance'):
+        writer.retain_window(maximum_retained_bytes=0,minimum_free_bytes=0,maximum_io_bytes=0)
+    assert writer.generation==before[0]
+
+
+def test_S3_resume_ignores_unpublished_crash_orphans(tmp_path,monkeypatch):
+    import qcl_negf_results.telemetry as module
+    writer=s3_writer(tmp_path/'new');selected=writer._previous_ref.copy();session=writer._previous['session'].copy()
+    writer.record_resource(dict(wall_seconds=1.))
+    original=module.publish_pointer
+    def before_pointer(*args,**kwargs):raise OSError('fixture crash before publication')
+    monkeypatch.setattr(module,'publish_pointer',before_pointer)
+    with pytest.raises(OSError,match='before publication'):writer.flush()
+    orphan=json.loads((writer.directory/'commit-000002.json').read_bytes())
+    assert orphan['previous']['commit']==selected
+    monkeypatch.setattr(module,'publish_pointer',original)
+    # The fixture has quiesced the old writer; no shared-owner claim is made.
+    resumed=TelemetryWriter.resume(writer.root,commit_ref=selected,expected_session=session,hardware={},technical_version=2)
+    assert resumed._previous_summary['totals']['rows']['resources']=='0'
+    assert resumed._previous['previous']['commit']==selected
+    assert resumed._previous_ref['path']!=str((writer.directory/'commit-000002.json').relative_to(writer.root))
+    assert resumed._previous_summary['cumulative']['cost']['uncovered_restarts']=='1'
+
+
+@pytest.mark.parametrize('target',['raw','previous'])
+def test_S3_late_retained_change_prevents_pointer_publication(tmp_path,target):
+    from qcl_negf_contracts.messages import ContractError
+    writer=s3_writer(tmp_path/'new')
+    pointer=(writer.root/'current.json').read_bytes()
+    if target=='raw':
+        writer.stage_phase_batch(s3_phase_batch(tmp_path/'source',0))
+        path=writer.root/writer.accepted_ranges[0]['retained_segment']['path']
+    else:
+        writer.record_resource(dict(wall_seconds=1.))
+        path=writer.root/writer._previous_ref['path']
+    path.write_bytes(path.read_bytes()+b'\n')
+    with pytest.raises((ValueError,ContractError)):
+        writer.flush()
+    assert (writer.root/'current.json').read_bytes()==pointer
+
+
+def test_S3_resume_partial_physical_source(tmp_path):
+    from native_consumer_fixture import diagnostic_parts
+    writer=s3_writer(tmp_path/'new')
+    parts=diagnostic_parts(tmp_path/'source',(2.,3.))
+    writer.stage_phase_batch(parts[0]);writer.flush()
+    resumed=TelemetryWriter.resume(writer.root,commit_ref=writer._previous_ref,expected_session=writer._previous['session'],hardware={},technical_version=2)
+    resumed.stage_phase_batch(parts[1]);resumed.flush()
+    assert resumed._previous_summary['totals']['accepted_source_rows']=='2'
+    assert resumed._previous_summary['cumulative']['phases']['entries'][0]['metrics']['duration_seconds']['known']==5.

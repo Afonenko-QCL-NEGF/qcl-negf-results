@@ -246,9 +246,8 @@ before production integration acceptance.
 
 The published Contracts revision adds separate technical commit/summary/pointer/binding v2,
 retained catalog3 and performance index3. This reader accepts an explicit commit2 FileRef through
-the unchanged `TelemetrySelection` and `read_performance_context` ports. It does not enable a v2
-writer, select a newest/index entry, convert a v1 root, prune files or change capture-spec/native5.
-Writer/window/export production remains a separate owning stage. Existing v1 read/export and
+the unchanged `TelemetrySelection` and `read_performance_context` ports. The reader does not select a newest/index entry or convert a v1 root. The explicit source-only
+writer/window API below is separate from production capture activation and capture-spec/native5. Existing v1 read/export and
 recursive full-state semantics remain on their original branch.
 
 ```python
@@ -327,3 +326,57 @@ A successful v2 receive adds `technical_verification` with the retained-window s
 consistency only. It does not refresh native access, actual producer association, pin leases,
 writer/pruning readiness, runtime overhead or scientific acceptance. The wire/archive checks use
 manufactured fixtures; source publication and later installed/native qualification remain separate.
+
+## Opt-in writer and owned-fixture retention
+
+`TelemetryWriter(..., technical_version=2, prior_capture='none')` writes the retained
+technical format in a fresh empty root and requires an explicit Transport. `prior_capture`
+may be `unimported`; that evidence remains sticky through rotation and resume. The default
+is still version1. Old roots are neither converted nor appended by a version2 constructor.
+`resume(..., technical_version=2, prior_capture=...)` consumes one exact current transaction,
+its immediate predecessor/catalog and committed contexts; it does not traverse historical
+baseline graphs. The caller must have quiesced the previous writer. Rotation keeps the
+observer operation ID; process resume starts a new ID and records an uncovered restart.
+
+Each v2 publication stages immutable catalog/summary/commit bytes, checks exact same-open
+readback and input guards, then publishes the root pointer and bounded index3. A retry after
+lost acknowledgement uses the prepared transaction's original bytes and operation interval.
+The current publication tail is excluded from its own cost delta and becomes eligible at
+the next completed operation. Every completed outer writer operation classifies all16 cost
+metrics. Acknowledged logical payload bytes and process CPU are measured; uninstrumented
+read/probe/physical I/O/serialization timings remain unavailable with sticky coverage.
+Arrow I/O is separately an admitted forecast. A failed operation cannot claim known zero
+bytes for an uncertain write. None of these counters is a physical disk quota.
+
+`retain_window(maximum_retained_bytes=..., minimum_free_bytes=...,
+maximum_io_bytes=..., protected_refs=(...))` returns the existing Retention object. It
+publishes exact before/introduced/removed membership before any unlink, including the mandatory
+previous-catalog metadata leaf. Current/previous transaction/catalog refs, accepted raw delta,
+required phase/resume proof and explicit caller-held refs are protected. Older catalog leaves
+retire through the authenticated window delta. Unsuccessful unlink remains physical debt;
+a later barrier retries it, and only acknowledged success removes that debt from the next
+transaction. Whole-file footer rows and accepted physical extents determine omission counts;
+missing row counts are never inferred as zero. Per-operation metadata/delivered I/O admission
+and Arrow forecasts are capped at4MiB. Before dependent writes the writer checks observed free
+space against the supplied reserve, retained closure, physical debt and temporary metadata burst.
+Insufficient space refuses that dependent operation; buffered probe data remain uncommitted.
+Catalog/raw/phase limits and combined1MiB working metadata still apply, even if individual
+cardinality maxima would permit more members. New phase keys that do not fit prospective
+current/previous/cache object headroom go into the explicit overflow bucket; established keys
+are retained. Inclusive phase totals never become a whole-solver wall interval.
+
+Internal v2 export and `make_binding` explicitly select `PerformanceLimits(maximum_objects=16384)`.
+Public `read_performance_context` and performance-view callers must supply that allowance when
+needed; their default4096 is unchanged and can reject a valid larger retained closure. Tight
+limits still fail through the unchanged whole-cache S2 guards. Both export profiles carry
+exactly the same complete retained technical closure and explicit retained-v2 cutoff fields.
+Scientific profile selection and the existing Parquet compaction algorithm are unchanged.
+The fixed root hardware passport is outside catalog3 membership: S1 permits performance.v2
+as Parquet, not arbitrary JSON. It adds fixed root overhead rather than one passport per rotation.
+
+This writer/window implementation is qualified here only for source and exclusively owned local
+fixtures. `protected_refs` expresses exact constraints; it does not establish the actual absence
+of other RO/export/copy users. Native/shared/NFS activation requires the separate TL-O lifetime,
+owner/no-reuse, pin and crash/fault gates. The existing capture observer remains v1 by default;
+its historical lifetime credits do not become limits of the explicit v2 writer. Source fixture
+throughput and bounded windows do not establish native overhead or scientific acceptance.

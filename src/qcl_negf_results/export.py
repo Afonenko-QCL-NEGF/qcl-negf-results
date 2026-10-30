@@ -152,7 +152,8 @@ def _technical_selection(reader, telemetry, profile, bindings):
     from .performance_views import _load_telemetry, PerformanceLimits
     from .catalog import _catalog_rows
     from qcl_negf_contracts.telemetry import TABLE_FIELDS, TELEMETRY_SCHEMA
-    loaded = _load_telemetry(reader, telemetry, PerformanceLimits(), bindings)
+    limits=(PerformanceLimits(maximum_objects=16384) if telemetry.commit_ref['schema']=='qcl-negf.telemetry-commit.v2' else PerformanceLimits())
+    loaded = _load_telemetry(reader, telemetry, limits, bindings)
     selected = {}; omitted = []; rows = []
     def add(scope, reference, role, **extra):
         key = (str(Path(scope).absolute()), reference['path'])
@@ -170,6 +171,24 @@ def _technical_selection(reader, telemetry, profile, bindings):
         role = 'performance.summary' if ref==loaded['commit']['summary'] and scope==telemetry.artifact_root else 'performance.provenance'
         add(scope,ref,role)
     commit=loaded['commit'];commits=[commit]
+    if loaded.get('technical_version') == 2:
+        # S2 already authenticated the complete bounded retained closure. Previous
+        # catalog descriptors are opaque leaves, never recursive export promises.
+        for ordinal,descriptor in enumerate(loaded['catalog']['artifacts']):
+            ref=descriptor['ref'];key=(str(telemetry.artifact_root.absolute()),ref['path'])
+            if key not in selected:raise ContractError('authenticated retained member missing','corrupt_result')
+            selected[key].update(role=descriptor['role'],table=descriptor['table'],
+                catalog_order=(0,ordinal),source_role=descriptor['role'],selection='retained_technical_window')
+        scope_fields=dict(technical_contract='qcl-negf.telemetry-retained.v2',scope='retained_technical_window',
+            catalog=copy.deepcopy(commit['catalog']),cumulative_scope='enclosing_transport_since_v2_genesis',
+            prior_capture=loaded['summary']['cumulative']['prior_capture'])
+        return dict(loaded=loaded,selected=selected,omitted=[],scope_fields=scope_fields,
+            cutoff=dict(commit=telemetry.commit_ref,source_cursors=commit['source_cursors'],
+                uncommitted='not_included',pending_rows=None,**scope_fields),
+            freshness=dict(session=commit['session']['source']['session_id'],published_unix=commit['published_unix'],
+                observed_unix=telemetry.observed_unix,committed_age_seconds=None if telemetry.observed_unix is None else telemetry.observed_unix-commit['published_unix'],
+                maximum_buffer_seconds=loaded['summary']['durability']['maximum_buffer_seconds'],pending_rows=None),
+            root=telemetry.artifact_root,plan_root=telemetry.canonical_plan_root)
     if profile=='full-state':
         from .performance_views import _read_reference
         from .state import _schema_check,_metadata_weight
@@ -394,7 +413,7 @@ def _export_snapshot(reader, destination, *, profile, byte_budget, reserve_bytes
                     source_role=row.get('source_role',row['role']),selection=row.get('selection','exact_transaction_metadata')))
             footer.finish()
             technical_record=dict(source_state=copy.deepcopy(reader.source.state),source_commit_sha256=telemetry.commit_ref['sha256'],
-                technical=True,included=technical_included,omitted_by_policy=technical['omitted'])
+                technical=True,included=technical_included,omitted_by_policy=technical['omitted'],**technical.get('scope_fields',{}))
             records.append(technical_record)
             compaction=compact_export_records([technical_record],objects,spool,budget=budget,io_budget=reader._budget,retain_original=True)
             originals={row['object'] for row in technical_locator if row['reference']['media_type']=='application/vnd.apache.parquet'}

@@ -13,6 +13,7 @@ import threading
 import time
 from typing import Any, Mapping
 import uuid
+from functools import wraps
 
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -34,7 +35,7 @@ _REQUIRED = {"spans": {"phase", "duration_seconds"},
 
 def publish_pointer(path: Path, reference: Mapping[str, Any]) -> None:
     """Technical pointer only; never use the scientific pointer wire adapter."""
-    atomic_write(path,json_bytes(dict(schema='qcl-negf.telemetry-pointer.v1',
+    atomic_write(path,json_bytes(dict(schema=('qcl-negf.telemetry-pointer.v2' if reference['schema'].endswith('.v2') else 'qcl-negf.telemetry-pointer.v1'),
         contract_set=CONTRACT_SET,commit=dict(reference))))
 
 
@@ -155,6 +156,75 @@ class CpuCoverage:
         }
 
 
+_UINT64_MAX = 2**64-1
+_COST_FLOATS = ('probe_seconds','read_seconds','hash_seconds','parse_validate_seconds',
+                'serialize_seconds','parquet_seconds','flush_sync_seconds','process_cpu_seconds')
+_COST_METRICS = (*_COST_FLOATS,'bytes_read','bytes_written','physical_read_bytes','physical_write_bytes',
+                 'polls','flushes','source_reopens','reverified_bytes')
+_PHASE_METRICS = ('duration_seconds','process_cpu_seconds','allocated_bytes','gc_seconds','gc_count')
+
+
+def _count(value):
+    if not 0 <= value <= _UINT64_MAX:raise ValueError('UInt64 counter overflow before publication')
+    return str(value)
+
+
+def _empty_accumulation():
+    return dict(known=None,covered='0',unavailable='0',overflow='0',reasons=[])
+
+
+def _accumulate(left,right,integer=False):
+    counts={k:_count(int(left[k])+int(right[k])) for k in ('covered','unavailable','overflow')}
+    parts=[r['known'] for r in (left,right) if r['known'] is not None]
+    known=None
+    if parts:
+        known=_count(sum(int(v) for v in parts)) if integer else math.fsum(parts)
+        if not integer and not math.isfinite(known):raise ValueError('Float64 subtotal overflow before publication')
+    reasons=set(left['reasons'])|set(right['reasons'])
+    if any(int(v) for v in counts.values()):reasons.discard('no_observations')
+    return dict(known=known,**counts,reasons=sorted(reasons))
+
+
+def _nodes(value):
+    pending=[value];total=0
+    while pending:
+        node=pending.pop();total+=1
+        if isinstance(node,dict):pending.extend(node.values())
+        elif isinstance(node,(list,tuple)):pending.extend(node)
+    return total
+
+
+def _observed(method):
+    @wraps(method)
+    def operation(self,*args,**kwargs):
+        if self.technical_version != 2 or self._operation_depth:return method(self,*args,**kwargs)
+        _count(self._operation_stop+1)
+        self._io_remaining=min(4194304,kwargs.get('maximum_io_bytes',4194304))
+        forecast=self._forecast_total
+        self._operation_depth+=1
+        cpu=self._cost_cpu_position;written=self._cost_written_position;failed=False
+        try:return method(self,*args,**kwargs)
+        except BaseException:
+            failed=True
+            raise
+        finally:
+            self._operation_depth-=1
+            self._cost_cpu_position=time.process_time()
+            values=dict(process_cpu_seconds=self._cost_cpu_position-cpu,
+                        bytes_written=None if failed else self._metadata_written-written)
+            self._cost_written_position=self._metadata_written
+            if method.__name__=='flush':values['flushes']=1
+            for key in _COST_METRICS:
+                value=values.get(key)
+                item=dict(known=(_count(value) if key not in _COST_FLOATS else value) if value is not None else None,
+                          covered='1' if value is not None else '0',unavailable='0' if value is not None else '1',
+                          overflow='0',reasons=[] if value is not None else ['missing_observation'])
+                self._cost_metrics[key]=_accumulate(self._cost_metrics[key],item,key not in _COST_FLOATS)
+            self._operation_stop+=1
+            self._io_forecast_pending+=self._forecast_total-forecast
+    return operation
+
+
 class TelemetryWriter:
     """Synchronous bounded flush outside numerical hot loops; no sample dropping.
 
@@ -163,12 +233,42 @@ class TelemetryWriter:
     """
     def __init__(self, root: Path, identity: Mapping[str, Any], hardware: Mapping[str, Any],
                  *, batch_rows: int = 256, batch_bytes: int = 4 * 1024 * 1024,
-                 max_buffer_seconds: float = 15.0, metadata_budget=None, transport=None) -> None:
+                 max_buffer_seconds: float = 15.0, metadata_budget=None, transport=None,
+                 technical_version: int = 1, prior_capture: str = 'none') -> None:
+        if type(technical_version) is not int or technical_version not in (1, 2):
+            raise ValueError('technical_version must be 1 or 2')
+        if prior_capture not in ('none', 'unimported') or technical_version == 1 and prior_capture != 'none':
+            raise ValueError('prior_capture requires explicit v2')
+        if technical_version == 2:
+            if transport is None:raise ValueError('v2 requires explicit transport')
+            if Path(root).is_symlink() or Path(root).exists() and any(Path(root).iterdir()):
+                raise ValueError('v2 requires a fresh empty technical root')
         self._initialize_writer(root,identity,hardware,batch_rows=batch_rows,batch_bytes=batch_bytes,
-            max_buffer_seconds=max_buffer_seconds,metadata_budget=metadata_budget,transport=transport)
+            max_buffer_seconds=max_buffer_seconds,metadata_budget=metadata_budget,transport=transport,
+            technical_version=technical_version,prior_capture=prior_capture)
 
     def _initialize_writer(self,root,identity,hardware,*,batch_rows=256,batch_bytes=4*1024*1024,
-            max_buffer_seconds=15.,metadata_budget=None,transport=None,create_outputs=True,publish=True):
+            max_buffer_seconds=15.,metadata_budget=None,transport=None,create_outputs=True,publish=True,
+            technical_version=1,prior_capture="none"):
+        self.technical_version=technical_version
+        self.prior_capture=prior_capture
+        self._catalog=None
+        self._catalog_ref=None
+        self._window_removals=[]
+        self._pin_refused=False
+        self._unlinked=set()
+        self._observer_id=uuid.uuid4().hex
+        self._operation_stop=0
+        self._cost_metrics={k:_empty_accumulation() for k in _COST_METRICS}
+        self._operation_depth=0
+        self._io_remaining=4194304
+        self._minimum_free_bytes=0
+        self._forecast_total=0
+        self._io_forecast_pending=0
+        self._v2_phase_rows=[]
+        self._v2_restart=False
+        if technical_version==2 and (type(batch_bytes) is not int or batch_bytes>4194304):
+            raise ValueError('v2 batch payload exceeds4MiB operation bound')
         if type(batch_rows) is not int or batch_rows < 1 or batch_rows > 65_536:
             raise ValueError("batch_rows must be in 1..65536")
         if type(batch_bytes) is not int or batch_bytes < 1024:
@@ -196,6 +296,8 @@ class TelemetryWriter:
         self._metadata_written = 0
         self._retained_bytes = 0
         self._began_cpu = time.process_time()
+        self._cost_cpu_position=self._began_cpu
+        self._cost_written_position=0
         self.root = Path(root)
         self.metadata_budget = metadata_budget
         self.session_id = uuid.uuid4().hex
@@ -256,16 +358,27 @@ class TelemetryWriter:
                 "compile_target", "libraries"} - set(hardware)),
             "time_semantics": "monotonic nanoseconds; durations and CPU time in seconds",
             "sampling": "all received rows retained; absent measurements are null"}
-        self._metadata_write(self.directory / "hardware.json", json_bytes(passport), immutable=True)
-        self.artifacts.append(self._metadata_artifact(self.directory / "hardware.json",
-            relative="hardware.json", role="performance.summary", media_type="application/json",schema=TELEMETRY_SCHEMA))
+        if self.technical_version == 1:
+            self._metadata_write(self.directory / "hardware.json", json_bytes(passport), immutable=True)
+            self.artifacts.append(self._metadata_artifact(self.directory / "hardware.json",
+                relative="hardware.json", role="performance.summary", media_type="application/json",schema=TELEMETRY_SCHEMA))
+        elif not (self.root/'hardware.json').exists():
+            # Fixed root passport is not a retained-catalog member: S1 permits
+            # performance.v2 only as Parquet, never as arbitrary JSON metadata.
+            self._metadata_write(self.root/'hardware.json',json_bytes(passport),immutable=True)
         if publish:
             self._publish()
             self._register()
 
     @classmethod
     def resume(cls,root: Path,*,commit_ref,expected_session,hardware,
-            batch_rows=256,batch_bytes=4*1024*1024,max_buffer_seconds=15.,metadata_budget=None):
+            batch_rows=256,batch_bytes=4*1024*1024,max_buffer_seconds=15.,metadata_budget=None,
+            technical_version=1,prior_capture='none'):
+        if technical_version == 2:
+            return cls._resume2(root,commit_ref=commit_ref,expected_session=expected_session,hardware=hardware,
+                batch_rows=batch_rows,batch_bytes=batch_bytes,max_buffer_seconds=max_buffer_seconds,
+                metadata_budget=metadata_budget,prior_capture=prior_capture)
+        if technical_version != 1 or prior_capture != 'none':raise ValueError('invalid technical version/prior capture')
         """Resume one exact immutable metadata baseline; never infer old CPU endpoints."""
         from ._capture_io import regular,stamp
         from .commits import decode_json
@@ -331,7 +444,22 @@ class TelemetryWriter:
         verify();obj._publish();obj._register()
         return obj
 
+    def _charge_io2(self,count):
+        if self.technical_version == 2:
+            if count>self._io_remaining:raise ValueError('operation I/O allowance exhausted before dependent I/O')
+            self._io_remaining-=count
+
+    def _space2(self,burst):
+        if self.technical_version==2:
+            space=os.statvfs(self.root)
+            debt=sum(int(r['bytes']) for r in self._previous['window_delta']['pending_unlink']) if self._previous else 0
+            retained=sum(int(r['ref']['bytes']) for r in self._catalog['artifacts']) if self._catalog else 0
+            if space.f_bavail*space.f_frsize < self._minimum_free_bytes+debt+retained+burst+1048576:
+                raise ValueError('scientific free-space reserve unavailable before dependent write')
+
     def _metadata_write(self, path, payload, *, immutable=False):
+        self._space2(len(payload))
+        self._charge_io2(len(payload))
         if len(payload)>1024*1024:
             raise ValueError('technical metadata exceeds bounded page')
         if self.metadata_budget is not None:
@@ -340,6 +468,7 @@ class TelemetryWriter:
         self._metadata_written += len(payload)
 
     def _check_retained(self,path,payload):
+        self._charge_io2(len(payload))
         from ._capture_io import regular,stamp
         with regular(path,size=len(payload)) as stream:
             before=stamp(stream,include_change=True)
@@ -351,6 +480,7 @@ class TelemetryWriter:
             now=path.stat(follow_symlinks=False)
             if (now.st_dev,now.st_ino,now.st_size,now.st_mtime_ns,now.st_ctime_ns)!=before:
                 raise ValueError('retained immutable telemetry path replaced')
+            return before
 
     def _metadata_artifact(self, path, **kwargs):
         if self.metadata_budget is not None:
@@ -364,6 +494,7 @@ class TelemetryWriter:
         return dict(reference,path=str(self.directory.relative_to(self.root)/reference['path']))
 
     def _register(self) -> None:
+        if self.technical_version == 2:return
         self.root.mkdir(parents=True, exist_ok=True)
         with (self.root / ".index.lock").open("a+b") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
@@ -424,10 +555,13 @@ class TelemetryWriter:
                 raise ValueError(f"{name} must be boolean")
         return value
 
+    @_observed
     def _record(self, table: str, row: Mapping[str, Any], science_window: bool) -> None:
         with self.lock:
             if self.closed:
                 raise RuntimeError("telemetry session is closed")
+            if self.technical_version==2 and any(isinstance(v,str) and len(v)>self.batch_bytes for v in row.values()):
+                raise ValueError('row string exceeds bounded payload before UTF8 allocation')
             value = self._normalise(table, row)
             self._reserve([value])
             self._append(table, value, science_window)
@@ -520,6 +654,7 @@ class TelemetryWriter:
             aggregate["sum_seconds"] += duration
             aggregate["max_seconds"] = max(aggregate["max_seconds"], duration)
 
+    @_observed
     def ingest_spans(self, rows: list[Mapping[str, Any]], *, source_cursors: Mapping[str, Any]) -> Path:
         """Publish source offsets and their exact rows in the same immutable commit.
 
@@ -547,6 +682,7 @@ class TelemetryWriter:
                 self._mark_pending()
             return self.flush()
 
+    @_observed
     def stage_spans(self, rows: list[Mapping[str, Any]], *, source_cursors: Mapping[str, Any]) -> None:
         """Accept a replayable source batch without promising immediate durability.
 
@@ -689,6 +825,7 @@ class TelemetryWriter:
             if count>self.batch_bytes or ref['media_type']!='application/json':raise ValueError('context metadata allowance/schema exceeded')
             path=beneath(self.root,ref['path'])
             with regular(path,size=count) as raw:
+                self._charge_io2(count)
                 before=stamp(raw,include_change=True);io.require(count)
                 if self.metadata_budget is not None:self.metadata_budget.require(count)
                 data=raw.read(count);io.account(len(data))
@@ -715,7 +852,9 @@ class TelemetryWriter:
         _check_bindings(guards)
         return phases,resumes,guards
 
+    @_observed
     def rotate(self):
+        if self.technical_version == 2:return self._rotate2()
         """Explicit barrier: close old page, then begin an empty active page."""
         from .performance_views import _check_bindings
         with self.lock:
@@ -740,6 +879,7 @@ class TelemetryWriter:
             self.__dict__.update(candidate.__dict__)
             return old_path
 
+    @_observed
     def stage_phase_batch(self,batch,*,phase_context_refs=(),resume_context_refs=()) -> None:
         from .capture import PhaseBatch
         from .state import _metadata_weight
@@ -842,22 +982,46 @@ class TelemetryWriter:
                 summary=self._root_ref(dict(path=f'summary-{self.generation+1:06d}.json',bytes=str(len(summary_raw)),sha256=hashlib.sha256(summary_raw).hexdigest(),media_type='application/json',schema=summary['schema'])),
                 catalog=self._root_ref(self.catalog_watermark) if self.catalog_watermark is not None else None,source_cursors=list(cursors.values()),accepted_ranges=deepcopy(self.accepted_ranges)+[accepted])
             kwargs={} if self._previous is None else dict(previous=self._previous,previous_ref=self._previous_ref,previous_summary=self._previous_summary,previous_summary_ref=self._previous['summary'])
-            validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],phase_contexts=list(contexts.values()),resume_contexts=list(resumes.values()),**kwargs)
+            if self.technical_version == 1:
+                validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],phase_contexts=list(contexts.values()),resume_contexts=list(resumes.values()),**kwargs)
+            else:
+                candidate.accepted_ranges=deepcopy(self.accepted_ranges)+[accepted]
+                candidate.phase_contexts=list(contexts.values());candidate._phase_context_refs=context_refs
+                candidate._resume_contexts=list(resumes.values());candidate.staged_source_cursors=cursors
+                candidate._v2_phase_rows=self._v2_phase_rows+[(representation,deepcopy(row)) for row in projected]
+                candidate.artifacts=deepcopy(self.artifacts)
+                for ref in rawrefs:
+                    if ref['path'] not in self._phase_raw:
+                        candidate.artifacts.append(dict(ref,path=str((self.root/ref['path']).relative_to(self.directory)),
+                            bytes=int(ref['bytes']),role='performance.window'))
+                pending={table:sum(len(rows) for (name,_),rows in self.buffers.items() if name==table) for table in TABLE_FIELDS}
+                pending['spans']+=len(span_rows)
+                for table,count in pending.items():
+                    if count:
+                        candidate.artifacts.append(dict(path='.staging-check-'+table+'.parquet',bytes=1,sha256='0'*64,
+                            media_type='application/vnd.apache.parquet',schema=TELEMETRY_SCHEMA,role='performance.full',table=table,_staging_rows=count))
+                candidate._prepare2()
+
             if _metadata_weight((self.phase_aggregates,phases,self.phase_contexts,list(contexts.values()),self._last_phase_contexts,self._last_phase_raw,cursors,list(resumes.values()),input_guards,self._context_guards)) + 2*_metadata_weight(context_refs)>self.batch_bytes:
                 raise ValueError('phase old/new working metadata exceeds byte bound')
             from .performance_views import _check_bindings
             _check_bindings(input_guards)
             # Invalid input above has not advanced counters/cursors or published files.
-            additions=[]
+            additions=[];raw_guards={}
             for ref,raw in zip(rawrefs,(batch.segment_bytes,batch.publication_bytes)):
                 target=self.root/ref['path']
                 if target.exists():
                     self._check_retained(target,raw)
                 else:
                     if self.metadata_budget is not None:self.metadata_budget.write(len(raw))
+                    self._space2(len(raw));self._charge_io2(len(raw))
                     atomic_write(target,raw,immutable=True);self._metadata_written+=len(raw)
+                if self.technical_version==2:
+                    raw_guards[(str(self.root.absolute()),ref['path'])]=self._check_retained(target,raw)
                 if ref['path'] not in self._phase_raw:
                     additions.append(dict(ref,path=str(target.relative_to(self.directory)),bytes=int(ref['bytes']),role='performance.window',profile='science',dependencies=[]))
+            if self.technical_version == 2:
+                self._v2_phase_rows.extend((representation,deepcopy(row)) for row in projected)
             self.artifacts.extend(additions)
             for ref in rawrefs:self._phase_raw[ref['path']]=deepcopy(ref)
             self._phase_context_refs = deepcopy(context_refs)
@@ -866,6 +1030,7 @@ class TelemetryWriter:
             self._last_phase_raw[sourcekey]=dict(publication_ref=deepcopy(batch.publication_ref),segment_ref=deepcopy(batch.segment_ref),
                 retained_publication_ref=deepcopy(rawrefs[1]),retained_segment_ref=deepcopy(rawrefs[0]))
             self._context_guards.update(input_guards)
+            self._context_guards.update(raw_guards)
             for value in span_rows:self._append('spans',value,False,auto_flush=False)
             self._mark_pending()
             if self.pending_rows>=self.batch_rows:self.flush()
@@ -895,6 +1060,7 @@ class TelemetryWriter:
             self._append("control_events", value, True, auto_flush=False)
             self.flush()  # Critical transitions are durable before returning to admission.
 
+    @_observed
     def flush(self) -> Path:
         return self._flush()
 
@@ -924,6 +1090,10 @@ class TelemetryWriter:
                         b"schema": TELEMETRY_SCHEMA.encode(), b"table": table.encode(),
                         b"contract_set": CONTRACT_SET.encode(),
                         b"units": b"monotonic_ns=ns; *_seconds=s; *_bytes=B"})
+                forecast=0
+                if self.technical_version==2:
+                    forecast=4*sum(self._row_bytes(row) for row in rows)+262144
+                    self._space2(forecast);self._charge_io2(forecast);self._forecast_total+=forecast
                 try:
                     pq.write_table(pa.Table.from_pylist(rows, schema=schema), temporary,
                                    compression="zstd", compression_level=3,
@@ -933,6 +1103,8 @@ class TelemetryWriter:
                     # A readable footer is necessary before publication.
                     if pq.ParquetFile(temporary).metadata.num_rows != len(rows):
                         raise RuntimeError("Parquet row count mismatch before commit")
+                    if self.technical_version==2 and 3*temporary.stat().st_size>forecast:
+                        raise ValueError('Arrow serialization exceeded admitted I/O forecast')
                     destination = self.directory / name
                     os.link(temporary, destination)
                     fsync_directory(self.directory)
@@ -941,6 +1113,7 @@ class TelemetryWriter:
                         profile="science" if selected_window else "full-state",
                         media_type="application/vnd.apache.parquet", schema=TELEMETRY_SCHEMA))
                     self.artifacts[-1]["table"] = table
+                    if self.technical_version==2:self._metadata_written+=destination.stat().st_size
                     if selected_window:
                         self.window_buckets[table] = bucket
                         self.transition_windows.discard(table)
@@ -1061,6 +1234,7 @@ class TelemetryWriter:
             observer_self_cost=cost,recorded_until_monotonic_ns=count(time.monotonic_ns()),durability=durability,science_window_policy=windows)
 
     def _publish(self) -> Path:
+        if self.technical_version == 2:return self._publish2()
         if self._publication_pending is None:
             generation=self.generation+1
             watermark=self.catalog_watermark
@@ -1133,6 +1307,354 @@ class TelemetryWriter:
         self.accepted_ranges=[];self.phase_contexts=[];self._phase_context_refs=[];self._resume_contexts=[];self._context_guards={};self._publication_pending=None
         return self.root/self._previous_ref['path']
 
+    def _phase_rollup2(self,summary,catalog):
+        prior=self._previous_summary['cumulative']['phases'] if self._previous_summary else None
+        roll=deepcopy(prior) if prior else dict(scope='accepted_source_rows_across_sources_no_cross_clock_bounds',entries=[],
+            overflow=dict(call_count='0',metrics={k:_empty_accumulation() for k in _PHASE_METRICS}),incomplete=False,reasons=[])
+        entries={encode(r['key']):r for r in roll['entries']}
+        for representation,row in self._v2_phase_rows:
+            key={k:row[k] for k in ('stage','phase','status','task_width','counter_scope')};key['representation']=representation
+            token=encode(key)
+            empty=dict(key=key,call_count='0',metrics={k:_empty_accumulation() for k in _PHASE_METRICS})
+            prospective=dict(roll,entries=[*entries.values(),empty])
+            # Reserve duplicated current/previous/cache trees plus external binding,
+            # plan and detached return headroom under the explicit v2 object ceiling.
+            base=(summary,catalog,self._previous,self._previous_summary,self._catalog,self.phase_contexts,self._resume_contexts)
+            if token not in entries and len(entries)<64 and 2*_nodes((base,prospective))+4096<=16384:
+                entries[token]=empty
+            target=entries.get(token,roll['overflow']);calls=int(row['call_count'])
+            target['call_count']=_count(int(target['call_count'])+calls)
+            for name in _PHASE_METRICS:
+                allowed=('B','bytes') if name=='allocated_bytes' else ('1','') if name=='gc_count' else ('s',)
+                found=[m for m in row['metrics'] if m['name']==name]
+                m=found[0] if len(found)==1 and found[0]['unit'] in allowed else None
+                measured=int(m['measured_calls']) if m else 0;missing=int(m['unavailable_calls']) if m else calls
+                known=m['sum'] if m else None
+                if isinstance(known,dict):known=int(known['decimal'])
+                overflow=measured if measured and known is None else 0;covered=measured-overflow
+                if known is not None and name in ('allocated_bytes','gc_count') and (type(known) is not int or not 0<=known<=_UINT64_MAX):
+                    missing+=covered;covered=0;known=None
+                reasons=(['missing_observation'] if missing else [])+(['counter_overflow'] if overflow else [])
+                contribution=dict(known=str(known) if known is not None and name in ('allocated_bytes','gc_count') else known,
+                    covered=_count(covered),unavailable=_count(missing),overflow=_count(overflow),reasons=reasons)
+                target['metrics'][name]=_accumulate(target['metrics'][name],contribution,name in ('allocated_bytes','gc_count'))
+                roll['reasons']=sorted(set(roll['reasons'])|set(reasons))
+            if target is roll['overflow']:roll['reasons']=sorted(set(roll['reasons'])|{'phase_key_limit'})
+        roll['entries']=[entries[k] for k in sorted(entries)]
+        roll['incomplete']=bool(roll['reasons'])
+        return roll
+
+    def _descriptor2(self,artifact):
+        ref=self._root_ref({k:artifact[k] for k in ('path','sha256','media_type','schema')}|{'bytes':str(artifact['bytes'])})
+        table=artifact.get('table');rows=None
+        if table is not None:
+            if '_staging_rows' in artifact:rows=_count(artifact['_staging_rows'])
+            else:
+                self._charge_io2(int(ref['bytes']))
+                rows=_count(pq.ParquetFile(self.root/ref['path']).metadata.num_rows)
+        accepted=[]
+        for ar in self.accepted_ranges:
+            if ar['retained_segment']==ref:
+                accepted.append({k:deepcopy(ar[k]) for k in ('source_key','segment','first_row','stop_row')})
+        return dict(ref=ref,role=artifact['role'],table=table,rows=rows,accepted=accepted)
+
+    def _protected2(self,extra=()):
+        refs=list(extra)
+        if self._previous:
+            refs.extend((self._previous_ref,self._previous['summary'],self._previous['catalog']))
+        for ar in self.accepted_ranges:
+            refs.extend(ar[k] for k in ('retained_publication','retained_segment') if ar[k] is not None)
+        for row in self._phase_context_refs:
+            refs.extend(row[k] for k in ('retained_publication_ref','retained_segment_ref'))
+        for row in self._last_phase_raw.values():
+            refs.extend(row[k] for k in ('retained_publication_ref','retained_segment_ref'))
+        for pair in self._resume_contexts:refs.extend((pair['commit_ref'],pair['summary_ref']))
+        return {r['path']:r for r in refs}
+
+    def _prepare2(self):
+        from .state import _metadata_weight
+        generation=self.generation+1
+        old=self._catalog['artifacts'] if self._catalog else []
+        before={r['ref']['path']:deepcopy(r) for r in old};after=deepcopy(before)
+        protected=self._protected2()
+        removed={r['ref']['path']:r for r in self._window_removals}
+        # Historical catalog leaves leave membership through the same authenticated delta.
+        for row in old:
+            if row['ref']['schema']=='qcl-negf.telemetry-catalog.v3' and row['ref']['path'] not in protected:
+                removed[row['ref']['path']]=row
+        for path in removed:
+            if path in protected:raise ValueError('protected technical member cannot retire')
+            after.pop(path)
+        for artifact in self.artifacts:
+            row=self._descriptor2(artifact);path=row['ref']['path']
+            if path in after:
+                if after[path]['ref']!=row['ref']:raise ValueError('immutable retained path rebound')
+                row['accepted']=after[path]['accepted']+[e for e in row['accepted'] if e not in after[path]['accepted']]
+            after[path]=row
+        # New ranges can extend an existing retained original without rewriting it.
+        for ar in self.accepted_ranges:
+            if ar['retained_segment'] is not None:
+                row=after[ar['retained_segment']['path']];extent={k:deepcopy(ar[k]) for k in ('source_key','segment','first_row','stop_row')}
+                if extent not in row['accepted']:row['accepted'].append(extent)
+        if self._previous:
+            ref=deepcopy(self._previous['catalog']);after[ref['path']]=dict(ref=ref,role='performance.provenance',table=None,rows=None,accepted=[])
+        ordered=lambda rows:sorted(rows,key=lambda a:(a['ref']['path'],a['ref']['sha256']))
+        catalog=dict(schema='qcl-negf.telemetry-catalog.v3',contract_set=CONTRACT_SET,transport=deepcopy(self.transport),
+                     generation=_count(generation),artifacts=ordered(after.values()))
+        introduced=ordered(row for k,row in after.items() if before.get(k)!=row)
+        retired=ordered(removed.values())
+        def reference(name,payload,schema):
+            return self._root_ref(dict(path=name,bytes=str(len(payload)),sha256=hashlib.sha256(payload).hexdigest(),media_type='application/json',schema=schema))
+        name=f'catalog-{generation:09d}.json';raw=json_bytes(catalog)
+        if len(raw)>65536 or len(after)>128:raise ValueError('bounded retained catalog exhausted; retain_window before adding detail')
+        catalog_ref=reference(name,raw,catalog['schema']);publications=[(name,raw)]
+        committed={**self.source_cursors,**self.staged_source_cursors}
+        summary=self._technical_summary(generation,list(committed.values()))
+        summary['schema']='qcl-negf.telemetry-summary.v2';summary.pop('baseline')
+        summary['coverage']['detail_scope']='collector_session_local'
+        retention=summary['retention'];prior=self._previous_summary
+        for k in ('omitted_source_rows','omitted_resource_rows','omitted_span_rows'):
+            retention[k]=prior['retention'][k] if prior else '0'
+        retention['omitted_source_rows']=_count(int(retention['omitted_source_rows'])+sum(int(e['stop_row'])-int(e['first_row']) for row in retired for e in row['accepted']))
+        for table,k in (('resources','omitted_resource_rows'),('spans','omitted_span_rows')):
+            retention[k]=_count(int(retention[k])+sum(int(row['rows']) for row in retired if row['table']==table))
+        retention['retained_source_rows']=_count(sum(int(e['stop_row'])-int(e['first_row']) for row in after.values() for e in row['accepted']))
+        retention['retained_bytes']=_count(sum(int(row['ref']['bytes']) for row in after.values()))
+        retention['pinned_retention_refused']=self._pin_refused
+        retention['incomplete']=self._pin_refused or any(int(retention[k]) for k in ('omitted_source_rows','omitted_resource_rows','omitted_span_rows'))
+        retention['reasons']=(['pin_refused'] if self._pin_refused else [])+(['retention_omission'] if any(int(retention[k]) for k in ('omitted_source_rows','omitted_resource_rows','omitted_span_rows')) else [])
+        previous_cost=prior['cumulative']['cost'] if prior else None
+        same_observer=previous_cost is None or previous_cost['position']['observer_id']==self._observer_id
+        first=int(previous_cost['position']['stop_operation']) if previous_cost and same_observer else 0
+        delta=dict(observer_id=self._observer_id,first_operation=_count(first),stop_operation=_count(self._operation_stop),
+            as_of_monotonic_ns=_count(time.monotonic_ns()),metrics=deepcopy(self._cost_metrics),arrow_io_forecast_bytes=_count(self._io_forecast_pending),
+            publication_tail='not_included',restart_gap=not same_observer)
+        cost=dict(scope='observer_process_completed_operations',position=dict(observer_id=self._observer_id,stop_operation=delta['stop_operation']),
+            metrics={k:_accumulate(previous_cost['metrics'][k] if previous_cost else _empty_accumulation(),delta['metrics'][k],k not in _COST_FLOATS) for k in _COST_METRICS},
+            arrow_io_forecast_bytes=_count((int(previous_cost['arrow_io_forecast_bytes']) if previous_cost else 0)+self._io_forecast_pending),
+            uncovered_restarts=_count((int(previous_cost['uncovered_restarts']) if previous_cost else 0)+(not same_observer)),publication_tail='not_included')
+        phases=self._phase_rollup2(summary,catalog);reasons=set(prior['cumulative']['coverage']['reasons'] if prior else [])-{'no_observations'}
+        if self.prior_capture=='unimported':reasons.add('unimported_capture')
+        if not same_observer:reasons.add('collector_restart')
+        if summary['coverage']['incomplete']:reasons.add('missing_observation')
+        if int(summary['coverage']['capture_error_events']):reasons.add('capture_error')
+        if int(summary['totals']['collector_dropped_rows']):reasons.add('missing_observation')
+        reasons.update(retention['reasons']);reasons.update(phases['reasons'])
+        for metric in cost['metrics'].values():
+            if int(metric['unavailable']) or int(metric['overflow']):reasons.update(metric['reasons'])
+        prior_gaps=prior['coverage']['gaps'] if prior and prior['session']==summary['session'] else []
+        new_gaps=len({encode(g) for g in summary['coverage']['gaps']}-{encode(g) for g in prior_gaps})
+        gap_count=(int(prior['cumulative']['coverage']['gap_events']) if prior else 0)+max(new_gaps,int(not same_observer))
+        rss=[int(v) for v in (summary['max_observed_rss_bytes'],prior['cumulative']['max_observed_rss_bytes']['value'] if prior else None) if v is not None]
+        summary['cumulative']=dict(scope='enclosing_transport_since_v2_genesis',prior_capture=self.prior_capture,cost=cost,phases=phases,
+            coverage=dict(gap_events=_count(gap_count),incomplete=bool(reasons),reasons=sorted(reasons)),
+            max_observed_rss_bytes=self._measurement(_count(max(rss)) if rss else None,'B'))
+        validate_telemetry_summary(summary)
+        name=f'summary-{generation:06d}.json';raw=json_bytes(summary);summary_ref=reference(name,raw,summary['schema']);publications.append((name,raw))
+        debts={r['path']:r for r in self._previous['window_delta']['pending_unlink']} if self._previous else {}
+        debts.update((row['ref']['path'],row['ref']) for row in retired)
+        if self._previous and self._previous['previous']:
+            debts.update((ref['path'],ref) for ref in self._previous['previous'].values())
+        if self._previous:
+            debts.update((ref['path'],ref) for row in self._previous['contexts']['phase_context_refs'] for k,ref in row.items() if k.startswith('retained_'))
+            debts.update((ref['path'],ref) for pair in self._previous['contexts']['resume_context_refs'] for ref in pair.values())
+        debt=[deepcopy(ref) for path,ref in sorted(debts.items()) if path not in protected and path not in after and json_bytes(ref) not in self._unlinked]
+        if len(debt)>128:raise ValueError('pending physical unlink debt exhausted')
+        commit=dict(schema='qcl-negf.telemetry-commit.v2',contract_set=CONTRACT_SET,session=deepcopy(summary['session']),transport=deepcopy(self.transport),
+            generation=_count(generation),closed=self.closed,published_unix=time.time(),
+            previous=dict(commit=deepcopy(self._previous_ref),summary=deepcopy(self._previous['summary'])) if self._previous else None,
+            summary=summary_ref,catalog=catalog_ref,source_cursors=list(deepcopy(committed).values()),accepted_ranges=deepcopy(self.accepted_ranges),
+            contexts=dict(phase_context_refs=deepcopy(self._phase_context_refs),resume_context_refs=[dict(commit=r['commit_ref'],summary=r['summary_ref']) for r in self._resume_contexts]),
+            window_delta=dict(introduced=introduced,removed=retired,pending_unlink=debt),cost_delta=delta)
+        kwargs={} if self._previous is None else dict(previous=self._previous,previous_ref=self._previous_ref,previous_summary=prior,
+            previous_summary_ref=self._previous['summary'],previous_catalog=self._catalog)
+        validate_telemetry_commit(commit,summary=summary,summary_ref=summary_ref,catalog=catalog,
+            phase_contexts=self.phase_contexts,resume_contexts=self._resume_contexts,**kwargs)
+        name=f'commit-{generation:06d}.json';raw=json_bytes(commit);cref=reference(name,raw,commit['schema']);publications.append((name,raw))
+        context_raw=json_bytes(dict(commit_ref=cref,phase_context_refs=commit['contexts']['phase_context_refs'],
+            resume_context_refs=[dict(commit_ref=r['commit'],summary_ref=r['summary']) for r in commit['contexts']['resume_context_refs']]))
+        if _metadata_weight((publications,commit,summary,catalog,self._previous,self._previous_summary,self._catalog,context_raw))>1024*1024:
+            raise ValueError('combined writer metadata exceeds 1MiB allowance')
+        return dict(publications=publications,commit=commit,summary=summary,ref=cref,catalog=catalog,
+            catalog_ref=catalog_ref,committed=committed,context_raw=context_raw)
+
+    def _check_reference2(self,ref):
+        from ._capture_io import regular,beneath,stamp
+        count=int(ref['bytes']);self._charge_io2(count)
+        path=beneath(self.root,ref['path'])
+        with regular(path,size=count) as stream:
+            before=stamp(stream,include_change=True);raw=stream.read(count)
+            if len(raw)!=count or hashlib.sha256(raw).hexdigest()!=ref['sha256'] or stamp(stream,include_change=True)!=before:
+                raise ValueError('previous immutable transaction bytes changed before publication')
+            now=path.stat(follow_symlinks=False)
+            if (now.st_dev,now.st_ino,now.st_size,now.st_mtime_ns,now.st_ctime_ns)!=before:
+                raise ValueError('previous immutable transaction path replaced before publication')
+
+    def _publish2(self):
+        if self._publication_pending is None:
+            self._publication_pending=self._prepare2()
+            self._cost_metrics={k:_empty_accumulation() for k in _COST_METRICS}
+            self._io_forecast_pending=0
+        pending=self._publication_pending
+        for name,payload in pending['publications']:
+            target=self.directory/name
+            if not target.exists():self._metadata_write(target,payload,immutable=True)
+            self._check_retained(target,payload)
+        from .performance_views import _check_bindings
+        _check_bindings(self._context_guards)
+        if self._previous:
+            for ref in (self._previous_ref,self._previous['summary'],self._previous['catalog']):self._check_reference2(ref)
+        pointer=json_bytes(dict(schema='qcl-negf.telemetry-pointer.v2',contract_set=CONTRACT_SET,commit=pending['ref']))
+        self._charge_io2(len(pointer))
+        publish_pointer(self.root/'current.json',pending['ref'])
+        self._metadata_written+=len(pointer)
+        index=dict(schema='qcl-negf.performance-index.v3',contract_set=CONTRACT_SET,transport=self.transport,
+                   current=dict(commit=pending['ref'],summary=pending['commit']['summary']),retained=[])
+        self._metadata_write(self.root/'index.json',json_bytes(index))
+        fsync_directory(self.root)
+        self._previous=deepcopy(pending['commit']);self._previous_summary=deepcopy(pending['summary']);self._previous_ref=deepcopy(pending['ref'])
+        self._catalog=pending['catalog'];self._catalog_ref=pending['catalog_ref'];self.generation=int(self._previous['generation'])
+        self._retained_bytes=int(self._previous_summary['retention']['retained_bytes']);self._published_context_raw=pending['context_raw']
+        self.source_cursors=deepcopy(pending['committed']);self.staged_source_cursors.clear();self.artifact_count+=len(self.artifacts);self.artifacts=[]
+        self.accepted_ranges=[];self.phase_contexts=[];self._phase_context_refs=[];self._resume_contexts=[];self._context_guards={}
+        self._v2_phase_rows=[];self._window_removals=[];self._publication_pending=None
+        self._unlinked.clear()
+        live={row['ref']['path'] for row in self._catalog['artifacts']}
+        self._phase_raw={k:v for k,v in self._phase_raw.items() if k in live}
+        return self.root/self._previous_ref['path']
+
+    @_observed
+    def retain_window(self, *, maximum_retained_bytes, minimum_free_bytes, maximum_io_bytes, protected_refs=()):
+        """Retire exact authenticated detail in this exclusively owned local root.
+
+        Caller-held refs constrain the fixture policy; they do not certify native
+        RO/export leases. Real capture activation requires the separate TL-O gate.
+        """
+        if self.technical_version!=2:raise ValueError('retain_window requires explicit technical_version2')
+        for value in (maximum_retained_bytes,minimum_free_bytes,maximum_io_bytes):
+            if type(value) is not int or value<0:raise ValueError('nonnegative operation bounds required')
+        if maximum_io_bytes>4194304:raise ValueError('operation I/O bound exceeds4MiB')
+        if not isinstance(protected_refs,tuple) or len(protected_refs)>128:raise ValueError('bounded exact protected refs required')
+        common=schema_validator('result-common.schema.json')
+        for ref in protected_refs:common.evolve(schema={'$ref':'#/$defs/FileRef','$defs':common.schema['$defs']}).validate(ref)
+        with self.lock:
+            if self.closed:raise RuntimeError('telemetry session is closed')
+            protected=self._protected2(protected_refs)
+            free=os.statvfs(self.root);available=free.f_bavail*free.f_frsize
+            burst=min(4194304,self.batch_bytes)+1048576
+            if available<minimum_free_bytes+burst:
+                raise ValueError('scientific free-space reserve unavailable before retention publication')
+            self._minimum_free_bytes=minimum_free_bytes
+            self.flush()
+            used=sum(int(a['ref']['bytes']) for a in self._catalog['artifacts'])
+            remove=[]
+            for row in self._catalog['artifacts']:
+                if used<=maximum_retained_bytes:break
+                if row['ref']['path'] in protected:continue
+                remove.append(row);used-=int(row['ref']['bytes'])
+            self._pin_refused=used>maximum_retained_bytes
+            self._window_removals=remove
+            # Always advance the publication barrier before touching retired files.
+            self._publish()
+            spent=0;failed=False
+            from ._capture_io import regular,beneath,stamp
+            for ref in self._previous['window_delta']['pending_unlink']:
+                count=int(ref['bytes'])
+                if count>min(maximum_io_bytes-spent,self._io_remaining):continue
+                self._charge_io2(count)
+                try:
+                    target=beneath(self.root,ref['path'])
+                    with regular(target,size=count) as stream:
+                        before=stamp(stream,include_change=True);raw=stream.read(count);spent+=len(raw)
+                        if len(raw)!=count or hashlib.sha256(raw).hexdigest()!=ref['sha256'] or stamp(stream,include_change=True)!=before:
+                            raise ValueError('retired physical debt bytes changed')
+                        now=target.stat(follow_symlinks=False)
+                        if (now.st_dev,now.st_ino,now.st_size,now.st_mtime_ns,now.st_ctime_ns)!=before:raise ValueError('retired debt path replaced')
+                    target.unlink();fsync_directory(target.parent)
+                    self._unlinked.add(json_bytes(ref))
+                    parent=target.parent
+                    while parent!=self.root and parent!=self.directory:
+                        try:parent.rmdir()
+                        except OSError:break
+                        parent=parent.parent
+                except FileNotFoundError:
+                    # An unacknowledged unlink is not authenticated success.
+                    failed=True
+                except OSError:failed=True
+            return deepcopy(self._previous_summary['retention'])
+
+    def _rotate2(self):
+        old_path=self.close();old=deepcopy(self._previous);summary=deepcopy(self._previous_summary);ref=deepcopy(self._previous_ref)
+        candidate=type(self).__new__(type(self))
+        candidate._initialize_writer(self.root,self.identity,self._hardware,batch_rows=self.batch_rows,batch_bytes=self.batch_bytes,
+            max_buffer_seconds=self.max_buffer_seconds,metadata_budget=self.metadata_budget,transport=self.transport,publish=False,
+            technical_version=2,prior_capture=self.prior_capture)
+        for name in ('_observer_id','_operation_stop','_cost_metrics','_catalog','_catalog_ref','_unlinked','_io_forecast_pending','_metadata_written','_forecast_total','_operation_depth','_io_remaining','_cost_cpu_position','_cost_written_position','_minimum_free_bytes'):
+            setattr(candidate,name,deepcopy(getattr(self,name)))
+        candidate._previous=old;candidate._previous_summary=summary;candidate._previous_ref=ref;candidate.generation=int(old['generation'])
+        candidate._baseline_summary=summary;candidate.accepted_totals=deepcopy(self.accepted_totals)
+        candidate._inherited_dropped=int(summary['totals']['collector_dropped_rows'])
+        candidate._coverage_gap=dict(source_key=None,clock_domain_id=None,kind='detail_page_rotation',first_monotonic_ns=None,last_monotonic_ns=None,reason='endpoint_reset_uncovered')
+        candidate._publish();candidate.lock=self.lock
+        self.__dict__.update(candidate.__dict__)
+        return old_path
+
+    @classmethod
+    def _resume2(cls,root,*,commit_ref,expected_session,hardware,batch_rows,batch_bytes,max_buffer_seconds,metadata_budget,prior_capture):
+        from ._capture_io import regular,beneath,stamp
+        from .commits import decode_json
+        root=Path(root);used=0;guards=[]
+        def read(ref):
+            nonlocal used
+            common=schema_validator('result-common.schema.json')
+            common.evolve(schema={'$ref':'#/$defs/FileRef','$defs':common.schema['$defs']}).validate(ref)
+            count=int(ref['bytes'])
+            if count>1048576-used:raise ValueError('bounded resume metadata allowance exceeded')
+            with regular(beneath(root,ref['path']),size=count) as stream:
+                before=stamp(stream,include_change=True);raw=stream.read(count);used+=len(raw)
+                if len(raw)!=count or hashlib.sha256(raw).hexdigest()!=ref['sha256'] or stamp(stream,include_change=True)!=before:raise ValueError('resume bytes changed')
+                guards.append((root/ref['path'],before))
+            value=decode_json(raw,'retained resume')
+            if value.get('schema')!=ref['schema']:raise ValueError('resume reference/content schema differs')
+            return value
+        commit=read(commit_ref)
+        if commit['schema']!='qcl-negf.telemetry-commit.v2' or commit['session']!=expected_session:raise ValueError('resume version/session differs')
+        summary=read(commit['summary']);catalog=read(commit['catalog'])
+        if summary['cumulative']['prior_capture']!=prior_capture:raise ValueError('prior_capture changed on resume')
+        previous=previous_summary=previous_catalog=None;kwargs={}
+        if commit['previous']:
+            previous=read(commit['previous']['commit']);previous_summary=read(commit['previous']['summary']);previous_catalog=read(previous['catalog'])
+            kwargs=dict(previous=previous,previous_ref=commit['previous']['commit'],previous_summary=previous_summary,
+                previous_summary_ref=commit['previous']['summary'],previous_catalog=previous_catalog)
+        phases=[dict(publication=read(row['retained_publication_ref']),publication_ref=row['publication_ref'],
+                     segment=read(row['retained_segment_ref']),segment_ref=row['segment_ref']) for row in commit['contexts']['phase_context_refs']]
+        resumes=[dict(commit=read(pair['commit']),commit_ref=pair['commit'],summary=read(pair['summary']),summary_ref=pair['summary']) for pair in commit['contexts']['resume_context_refs']]
+        validate_telemetry_commit(commit,summary=summary,summary_ref=commit['summary'],catalog=catalog,phase_contexts=phases,resume_contexts=resumes,**kwargs)
+        obj=cls.__new__(cls)
+        obj._initialize_writer(root,{},hardware,batch_rows=batch_rows,batch_bytes=batch_bytes,max_buffer_seconds=max_buffer_seconds,
+            metadata_budget=metadata_budget,transport=commit['transport'],publish=False,technical_version=2,prior_capture=prior_capture)
+        obj._previous=commit;obj._previous_summary=summary;obj._previous_ref=deepcopy(commit_ref);obj._catalog=catalog;obj._catalog_ref=commit['catalog']
+        obj.generation=int(commit['generation']);obj._baseline_summary=summary;obj.accepted_totals={k:int(summary['totals'][k]) for k in obj.accepted_totals}
+        obj._inherited_dropped=int(summary['totals']['collector_dropped_rows'])
+        obj.source_cursors={r['source_key']:deepcopy(r) for r in commit['source_cursors']}
+        for row in commit['source_cursors']:
+            refs={}
+            for name in ('publication','segment'):
+                original=row['cursor'][name]
+                matches=[r['ref'] for r in catalog['artifacts'] if all(r['ref'][k]==original[k]
+                    for k in ('bytes','sha256','media_type','schema'))]
+                if matches:refs[name]=deepcopy(min(matches,key=lambda r:r['path']))
+            if len(refs)==2:
+                obj._last_phase_raw[row['source_key']]=dict(publication_ref=deepcopy(row['cursor']['publication']),
+                    segment_ref=deepcopy(row['cursor']['segment']),retained_publication_ref=refs['publication'],retained_segment_ref=refs['segment'])
+        obj._coverage_gap=dict(source_key=None,clock_domain_id=None,kind='collector_restart',first_monotonic_ns=None,last_monotonic_ns=None,reason='endpoint_reset_uncovered')
+        for path,before in guards:
+            with regular(path,size=before[2]) as stream:
+                if stamp(stream,include_change=True)!=before:raise ValueError('resume source changed before publication')
+        obj._publish()
+        return obj
+
+    @_observed
     def close(self) -> Path:
         with self.lock:
             if self.closed:
