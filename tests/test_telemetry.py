@@ -574,3 +574,63 @@ def test_T10_new_publication_requires_completed_old_physical_rows_and_forgeries_
     writer.stage_phase_batch(next_batch,phase_context_refs=(phase,),resume_context_refs=(resume,));final=writer.close()
     summary=json.loads((writer.root/json.loads(final.read_bytes())['summary']['path']).read_bytes())
     assert summary['totals']['accepted_source_rows']=='4'
+
+
+def test_T0_close_context_detaches_exact_durable_close_and_reconciles_lost_ack(tmp_path, monkeypatch):
+    """A lost pointer ACK must not select a newer collector or advance twice."""
+    import copy
+    import hashlib
+    import qcl_negf_results.telemetry as module
+    writer = TelemetryWriter(tmp_path, {}, {})
+    writer.record_resource({'wall_seconds': 1.})
+    publish = module.publish_pointer
+    def lost_ack(*args, **kwargs):
+        publish(*args, **kwargs)
+        raise OSError('T0 original lost close ACK')
+    with monkeypatch.context() as patch:
+        patch.setattr(module, 'publish_pointer', lost_ack)
+        with pytest.raises(OSError, match='original lost close ACK'):
+            writer.close_context()
+    snapshot = writer.close_context()
+    ref, phases, resumes = snapshot
+    raw = (tmp_path / ref['path']).read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == ref['sha256']
+    assert str(len(raw)) == ref['bytes']
+    assert json.loads(raw)['closed'] is True
+    assert json.loads(raw)['generation'] == '2'
+    assert phases == () and resumes == ()
+    frozen = copy.deepcopy(snapshot)
+    ref['sha256'] = 'f' * 64
+    other = TelemetryWriter(tmp_path, {}, {})
+    other.close()
+    assert writer.close_context() == frozen
+    assert (tmp_path / frozen[0]['path']).read_bytes() == raw
+
+
+def test_T0_close_context_preserves_explicit_retained_completion_path(tmp_path):
+    """Equivalent raw bytes at another selected path must not rewrite that ref."""
+    from native_consumer_fixture import sealed_phase
+    from result_v2_fixture import IDENTITY
+    from qcl_negf_results.capture import PhaseCaptureSource
+    from qcl_negf_results.state import _IOBudget
+    producer = tmp_path / 'producer'
+    first = sealed_phase(producer, IDENTITY)
+    writer = TelemetryWriter(tmp_path / 'technical', {}, {})
+    descriptor = dict(status='available', session_id='native', current_path='phase-current.json', reason=None)
+    with PhaseCaptureSource(producer, descriptor=descriptor, expected_identity=IDENTITY, route_epoch=0) as source:
+        batch = source.harvest(None, budget=_IOBudget(1 << 20))
+        writer.stage_phase_batch(batch)
+        accepted = json.loads(writer.flush().read_bytes())['accepted_ranges'][0]
+        completion = dict(publication_ref=accepted['publication'], segment_ref=accepted['segment'])
+        for role in ('publication', 'segment'):
+            ref = dict(accepted['retained_' + role])
+            raw = (writer.root / ref['path']).read_bytes()
+            ref['path'] = 'explicit-' + role + '.json'
+            (writer.root / ref['path']).write_bytes(raw)
+            completion['retained_' + role + '_ref'] = ref
+        writer.record_resource(dict(wall_seconds=1.))
+        writer.flush()
+        sealed_phase(producer, IDENTITY, previous=first['publication_ref'], generation=2)
+        returning = source.harvest(batch.cursor, budget=_IOBudget(1 << 20))
+        writer.stage_phase_batch(returning, phase_context_refs=(completion,))
+        assert writer.close_context()[1] == (completion,)
