@@ -183,12 +183,41 @@ plan bytes and model canonical identity retain their existing checks. Missing
 mandatory context is an error. There is no inferred final evidence or scientific
 acceptance and no numerical array selection.
 
+For `completed_restore`, the observations description additionally contains
+`parent_manifest` and `parent_checkpoint`: detached dictionaries read from the
+exact immediate `lineage.parent_state` and that parent's original checkpoint
+FileRef. Both are present together. For produced observations both are `None`;
+checkpoint-only calls still return no observations description. The original
+parent epoch, attempt, history cutoff and Core evidence are preserved. A parent
+from a different attempt or epoch is valid only through that exact lineage;
+latest-state selection and rewriting an identity are not substitutes.
+
+These two fields are optional keyword-only constructor parameters with default
+`None`. Existing eleven positional arguments and positional pattern matching
+remain compatible; `dataclasses.asdict` includes the two additional fields.
+Manually constructing a description does not authenticate it. The public return
+tuple still has five elements, and persisted result and binding formats are
+unchanged. Parent metadata conveys no native creator, current access, Core
+restore or scientific acceptance verdict.
+
 One physical stream-delivery budget is created **before** manifest initialization
 and shared by nested checkpoint, history, parent, input and native readers,
 source stability and handle close. A successful tuple contains identical final
 whole-call I/O counters in all descriptions. The counters include hashes and HDF
 metadata delivery; they are not physical disk traffic. Existing standalone
 reader operations retain their previous per-operation counters and limits.
+
+The standalone `FinalObservationsReader.describe` and
+`describe_final_observations` operations admit the original metadata and all
+simultaneous description argument copies against the reader's existing metadata
+allowance before copying either parent dictionary. The standalone allowance is
+the existing retained-object estimate, not the whole-call arena accounting
+below. Whole-call parent copies are also included in the arena's live forests,
+temporary copy workspace, final retained allowance and final shared counters.
+Parent readers and handles are closed before a successful whole-call return;
+consumed parent paths remain covered by its final source-stability check.
+Cancellation, a changed parent binding or a close failure returns no partial
+tuple. These accounting models do not bound process RSS or physical disk traffic.
 
 The optional keyword-only `maximum_context_bytes` defaults to 128 MiB and accepts
 an exact integer in `1..134217728`. It enforces an
