@@ -1080,6 +1080,350 @@ def _T3_anchor(fixture, *, pending=False):
     return value, raw, target
 
 
+def _N3_fixture(tmp_path, *, produced=False):
+    """Literal NEW engineering wire and real local identities, no origin authority."""
+    import hashlib
+    import shutil
+    import qcl_negf_results.capture as cap
+    from native_consumer_fixture import technical_source, sealed_phase
+    f = _T1_native_job(tmp_path)
+    f['spec']['credits']['scalar_bytes'] = 64 << 20
+    f['spec'].update(schema='qcl-negf.capture-spec.v3',
+        native_performance=dict(run_uuid='00000000-0000-4000-8000-000000000009'))
+    f['result'].chmod(0o700)
+    f['arguments'] = (*f['arguments'], '--native-execution', 'native-execution.json', '--native-calcjob-uuid', f['spec']['selection']['calcjob_uuid'])
+    if produced:
+        c = technical_source(tmp_path / 'history-only-engineering-source', checkpoint=False, execution='exec')
+        for child in c['science'].iterdir():
+            destination = f['result'] / child.name
+            if child.is_dir():shutil.copytree(child, destination)
+            else:shutil.copyfile(child, destination)
+        f['context'] = c
+        f['manifest'] = f['result'] / c['state']['manifest']['path']
+        plan_raw = (c['root'] / c['plan']['path']).read_bytes()
+        (f['job'] / 'plan.json').write_bytes(plan_raw)
+        f['spec']['plan'].update(bytes=len(plan_raw),sha256=hashlib.sha256(plan_raw).hexdigest())
+        f['spec']['selection']['plan_fingerprint'] = json.loads(plan_raw)['fingerprint']
+        f['native']['input_plan'].update(bytes=str(len(plan_raw)),sha256=hashlib.sha256(plan_raw).hexdigest())
+        (f['job'] / 'native-execution.json').write_bytes(cap.json_bytes(f['native']))
+        sealed_phase(f['result'], c['state']['identity'])
+    anchor, raw, original = _T3_anchor(f, pending=not produced)
+    anchor['origin'] = dict(calcjob_uuid=f['spec']['selection']['calcjob_uuid'],
+        native_execution_uuid=f['native']['storage']['execution_binding_uuid'])
+    if produced:
+        anchor['scientific']['artifact_root'] = '.'
+        anchor['scientific']['source_origin'] = dict(anchor['origin'])
+    raw = b' \n' + cap.json_bytes(anchor) + b'\n'
+    original = f['result'] / 'performance-anchors' / (hashlib.sha256(raw).hexdigest() + '.json')
+    original.write_bytes(raw);(f['result'] / 'performance-anchor-current.json').write_bytes(raw)
+    ns = os.stat('/proc/self/ns/mnt'); born = f['result'].stat()
+    f['birth'] = dict(boot_id=Path('/proc/sys/kernel/random/boot_id').read_text().strip(),
+        mount_namespace_device=str(ns.st_dev), mount_namespace_inode=str(ns.st_ino),
+        producer_pid=str(os.getpid()), producer_start_ticks=str(cap._start_ticks(os.getpid())),
+        device=str(born.st_dev), inode=str(born.st_ino))
+    f['locator'] = dict(schema='qcl-negf.capture-source.v3', capture_token=f['spec']['capture_token'],
+        execution_id='exec', plan_fingerprint=f['spec']['selection']['plan_fingerprint'], mode='direct',
+        actual_root=str(f['result']), epoch=0, root_birth=f['birth'])
+    (f['job'] / 'capture-spec.json').write_bytes(cap.json_bytes(f['spec']))
+    (f['job'] / 'capture-source.json').write_bytes(cap.json_bytes(f['locator']))
+    return f
+
+
+def _N3_observe(f):
+    import qcl_negf_results.capture as cap
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 0\n');os.close(write_fd)
+    return cap.observe(f['job'] / 'capture-spec.json', int(f['birth']['producer_pid']),
+        int(f['birth']['producer_start_ticks']), read_fd,
+        native_execution_path=f['job'] / 'native-execution.json', solver_arguments=f['arguments'])
+
+
+@pytest.mark.parametrize('produced', [False, True])
+def test_N3_observe_result_domain_phase0_and_produced_history_only(tmp_path, produced):
+    f = _N3_fixture(tmp_path, produced=produced)
+    assert _N3_observe(f) == (0 if produced else 2)
+    terminal = f['result'] / 'performance-source.json'
+    assert terminal.exists()
+    index = json.loads(terminal.read_bytes())
+    assert index['closed'] and len(index['entries']) == int(produced)
+    assert index['provider_selection']['run_uuid'] == f['spec']['native_performance']['run_uuid']
+    assert index['provider_selection']['run_uuid'] != f['native']['request_id']
+    assert index['technical']['root']['area'] == 'native_execution'
+    assert not (f['job'] / 'performance').exists() and not (f['job'] / 'performance-source.json').exists()
+    if produced:
+        row = index['entries'][0]
+        assert row['canonical_plan_root']['area'] == 'native_workdir'
+        assert row['scientific_root']['area'] == 'native_execution'
+        assert row['telemetry']['canonical_plan_ref']['sha256'] == f['spec']['plan']['sha256']
+        assert json.loads(f['manifest'].read_bytes())['checkpoint'] is None
+
+
+def test_N3_spec3_and_locator3_are_the_exact_new_ingress(tmp_path):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f = _N3_fixture(tmp_path)
+    root, spec, known = cap._spec(f['job'] / 'capture-spec.json', budget=ObserverIO(128 << 20))
+    assert root == f['job'] and known == {f['context']['state']['identity']['point_id']} and spec == f['spec']
+    locator, actual = cap._locator(root, spec, budget=ObserverIO(1 << 20), native_output=f['result'])
+    assert locator == f['locator'] and actual == f['result']
+
+
+@pytest.mark.parametrize('alias', ['/', '/.', 'double-separator'])
+@pytest.mark.parametrize('role', ['locator', 'original_argv'])
+def test_N3_F1_literal_output_alias_refuses_before_factory_and_effects(tmp_path, monkeypatch, alias, role):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f = _N3_fixture(tmp_path, produced=True)
+    literal = str(f['result'])
+    candidate = literal.replace('/native/', '/native//') if alias == 'double-separator' else literal + alias
+    assert candidate != literal and Path(candidate) == f['result']
+    if role == 'locator':
+        f['locator']['actual_root'] = candidate
+        (f['job'] / 'capture-source.json').write_bytes(cap.json_bytes(f['locator']))
+        with pytest.raises(ValueError):
+            cap._locator(f['job'], f['spec'], budget=ObserverIO(16384), native_output=f['result'])
+    else:
+        f['arguments'] = (*f['arguments'][:2], candidate, *f['arguments'][3:])
+        with pytest.raises(ValueError):
+            cap._native_capture_inputs(f['job'], f['spec'], f['job'] / 'native-execution.json',
+                f['arguments'], budget=ObserverIO(128 << 20))
+    monkeypatch.setattr('qcl_negf_results.telemetry.TelemetryWriter',
+        lambda *a, **k: pytest.fail('native3 path alias reached writer constructor'))
+    monkeypatch.setattr(cap, 'NativePerformanceCapture',
+        lambda *a, **k: pytest.fail('native3 path alias reached capture factory'))
+    before = len(list(Path('/proc/self/fd').iterdir()))
+    assert _N3_observe(f) == 2
+    assert len(list(Path('/proc/self/fd').iterdir())) == before
+    for root in (f['job'], f['result']):
+        assert not (root / 'performance').exists() and not (root / 'performance-source.json').exists()
+
+
+@pytest.mark.parametrize('alias', ['/', '/.', 'double-separator'])
+def test_N3_F1_literal_strictness_preserves_v1_path_alias_semantics(tmp_path, alias):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f = _T1_native_job(tmp_path)
+    literal = str(f['result'])
+    candidate = literal.replace('/native/', '/native//') if alias == 'double-separator' else literal + alias
+    arguments = (*f['arguments'][:2], candidate, *f['arguments'][3:])
+    output, _ = cap._native_capture_inputs(f['job'], f['spec'], f['job'] / 'native-execution.json',
+        arguments, budget=ObserverIO(128 << 20))
+    locator = json.loads((f['job'] / 'capture-source.json').read_bytes())
+    locator['actual_root'] = candidate
+    (f['job'] / 'capture-source.json').write_bytes(cap.json_bytes(locator))
+    _, actual = cap._locator(f['job'], f['spec'], budget=ObserverIO(16384), native_output=output)
+    assert actual == output == f['result']
+
+
+@pytest.mark.parametrize('fault', ['pid', 'start', 'boot', 'namespace', 'inode', 'mode', 'existing', 'old_locator'])
+def test_N3_invalid_birth_has_zero_writer_effects(tmp_path, monkeypatch, fault):
+    import qcl_negf_results.capture as cap
+    f = _N3_fixture(tmp_path)
+    field = dict(pid='producer_pid', start='producer_start_ticks', boot='boot_id',
+        namespace='mount_namespace_inode', inode='inode').get(fault)
+    if field:f['birth'][field] = '00000000-0000-4000-8000-000000000099' if field == 'boot_id' else str(int(f['birth'][field])+1)
+    elif fault == 'mode':f['result'].chmod(0o755)
+    elif fault == 'existing':(f['result'] / 'performance').mkdir()
+    else:f['locator'].pop('root_birth');f['locator']['schema'] = 'qcl-negf.capture-source.v1'
+    (f['job'] / 'capture-source.json').write_bytes(cap.json_bytes(f['locator']))
+    monkeypatch.setattr('qcl_negf_results.telemetry.TelemetryWriter', lambda *a, **k: pytest.fail('birth refused after writer effect'))
+    # Supervisor generation is independent of the altered locator assertion.
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC);os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    assert cap.observe(f['job'] / 'capture-spec.json', os.getpid(), cap._start_ticks(os.getpid()), read_fd,
+        native_execution_path=f['job'] / 'native-execution.json', solver_arguments=f['arguments']) == 2
+    assert not (f['job'] / 'performance').exists()
+    assert not (f['result'] / 'performance-source.json').exists()
+
+
+@pytest.mark.parametrize('field,value', [('inode', True), ('device', 1), ('producer_pid', '01'),
+    ('mount_namespace_inode', '0'), ('device', str(2**64)), ('boot_id', '00000000-0000-0000-0000-000000000000')])
+def test_N3_locator_birth_strict_types_before_effects(tmp_path, field, value):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f = _N3_fixture(tmp_path);f['birth'][field] = value
+    (f['job'] / 'capture-source.json').write_bytes(cap.json_bytes(f['locator']))
+    with pytest.raises(ValueError):cap._locator(f['job'],f['spec'],budget=ObserverIO(16384),native_output=f['result'])
+    assert not (f['result'] / 'performance').exists()
+
+
+@pytest.mark.parametrize('fault', ['extra', 'bool_attempt', 'run_uuid', 'v2', 'scratch', 'duplicates'])
+def test_N3_spec_is_closed_and_never_downgrades(tmp_path, fault):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f = _N3_fixture(tmp_path);spec = f['spec']
+    if fault == 'extra':spec['extra'] = None
+    elif fault == 'bool_attempt':spec['selection']['attempt'] = True
+    elif fault == 'run_uuid':spec['native_performance']['run_uuid'] = '00000000-0000-0000-0000-000000000000'
+    elif fault == 'v2':spec['schema'] = 'qcl-negf.capture-spec.v2'
+    elif fault == 'scratch':spec['scratch_root'] = str(tmp_path)
+    raw = cap.json_bytes(spec)
+    if fault == 'duplicates':raw = raw[:-1] + b',"native_performance":null}'
+    (f['job'] / 'capture-spec.json').write_bytes(raw)
+    with pytest.raises(ValueError):cap._spec(f['job'] / 'capture-spec.json',budget=ObserverIO(16384))
+
+
+def test_N3_before_first_open_replacement_has_zero_constructor_effect(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as cap
+    f = _N3_fixture(tmp_path);saved=f['result'].with_name('born-original-owned');changed=[]
+    locate=cap._locator
+    def replaced(*a, **k):
+        value=locate(*a, **k)
+        if not changed:f['result'].rename(saved);f['result'].mkdir(mode=0o700);changed.append(True)
+        return value
+    monkeypatch.setattr(cap,'_locator',replaced)
+    monkeypatch.setattr('qcl_negf_results.telemetry.TelemetryWriter',lambda *a,**k:pytest.fail('writer before SAME'))
+    assert _N3_observe(f)==2 and changed
+    assert list(f['result'].iterdir())==[]
+
+
+@pytest.mark.parametrize('schedule', ['observer_first', 'science_first'])
+def test_N3_held_guard_accepts_legitimate_children_and_holds_final_identity(tmp_path, schedule):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f = _N3_fixture(tmp_path);budget=ObserverIO(128 << 20)
+    before=len(list(Path('/proc/self/fd').iterdir()))
+    if schedule=='science_first':(f['result'] / 'science-child').mkdir()
+    guard=cap._NativeResultGuard(f['job'],f['result'],f['birth'],os.getpid(),cap._start_ticks(os.getpid()),budget)
+    try:
+        guard.create_technical()
+        if schedule=='observer_first':(f['result'] / 'science-child').mkdir()
+        guard.validate()
+        with guard.effect():(f['result'] / 'performance' / 'owned.json').write_bytes(b'{}')
+        assert budget.read_bytes>0 and budget.reserved==guard.cleanup_reserved
+    finally:guard.close()
+    assert budget.reserved==0 and len(list(Path('/proc/self/fd').iterdir()))==before
+
+
+@pytest.mark.parametrize('role', ['workdir', 'result', 'technical'])
+@pytest.mark.parametrize('cancel', [False, True])
+def test_N3_late_name_change_keeps_primary_and_closes_every_fd(tmp_path, role, cancel):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_N3_fixture(tmp_path);budget=ObserverIO(128 << 20)
+    before=len(list(Path('/proc/self/fd').iterdir()))
+    guard=cap._NativeResultGuard(f['job'],f['result'],f['birth'],os.getpid(),cap._start_ticks(os.getpid()),budget)
+    guard.create_technical()
+    target=dict(workdir=f['job'],result=f['result'],technical=f['result']/'performance')[role]
+    saved=target.with_name(target.name+'-moved-owned')
+    primary=KeyboardInterrupt('native3 cancellation') if cancel else OSError('native3 primary')
+    try:
+        with pytest.raises(type(primary)) as caught:
+            with guard.effect():
+                target.rename(saved);target.mkdir(mode=0o700)
+                raise primary
+        assert caught.value is primary and any('effect validation' in x for x in primary.__notes__)
+    finally:
+        target.rmdir();saved.rename(target);guard.close()
+    assert budget.reserved==0 and len(list(Path('/proc/self/fd').iterdir()))==before
+
+
+@pytest.mark.parametrize('stage', ['spec', 'native_inputs'])
+def test_N3_startup_cancellation_preserves_primary_and_closes_control_fd(tmp_path, monkeypatch, stage):
+    import qcl_negf_results.capture as cap
+    f=_N3_fixture(tmp_path);primary=KeyboardInterrupt('native3 startup cancelled')
+    def cancelled(*a,**k):raise primary
+    monkeypatch.setattr(cap,'_spec' if stage=='spec' else '_native_capture_inputs',cancelled)
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC)
+    try:
+        with pytest.raises(KeyboardInterrupt) as caught:
+            cap.observe(f['job']/'capture-spec.json',os.getpid(),cap._start_ticks(os.getpid()),read_fd,
+                native_execution_path=f['job']/'native-execution.json',solver_arguments=f['arguments'])
+        assert caught.value is primary
+        with pytest.raises(OSError):os.fstat(read_fd)
+        assert not (f['result']/'performance').exists()
+    finally:
+        os.close(write_fd)
+        try:os.close(read_fd)
+        except OSError:pass
+
+
+def test_N3_actual_held_fd_close_failure_does_not_leak_other_descriptors(tmp_path):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_N3_fixture(tmp_path);budget=ObserverIO(128 << 20)
+    before=len(list(Path('/proc/self/fd').iterdir()))
+    guard=cap._NativeResultGuard(f['job'],f['result'],f['birth'],os.getpid(),cap._start_ticks(os.getpid()),budget)
+    guard.create_technical();os.close(guard.entries[-1][0])
+    with pytest.raises(OSError):guard.close()
+    assert guard.closed and budget.reserved==0
+    guard.close()  # No retry of an uncertain descriptor number.
+    assert len(list(Path('/proc/self/fd').iterdir()))==before
+
+
+@pytest.mark.parametrize('fault', ['namespace', 'mount', 'mode'])
+def test_N3_late_scope_or_credentials_change_refuses_before_next_effect(tmp_path, monkeypatch, fault):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    from types import SimpleNamespace
+    f=_N3_fixture(tmp_path);budget=ObserverIO(128 << 20)
+    guard=cap._NativeResultGuard(f['job'],f['result'],f['birth'],os.getpid(),cap._start_ticks(os.getpid()),budget)
+    guard.create_technical();effects=[]
+    try:
+        with monkeypatch.context() as patch:
+            if fault=='namespace':
+                original=cap.os.stat
+                def changed(path,*a,**k):
+                    value=original(path,*a,**k)
+                    return SimpleNamespace(st_dev=value.st_dev,st_ino=value.st_ino+1) if str(path)=='/proc/self/ns/mnt' else value
+                patch.setattr(cap.os,'stat',changed)
+            elif fault=='mount':
+                original=guard._mount;patch.setattr(guard,'_mount',lambda fd:original(fd)+1)
+            else:f['result'].chmod(0o750)
+            with pytest.raises(ValueError):
+                with guard.effect():effects.append(True)
+        assert effects==[]
+    finally:f['result'].chmod(0o700);guard.close()
+
+
+def test_N3_original_parent_symlink_refuses_without_technical_adoption(tmp_path):
+    import qcl_negf_results.capture as cap
+    f=_N3_fixture(tmp_path);parent=f['result'].parent;saved=parent.with_name('original-native-parent-owned')
+    parent.rename(saved);parent.symlink_to(saved,target_is_directory=True)
+    try:
+        assert _N3_observe(f)==2
+        assert not (f['result']/'performance').exists()
+    finally:parent.unlink();saved.rename(parent)
+
+
+@pytest.mark.parametrize('window', ['constructor', 'close', 'terminal', 'flush'])
+def test_N3_observer_late_root_change_never_acknowledges_or_repairs(tmp_path, monkeypatch, window):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results.telemetry import TelemetryWriter
+    f=_N3_fixture(tmp_path);saved=f['result'].with_name('born-root-moved-owned');changed=[];ledgers=[]
+    before=len(list(Path('/proc/self/fd').iterdir()))
+    def swap():
+        if not changed:f['result'].rename(saved);f['result'].mkdir(mode=0o700);changed.append(True)
+    if window=='constructor':
+        original=TelemetryWriter.__init__
+        def construct(self,*a,**k):original(self,*a,**k);swap()
+        monkeypatch.setattr(TelemetryWriter,'__init__',construct)
+    elif window=='close':
+        original=TelemetryWriter.close_context
+        def close(self,*a,**k):result=original(self,*a,**k);swap();return result
+        monkeypatch.setattr(TelemetryWriter,'close_context',close)
+    elif window=='flush':
+        original=TelemetryWriter.flush
+        def flush(self,*a,**k):
+            result=original(self,*a,**k);ledgers.append(self.metadata_budget);swap();return result
+        monkeypatch.setattr(TelemetryWriter,'flush',flush)
+    else:
+        original=cap._capture_write
+        def write(root,path,*a,**k):
+            result=original(root,path,*a,**k)
+            if path=='performance-source.json':swap()
+            return result
+        monkeypatch.setattr(cap,'_capture_write',write)
+    assert _N3_observe(f)==2 and changed
+    assert list(f['result'].iterdir())==[]
+    assert (saved/'performance').exists()
+    if window=='terminal':assert (saved/'performance-source.json').exists()
+    if window=='flush':
+        actual=sum(p.stat().st_size for p in (saved/'performance').rglob('*.parquet'))
+        assert actual>0 and ledgers[0].forecast_bytes>=4*actual
+        assert ledgers[0].reserved==0
+    assert len(list(Path('/proc/self/fd').iterdir()))==before
+
+
 def test_T3_typed_anchor_requires_original_immutable_copy(tmp_path):
     import qcl_negf_results.capture as module
     from qcl_negf_results._capture_io import ObserverIO
@@ -1143,7 +1487,7 @@ def _T3_capture(tmp_path, *, history_only=False):
         for n, key in enumerate(('plan', 'source_graph', 'native_execution', 'submit_script'), 10)}
     inputs = module.NativePerformanceInputs(provider_selection=dict(run_uuid=uid(9),
         **{k: transport['selection'][k] for k in ('execution_id', 'attempt', 'calcjob_uuid')}),
-        original_inputs=pins, runner_anchor_root=root('native_execution', '.'),
+        native_execution_uuid=pins['native_execution']['node_uuid'], runner_anchor_root=root('native_execution', '.'),
         technical_root=root('native_workdir', 'performance'),
         sources=[dict(selected_state=fixture['context']['state'], artifact_root='science',
             scientific_root=root('native_execution', 'science'), scientific_directory=str(fixture['context']['science']),

@@ -427,15 +427,17 @@ that lifecycle available through StateReader.
 The owning source factory has explicit input ports in `qcl_negf_results.capture`:
 
 ```python
-NativePerformanceInputs(*, provider_selection, original_inputs,
+NativePerformanceInputs(*, provider_selection, native_execution_uuid,
     runner_anchor_root, technical_root, sources)
 NativePerformanceCapture(workdir, artifact_root, *, writer, transport, inputs, budget)
 capture.remember(anchor, whole_immutable_anchor_ref, original_raw_bytes)
 capture.publish(*, close_context=None, capture_status=None) -> FileRef
 ```
 
-`provider_selection` and `original_inputs` have the published Contracts
-`PerformanceProviderSelection` and `PerformanceOriginalInputs` shapes. Each `sources` row has
+`provider_selection` has the published Contracts `PerformanceProviderSelection` shape.
+The private producer carries a canonical nonzero `native_execution_uuid` claim from the original
+worker input. Four genuine `PerformanceOriginalInputs` NodePins remain mandatory in the separate
+public T4 binder; capture does not fabricate unused plan/graph/script pins or CREATE edges. Each `sources` row has
 exact keys `selected_state`, `artifact_root`, `scientific_root`, `scientific_directory`,
 `canonical_plan_root`, `canonical_plan_directory`, `source_transport`. RootLocators are explicit
 original storage/area/path assertions. The two directory fields are separate internal local
@@ -533,28 +535,59 @@ the primary failure and cannot invent an acknowledged index. Existing immutable 
 readable when a current pointer advances; consumers use
 exact retained operands and closed bindings without a new mutable lookup.
 
-`observe(..., native_performance_inputs=...)` is a source/L opt-in for these explicit typed
-operands and technical v2. It is exercised with tiny manufactured native5/history-only fixtures.
-The ordinary native CLI still lacks a production transport for all original operands:
-`capture-spec.v1.selection` has calcjob/execution/provider-attempt/plan fingerprint, but no
-`run_uuid`; original submit-script NodePin is also absent. Native input
-`storage.execution_binding_uuid` already carries the native-execution UUID claim, and the AiiDA
-actor independently compares it with the actual input node UUID. `request_id` is a different
-identity and is never used as `run_uuid`. Plan/source-graph NodePins already exist in that input.
+## Native3 result-domain ingress
 
-The native calculation path currently also explicitly unsets `QCL_NEGF_CAPTURE_SPEC`; the ordinary
-capture-spec generator is called only by the non-native path. The existing native `presubmit`
-creates and reads back the genuine `native_submit_script` CREATE after generating the script.
+Ordinary capture-spec1 and its direct/scratch/staged routes keep their existing behavior.
+Native performance ingress accepts only compact `qcl-negf.capture-spec.v3`: the eight original
+keys plus `native_performance={run_uuid: ...}`. The run UUID is a canonical nonzero original
+CALL-chain claim supplied by the AiiDA ingress; it is never inferred from `request_id`.
+Provider attempt is a safe positive JSON integer, separate from scientific attempt. Native3
+requires the paired original native CLI, fixed workdir plan/graph/native inputs, null scratch
+and the existing32MiB performance/64MiB scalar partitions. Spec and locator remain16KiB.
+There is no native spec2/locator1 downgrade, scratch/recovery route or automatic borrowed source.
 
-A later narrow owning extension of the existing capture-spec/launch input must carry genuine
-original performance operands from the AiiDA graph. It belongs to AiiDA `capture_spec.py` and
-`calculation.py`, with Runner's existing exact capture-spec admission and Results `_spec` reader
-updated together after design review. A possible ordering is to fix the existing script's capture
-path in `_prepare_native`, then fill a versioned capture-spec after the `presubmit` CREATE/readback
-from original graph values. The spec can contain the script pin without changing the script bytes.
-This is a design proposal, not an implemented launch/admission policy. No extra attestation
-sideband or DTO flag supplies that
-proof. Until that producer wire, actual graph/root qualification and native lifetime checks are
-complete, source fixture success and staging do not establish actual native capture or mandatory
-R5 availability. Installed backend, NFS/RO lifetime, AiiDA origin and scientific acceptance remain
-separate open gates.
+After prepaid original reads, the observer waits for the genuine Runner credit locator before
+any writer, directory creation, record or flush. Native `capture-source.v3` has exactly the
+original seven fields plus `root_birth`. The seven birth fields are original boot UUID,
+mount namespace device/inode, Runner PID/start ticks and born result device/inode. Numeric
+birth fields are canonical UInt64 decimal strings, without JSON numbers, bools or leading zeros.
+Direct/epoch0/literal output/token/execution/fingerprint must match. Runner PID/start must equal
+the generation already held by the supervisor, including after Runner exit.
+
+The observer opens and retains the existing original WORKDIR and RESULT parent chains and
+born root with directory/no-follow handles. Named and held device/inode, owner/group/mode,
+actual mount ID and observer boot/mount namespace are checked before effects and after them.
+Ancestors must belong to root or the original non-root worker and reject group/world write;
+the born root must have that worker's UID/GID and exact0700. Mutable directory timestamps and
+link counts are not identities: legitimate scientific children may change them. No enclosing
+root or parent is created or adopted by Results. `performance/` is created exclusively beneath
+the held born root; even a pre-existing own empty directory refuses. Its FD remains held too.
+The existing path-based writer runs under this finite guard, without a generalized lease or daemon.
+
+Technical output is `RESULT/performance` and fixed close is `RESULT/performance-source.json`,
+logical area `native_execution`. Original canonical plan remains separately in WORKDIR, area
+`native_workdir`; decoys in RESULT do not substitute for it. NativePerformanceCapture is created
+only after SAME-root qualification. It associates only a genuine exact T2 produced anchor with
+its selected original manifest and separately checked original canonical plan. Phase0 verifies
+the exact native origin, retains resource/phase evidence and may close an empty-entry index;
+it reports unavailable science and never invents a StateRef. Existing explicit source/L factories
+can still select their qualified workdir technical mapping and explicit borrowed association.
+
+Every native guard proc read shares ObserverIO with original reads, writer, nested reader,
+binding and publication. Each guarded effect prepays its postcheck; final validation has its
+own retained reservation. Named/held mount checks use bounded proc FD metadata, and every
+delivered byte stays spent on failure or cancellation. A source index suffix prepays all native
+validations as well as its existing write/readback and own memory/object capacity before index
+publication. Public raw/index1MiB, sources256, objects16384 and getter/response bounds remain
+unchanged, with the existing private4MiB retained/explicit-owned allowance. Native plan's raw
+role is1MiB; graph is64KiB from the mandatory Runner original-role check, native input16KiB from
+native capture admission. A legal per-file input can still receive an explicit aggregate
+private-credit refusal; the former unrelated1MiB combined-native-input check is not used in native3.
+
+Mismatch, mount/name/credential change or uncertain close gives no successful observer response.
+Primary failure/cancellation survives secondary guard/close diagnostics, and held FDs unwind once.
+Already visible effects remain uncertain evidence; capture does not delete or blindly repair
+another selected inode/pointer. Root birth and local byte consistency remain producer assertions,
+not portable provenance or a physical exclusive writer lease. Actual AiiDA ingress/original
+INPUT/CALL/CREATE qualification, current/retained T4, original RO/NFS/writer domain, installed
+wrapper/namespace/cgroup policy, native available R5, RSS/overhead and science remain separate gates.
