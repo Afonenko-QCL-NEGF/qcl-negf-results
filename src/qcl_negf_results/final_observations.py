@@ -1,7 +1,7 @@
 """Independently verified stored final observations, without scientific derive."""
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 import hashlib
 import math
 import re
@@ -34,6 +34,8 @@ class FinalObservationsDescription:
     original_evidence: Document
     integrity: Document
     io_counters: Mapping[str, int | None]
+    parent_manifest: Document | None = field(default=None, kw_only=True)
+    parent_checkpoint: Document | None = field(default=None, kw_only=True)
 
 
 @dataclass(frozen=True)
@@ -349,7 +351,7 @@ class FinalObservationsReader:
             handle=reader._open_hdf(owner,identity=reader._manifest['identity'],invocation=reader._manifest['invocation'],representation='final_observations')
             for d in self._arrays(value).values():
                 if d is not None:validate_final_observations_array(handle,d)
-            return value,handle,plan,model,checkpoint
+            return value,handle,plan,model,checkpoint,parent_manifest,parent_checkpoint
 
     @staticmethod
     def _arrays(value):
@@ -358,19 +360,34 @@ class FinalObservationsReader:
 
     def describe(self) -> FinalObservationsDescription:
         with self._reader._consumer_operation():
-            value,_,plan,model,checkpoint=self._load()
-            _context_before('observations description',extra=8192,roots=(value,plan,model),copies=(self._source,value['invocation'],self._reference,value['checkpoint'],value['diagnostics'],checkpoint['state']['fields']['final_evidence']))
-            with _context_hold(value,plan,model), _context_workspace('observations copy arguments',
-                    8192+sum(_context_weight(v) for v in (self._source,value['invocation'],self._reference,value['checkpoint'],value['diagnostics'],checkpoint['state']['fields']['final_evidence'])) if _context_arena.get() is not None else 0):
-                return FinalObservationsDescription(_context_copy(self._source),_context_copy(value['invocation']),
-                    _context_copy(self._reference),_context_copy(value['checkpoint']),_context_copy(value['diagnostics']),
-                    value,plan,model,_context_copy(checkpoint['state']['fields']['final_evidence']),
-                    dict(manifest_verified=True,observations_file_verified=True,diagnostics_file_verified=True,
-                        original_inputs_verified=True,checkpoint_declaration_verified=True,native_metadata_verified=True,
-                        selected_array_metadata_verified=True,full_core_payloads_scope='not_assessed_by_this_operation',scope='selected_bytes'),self._reader.io_counters)
+            value,_,plan,model,checkpoint,parent_manifest,parent_checkpoint=self._load()
+            roots=(self._reader._manifest,checkpoint,value,plan,model,parent_manifest,parent_checkpoint,
+                self._source,self._reference)
+            copies=(self._source,value['invocation'],self._reference,value['checkpoint'],value['diagnostics'],
+                checkpoint['state']['fields']['final_evidence'])
+            if parent_manifest is not None:copies+=(parent_manifest,parent_checkpoint)
+            with _context_hold(*roots):
+                _context_before('observations description',extra=8192,roots=roots,copies=copies)
+                # Arena hooks are no-ops for standalone readers. Admit originals,
+                # all simultaneous argument copies and headers before either new
+                # parent deepcopy using the existing per-operation metadata model.
+                if parent_manifest is not None and (8192+_metadata_weight(roots)+
+                        sum(_metadata_weight(v) for v in copies)+self._reader._source_stability_bytes()
+                        >self._reader.limits.maximum_metadata_bytes):
+                    raise ContractError('observations description exceeds metadata allowance','budget_exceeded')
+                with _context_workspace('observations copy arguments',
+                        8192+sum(_context_weight(v) for v in copies) if _context_arena.get() is not None else 0):
+                    return FinalObservationsDescription(_context_copy(self._source),_context_copy(value['invocation']),
+                        _context_copy(self._reference),_context_copy(value['checkpoint']),_context_copy(value['diagnostics']),
+                        value,plan,model,_context_copy(checkpoint['state']['fields']['final_evidence']),
+                        dict(manifest_verified=True,observations_file_verified=True,diagnostics_file_verified=True,
+                            original_inputs_verified=True,checkpoint_declaration_verified=True,native_metadata_verified=True,
+                            selected_array_metadata_verified=True,full_core_payloads_scope='not_assessed_by_this_operation',scope='selected_bytes'),self._reader.io_counters,
+                        parent_manifest=None if parent_manifest is None else _context_copy(parent_manifest),
+                        parent_checkpoint=None if parent_checkpoint is None else _context_copy(parent_checkpoint))
 
     def _array(self,name):
-        value,handle,_,_,_=self._load();arrays=self._arrays(value)
+        value,handle,_,_,_,_,_=self._load();arrays=self._arrays(value)
         if name not in arrays:raise ValueError('unknown stored observation array')
         descriptor=arrays[name]
         if descriptor is None:

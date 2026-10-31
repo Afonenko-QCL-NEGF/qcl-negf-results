@@ -35,6 +35,7 @@ def test_closed_literal_source_metadata_without_numeric_read_or_science_promotio
         monkeypatch.setattr(h5py.Dataset,'__getitem__',no_numeric)
         view=api().FinalObservationsReader(reader,artifact_ref=artifact)
         description=view.describe()
+        assert description.parent_manifest is description.parent_checkpoint is None
         assert description.declaration==value and description.source==selected
         assert description.plan['name']=='configured_operating_points'
         assert description.model==model
@@ -265,6 +266,118 @@ def test_completed_restore_preserves_failed_original_and_current_receipts(tmp_pa
         assert d.declaration['summary']['status']=='validation_failed'
         assert d.declaration['restoration']['parent_state']==parent
         assert d.declaration['restoration']['independent_oracle']['fields']['status']['value']=='not_measured'
+        parent_manifest=json.loads((tmp_path/parent['manifest']['path']).read_bytes())
+        parent_checkpoint=json.loads((tmp_path/parent_manifest['checkpoint']['path']).read_bytes())
+        assert d.parent_manifest==parent_manifest and d.parent_checkpoint==parent_checkpoint
+        assert d.parent_manifest['invocation']['source_epoch']=='epoch'
+        assert d.invocation['source_epoch']=='restored-epoch'
+        assert d.parent_manifest['identity']['attempt']=='1' and d.source['identity']['attempt']=='2'
+
+
+def test_parent_fields_preserve_old_constructor_and_positional_pattern_contract():
+    from dataclasses import asdict,fields
+    descriptor=api().FinalObservationsDescription
+    names=('source','invocation','artifact','checkpoint','diagnostics','declaration','plan','model',
+        'original_evidence','integrity','io_counters')
+    old=descriptor(*({} for _ in names))
+    assert descriptor.__match_args__==names
+    assert old.parent_manifest is old.parent_checkpoint is None
+    added={f.name:f for f in fields(descriptor) if f.name.startswith('parent_')}
+    assert set(added)=={'parent_manifest','parent_checkpoint'}
+    assert all(f.kw_only and f.default is None for f in added.values())
+    assert asdict(old)['parent_manifest'] is asdict(old)['parent_checkpoint'] is None
+    with pytest.raises(TypeError):descriptor(*({} for _ in range(13)))
+
+
+def test_completed_parent_descriptions_are_detached_and_array_paths_do_not_copy_them(tmp_path,monkeypatch):
+    from consumer_context_fixture import completed_fixture
+    selected,artifact,_,_,_,parent=completed_fixture(tmp_path)
+    original_close=StateReader.close;closed=[]
+    def closing(owner):
+        original_close(owner)
+        if owner._lineage_depth:closed.append(owner)
+    monkeypatch.setattr(StateReader,'close',closing)
+    with StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity']) as reader:
+        view=api().FinalObservationsReader(reader,artifact_ref=artifact)
+        description=view.describe()
+        expected_manifest=deepcopy(description.parent_manifest);expected_checkpoint=deepcopy(description.parent_checkpoint)
+        assert closed and all(owner._closed and not owner._handles for owner in closed)
+        assert all(description.parent_manifest is not owner._manifest and
+            description.parent_checkpoint is not owner._checkpoint for owner in closed)
+        description.parent_manifest['identity']['point_id']='mutated'
+        description.parent_checkpoint['identity']['point_id']='mutated'
+        again=view.describe()
+        assert again.parent_manifest==expected_manifest and again.parent_checkpoint==expected_checkpoint
+        assert reader.source.state==selected and parent==again.declaration['restoration']['parent_state']
+        assert all(owner._manifest['identity']['point_id']=='point' for owner in closed)
+        original_copy=api()._context_copy;copies=[]
+        def copying(value):
+            if value==expected_manifest or value==expected_checkpoint:copies.append(value)
+            return original_copy(value)
+        monkeypatch.setattr(api(),'_context_copy',copying)
+        assert view.describe_array('state_index').logical_shape==(2,)
+        assert view.read_array('state_index',(1,)).values==1
+        assert copies==[]
+
+
+@pytest.mark.parametrize('mutation',['missing','identity','sequence','checkpoint_ref','history','integrity','evidence','epoch'])
+def test_public_completed_parent_operands_reject_foreign_context(tmp_path,mutation):
+    from consumer_context_fixture import completed_fixture
+    selected,artifact,_,checkpoint,_,_=completed_fixture(tmp_path)
+    with StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity']) as reader:
+        d=api().describe_final_observations(reader,artifact_ref=artifact)
+        manifest=json.loads((tmp_path/selected['manifest']['path']).read_bytes())
+        with h5py.File(tmp_path/d.diagnostics['path'],'r') as handle:
+            diagnostic=json.loads(bytes(handle['final_diagnostics/declaration_json'][()]))
+        if mutation=='missing':d=__import__('dataclasses').replace(d,parent_checkpoint=None)
+        elif mutation=='identity':d.parent_manifest['identity']['attempt']='99'
+        elif mutation=='sequence':d.parent_manifest['state_sequence']='99'
+        elif mutation=='checkpoint_ref':d.parent_manifest['checkpoint']['sha256']='f'*64
+        elif mutation=='history':d.parent_checkpoint['history']['last_record']='1'
+        elif mutation=='integrity':d.parent_checkpoint['state']['fields']['integrity'][0]['decimal']='0'
+        elif mutation=='evidence':d.parent_checkpoint['state']['fields']['final_evidence']['fields']['original_status']['value']='converged'
+        else:d.parent_checkpoint['invocation']['source_epoch']='foreign'
+        with pytest.raises(ContractError):
+            validate_final_observations(d.declaration,checkpoint=checkpoint,manifest=manifest,artifact_ref=artifact,
+                diagnostics=diagnostic,plan=d.plan,model=d.model,parent_manifest=d.parent_manifest,parent_checkpoint=d.parent_checkpoint)
+
+
+def test_standalone_parent_copy_forecast_refuses_before_deepcopy(tmp_path,monkeypatch):
+    from dataclasses import replace
+    from consumer_context_fixture import completed_fixture
+    from qcl_negf_results import state
+    selected,artifact,_,_,_,_=completed_fixture(tmp_path)
+    forecasts=[];original_before=api()._context_before;original_copy=api()._context_copy
+    with StateReader(tmp_path,state_ref=selected,expected_identity=selected['identity']) as reader:
+        view=api().FinalObservationsReader(reader,artifact_ref=artifact)
+        def before(operation,**kwargs):
+            if operation=='observations description':
+                # Independently total the existing per-operation metadata model.
+                import sys
+                def weight(value):
+                    pending=[value];seen=set();total=0
+                    while pending:
+                        item=pending.pop()
+                        if id(item) in seen:continue
+                        seen.add(id(item));total+=sys.getsizeof(item)
+                        if type(item) is dict:pending.extend(item.keys());pending.extend(item.values())
+                        elif type(item) in (list,tuple):pending.extend(item)
+                    return total
+                forecasts.append(weight(kwargs['roots'])+sum(weight(v) for v in kwargs['copies'])+kwargs['extra']+reader._source_stability_bytes())
+            return original_before(operation,**kwargs)
+        monkeypatch.setattr(api(),'_context_before',before)
+        first=view.describe()
+        assert first.parent_manifest is not None and len(forecasts)==1 and state._context_arena.get() is None
+        forecast=forecasts[0];original_load=view._load;copy_calls=[]
+        def load():
+            loaded=original_load()
+            reader.limits=replace(reader.limits,maximum_metadata_bytes=forecast-1)
+            return loaded
+        def copying(value):copy_calls.append(value);return original_copy(value)
+        monkeypatch.setattr(view,'_load',load);monkeypatch.setattr(api(),'_context_copy',copying)
+        with pytest.raises(ContractError,match='observations description.*metadata') as caught:view.describe()
+        assert caught.value.code=='budget_exceeded' and copy_calls==[]
+        print('STANDALONE_PARENT_COPY_FORECAST',forecast)
 
 
 @pytest.mark.parametrize('kind',['missing_manifest','tampered_manifest','missing_checkpoint','changed_parent','changed_cutoff','original_integrity','wrong_current_evidence'])

@@ -32,6 +32,111 @@ def bridge():
     return function
 
 
+def completed_context_fixture(root):
+    from consumer_context_fixture import completed_fixture
+    selected,observations,value,checkpoint,_,parent=completed_fixture(root)
+    manifest=json.loads((root/selected['manifest']['path']).read_bytes())
+    refs={a['role']:{k:a[k] for k in ('path','bytes','sha256','schema','media_type')}
+        for a in manifest['artifacts'] if a['role'] in ('plan','model')}
+    return dict(artifact_root=root,state_ref=selected,expected_identity=selected['identity'],plan_ref=refs['plan'],model_ref=refs['model'],
+        diagnostics_ref=value['diagnostics'],observations_ref=observations,
+        limits=ResultReadLimits(maximum_metadata_bytes=8*M,maximum_io_bytes=16*M,maximum_catalog_bytes=8*M,
+            maximum_catalog_pages=16,maximum_catalog_entries=256,maximum_open_files=4,maximum_array_bytes=65536,
+            maximum_record_bytes=65536,maximum_batch_bytes=65536,maximum_batch_records=16,maximum_hdf_objects=4096,maximum_hdf_depth=32),
+        maximum_context_bytes=128*M,maximum_retained_bytes=8*M),parent
+
+
+def test_completed_parent_whole_call_detached_forest_counters_and_fixed_cap_margins(tmp_path,monkeypatch):
+    from dataclasses import replace
+    from qcl_negf_results import state
+    args,parent=completed_context_fixture(tmp_path);arenas=[];closed=[];original_arena=api._MetadataArena
+    original_close=StateReader.close;original_copy=state.copy.deepcopy;parent_copies=[]
+    class MeasuredArena(original_arena):
+        def __init__(self,*a,**k):super().__init__(*a,**k);arenas.append(self)
+    def close(reader):original_close(reader);closed.append(reader)
+    def copying(value,*a,**k):
+        copied=original_copy(value,*a,**k)
+        if type(value) is dict and value.get('state_id')=='state-1' and value.get('schema') in (
+                'qcl-negf.result-manifest.v1','qcl-negf.checkpoint-declaration.v1'):
+            arena=state._context_arena.get()
+            if arena is not None and arena.scratch:
+                originals=[v for v in arena.held if type(v) is dict and v.get('state_id')=='state-1' and
+                    v.get('schema') in ('qcl-negf.result-manifest.v1','qcl-negf.checkpoint-declaration.v1')]
+                assert len(originals)==2
+                assert arena.scratch>=sum(state._context_weight(v) for v in originals)
+                parent_copies.append((value,copied,arena.scratch))
+                assert any(value is root for root in arena.roots()) or any(value is x for root in arena.held if type(root) in (tuple,list) for x in root)
+        return copied
+    monkeypatch.setattr(api,'_MetadataArena',MeasuredArena);monkeypatch.setattr(StateReader,'close',close)
+    monkeypatch.setattr(state.copy,'deepcopy',copying)
+    result=bridge()(**args)
+    assert type(result) is tuple and len(result)==5
+    observation=result[4];original_manifest=json.loads((tmp_path/parent['manifest']['path']).read_bytes())
+    original_checkpoint=json.loads((tmp_path/original_manifest['checkpoint']['path']).read_bytes())
+    assert observation.parent_manifest==original_manifest and observation.parent_checkpoint==original_checkpoint
+    assert closed and all(r._closed and not r._handles for r in arenas[0].readers)
+    assert any(r._lineage_depth==1 for r in closed)
+    detached(result)
+    counters=result[2].io_counters
+    assert counters==result[3].io_counters==observation.io_counters
+    retained=state._context_weight(result)
+    assert retained<=8*M and counters['bytes_read_total']<=16*M and counters['metadata_high_water_bytes']<=128*M
+    assert parent_copies and all(original is not copied for original,copied,_ in parent_copies)
+    assert {v['schema'] for v,_,_ in parent_copies}=={'qcl-negf.result-manifest.v1','qcl-negf.checkpoint-declaration.v1'}
+    assert state._context_arena.get() is None
+    print('COMPLETED_PARENT_CONTEXT',dict(retained=retained,retained_margin=8*M-retained,
+        context_margin=128*M-counters['metadata_high_water_bytes'],io_margin=16*M-counters['bytes_read_total'],
+        parent_copy_scratch=[s for _,_,s in parent_copies],counters=counters))
+    tight=dict(args,maximum_retained_bytes=retained-1)
+    with pytest.raises(ContractError,match='retained metadata'):bridge()(**tight)
+    tight=dict(args,limits=replace(args['limits'],maximum_io_bytes=counters['bytes_read_total']-1))
+    with pytest.raises(ContractError,match='I/O budget'):bridge()(**tight)
+    tight=dict(args,maximum_context_bytes=counters['metadata_high_water_bytes']-1)
+    with pytest.raises(ContractError,match='arena exceeded'):bridge()(**tight)
+    # This limit also bounds HDF group depth. The existing fixture needs two
+    # group levels and retains its actual one-hop parent at that tighter cap.
+    shallow=dict(args,limits=replace(args['limits'],maximum_hdf_depth=1))
+    with pytest.raises(ContractError,match='native object inventory'):bridge()(**shallow)
+    shallow=dict(args,limits=replace(args['limits'],maximum_hdf_depth=2))
+    assert bridge()(**shallow)[4].parent_manifest==original_manifest
+    assert state._context_arena.get() is None
+
+
+def test_completed_parent_path_change_after_description_fails_shared_final_guard(tmp_path,monkeypatch):
+    from qcl_negf_results import state
+    args,parent=completed_context_fixture(tmp_path);original=api.FinalObservationsReader.describe;readers=[]
+    close=StateReader.close
+    def changing(view):
+        result=original(view)
+        path=tmp_path/parent['manifest']['path'];path.write_bytes(path.read_bytes()+b' ')
+        return result
+    def closing(reader):close(reader);readers.append(reader)
+    monkeypatch.setattr(api.FinalObservationsReader,'describe',changing);monkeypatch.setattr(StateReader,'close',closing)
+    with pytest.raises(ContractError,match='source binding.*changed') as caught:bridge()(**args)
+    assert caught.value.code=='source_changed'
+    assert readers and all(r._closed and not r._handles for r in readers)
+    assert state._context_arena.get() is None
+
+
+@pytest.mark.parametrize('fault',['parent_close','main_close','cancel_parent'])
+def test_completed_parent_whole_call_primary_cleanup_and_closed_owners(tmp_path,monkeypatch,fault):
+    from qcl_negf_results import state
+    args,_=completed_context_fixture(tmp_path);readers=[];original_close=StateReader.close;original_json=StateReader._json
+    primary=KeyboardInterrupt('original parent cancellation');secondary=RuntimeError('parent context close failed')
+    def reading(reader,reference):
+        if fault=='cancel_parent' and reader._lineage_depth and reference['path']=='checkpoint.json':raise primary
+        return original_json(reader,reference)
+    def closing(reader):
+        original_close(reader);readers.append(reader)
+        if (reader._lineage_depth>0)==(fault!='main_close'):raise secondary
+    monkeypatch.setattr(StateReader,'_json',reading);monkeypatch.setattr(StateReader,'close',closing)
+    with pytest.raises(BaseException) as caught:bridge()(**args)
+    assert caught.value is (primary if fault=='cancel_parent' else secondary)
+    if fault=='cancel_parent':assert any('cleanup also raised RuntimeError' in n for n in primary.__notes__)
+    assert readers and all(r._closed and not r._handles for r in readers)
+    assert state._context_arena.get() is None
+
+
 def detached(value):
     if is_dataclass(value):
         for f in fields(value):detached(getattr(value,f.name))
