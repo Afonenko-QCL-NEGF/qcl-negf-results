@@ -21,7 +21,7 @@ writer.published_context() -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]
 writer.close_context() -> tuple[dict, tuple[dict, ...], tuple[dict, ...]]
 observe(spec_path, pid, start_ticks, control_fd, *, transport=None,
     telemetry_selection_factory=None, native_execution_path=None,
-    solver_arguments=()) -> int
+    solver_arguments=(), native_performance_inputs=None) -> int
 capture_run(spec_path, solver, arguments, *, native_execution_path=None) -> int
 ```
 
@@ -407,3 +407,154 @@ of other RO/export/copy users. Native/shared/NFS activation requires the separat
 owner/no-reuse, pin and crash/fault gates. The existing capture observer remains v1 by default;
 its historical lifetime credits do not become limits of the explicit v2 writer. Source fixture
 throughput and bounded windows do not establish native overhead or scientific acceptance.
+
+
+## Typed Runner anchors and the source-only native factory
+
+`capture` reads only the fixed Runner `performance-anchor-current.json` and its exact
+`performance-anchors/<sha256>.json` original. Original UTF8, including whitespace, is retained.
+The public Contracts validator checks the full phase identity and scientific manifest/StateRef
+relationship. The immutable copy must already exist and have the same whole bytes. Reading an
+anchor never flushes scientific history, publishes a checkpoint or constructs a StateRef.
+
+Phase harvesting uses `phase_identity` and the current phase session, including while
+`scientific=None`. Resource samples and original phase rows, cursors, drop/incomplete coverage and
+self-cost remain on the enclosing technical stream. A later scientific or borrowed anchor cannot
+reset that cursor or move current execution costs to its scientific source attempt. An empty
+scientific selection remains `scientific_anchor_pending`; technical evidence alone cannot make
+that lifecycle available through StateReader.
+
+The owning source factory has explicit input ports in `qcl_negf_results.capture`:
+
+```python
+NativePerformanceInputs(*, provider_selection, original_inputs,
+    runner_anchor_root, technical_root, sources)
+NativePerformanceCapture(workdir, artifact_root, *, writer, transport, inputs, budget)
+capture.remember(anchor, whole_immutable_anchor_ref, original_raw_bytes)
+capture.publish(*, close_context=None, capture_status=None) -> FileRef
+```
+
+`provider_selection` and `original_inputs` have the published Contracts
+`PerformanceProviderSelection` and `PerformanceOriginalInputs` shapes. Each `sources` row has
+exact keys `selected_state`, `artifact_root`, `scientific_root`, `scientific_directory`,
+`canonical_plan_root`, `canonical_plan_directory`, `source_transport`. RootLocators are explicit
+original storage/area/path assertions. The two directory fields are separate internal local
+mappings; neither is inferred from the enclosing Runner path or returned in the source index.
+A source's canonical plan FileRef is its original `source_transport.frozen_plan`. `selected_state`
+may be null only as a future produced-state mapping with the exact enclosing transport; borrowed
+sources require an explicit original StateRef. Multiple matching mappings refuse rather than
+selecting one. Source attempts are never inferred from native counters.
+
+This typed input detaches assertions and validates shape, normalized paths and combined credit.
+It does not verify an actual AiiDA graph, qualify a physical mapping or issue an access lease.
+Every scientific, technical, plan and Runner root still needs independent owning qualification.
+The factory reads each scientific and canonical-plan mapping independently with the existing
+StateReader and public performance reader. It writes immutable source bindings and creates a
+closed binding with the existing `make_binding`. A caller callback is still forbidden at native
+ingress; the owning factory performs the local binding operation itself.
+
+The factory publishes a full `qcl-negf.performance-source-index.v1`, retaining distinct full
+root/state/invocation/source-transport/origin selector keys. Identical keys are deduplicated;
+conflicting associations refuse. All entries share the one exact acknowledged execution-attempt
+technical context. They do not describe independent copies of that cost. The inventory is at most
+256 entries and 1 MiB encoded UTF8. The canonical input JSON, each original metadata read and
+every encoded source index remain bounded by1 MiB; capture checks encoded length before calling
+its encoder. The F4 private operational allowance is4 MiB for its explicitly retained metadata
+forest and prospective owned read/decode/encode/copy/publication buffers, with the existing
+16384-object bound. It includes input raw/decoded documents, the complete remembered anchor
+inventory, enclosing transport, caller close context/status, accumulated entries and actual
+selected reader JSON/guards. Distinct copies consume byte credit; aliased retained objects count
+once in that byte weight. The existing public object traversal counts supplied occurrences.
+No inventory is truncated to fit. A legal input within the raw/source-count bounds can still
+receive an explicit conservative memory refusal.
+
+Owned JSON decoding prepays the full temporary Unicode input, including legal external
+whitespace, parser/pair-hook and detached-container capacity, and simultaneously active recursive
+diagnostic paths before entering the decoder. Encoding prepays container capacities, diagnostic
+paths, Unicode and UTF8 output. Already validated immutable canonical inputs retain their tighter
+shape-based decoder allowance. Capture copies also reserve their container/memo workspace.
+Incoming read/readback buffers, parsed/detached operands and codec diagnostic/output objects
+receive prospective object credit too; object refusal precedes the owned read/write/codec effect.
+The declared selected scientific manifest must be≤1 MiB before actual StateReader initialization;
+the ordinary initialization/hash check remains and receives a1MiB metadata limit. No extra
+manifest read is performed for a generic lifetime recipe.
+
+Reader limits keep their public default4096 and explicit16384 behavior. The performance reader
+receives `min(1 MiB, remaining private retained allowance)`, never an enlarged public limit.
+Getter metadata1MiB/response2MiB bounds are unchanged. The factory and writer must share the same aggregate
+observer I/O ledger; reader construction, source checks, bindings, writes and readback debit it.
+Each reader operation reserves its allowance on that ledger before reads begin; direct metadata
+I/O can spend only the unreserved remainder. Reader construction and nested performance/binding
+reads settle the delivered delta even when validation or cleanup fails. Settlement consumes an
+already admitted reservation rather than requesting credit after delivery, so it cannot replace a
+primary reader exception with a late admission refusal. The binding payload's known encoded size
+is separately admitted before its atomic write. The protected StateReader context profile remains
+unchanged.
+
+F4 does **not** bound all transitive callee temporaries, global Python heap, native allocations
+or process RSS by4MiB. These limits qualify separate boundaries:
+
+| Callee | Retained existing protection | Not qualified under capture4MiB |
+| --- | --- | --- |
+| StateReader init/consumer | Exact selected read/hash/identity, supplied1MiB metadata limit, shared I/O and source stability | Init/schema/validator temporaries; its inactive optional arena is not a4MiB certificate |
+| performance_views | Existing selected retained cache≤1MiB, response≤2MiB, object/session limits and source guards | Internal decoder, `_exact`, validator copies and diagnostic paths |
+| Contracts anchor/index/binding | Existing raw/aggregate byte, object and depth controls | Transitive detachments, embedded decoders, Unicode and diagnostic paths |
+| T0 published_context | Stored raw1MiB, context/page bounds, exact readback and its own retained check | Decoder temporaries preceding that retained check |
+| catalog/Parquet |64KiB stream chunks, footer preflight and explicit Thrift limits | Native Arrow allocations or RSS |
+
+Historical F1/F3 R1/R2 failures remain failures of their stronger whole-lifetime contract;
+F4 is a new qualification identity, not a retroactive whole-lifetime pass. The4MiB operational
+choice follows the old closed80 minimum observed forest1099163B and canonical normal80 input
+encoding stage1524894B, with approximately15GiB available on the owned host when chosen.
+These observations do not establish a mathematical minimum, every-input admission or native
+overhead. Representative/adversarial native memory and host-cost qualification remains open;
+ordinary existing host/process memory protections still apply.
+
+Open publication uses `writer.published_context()` without closing or flushing the collector.
+Closed publication requires the exact context returned by the owning close operation. Source
+bindings, closed bindings and all immutable Runner originals precede the immutable
+`performance/sources/<sha256>.json`; atomic `performance/current-source.json` and its readback come
+last. A terminal close writes those same index bytes as fixed `performance-source.json` for
+bounded retrieval. Before the first immutable index write, capture prepares its index reference,
+pointer encoding and detached return reference and prepays its own final suffix buffers and
+readbacks. This prevents an owned memory refusal first arising after pointer replacement.
+It does not preclude I/O or changed-source failure after replacement. A terminal run with no scientific anchor can retain an empty-entry technical
+index with an explicit pending control event, while observation reports unavailable. An uncertain
+technical ACK, changed original or exhausted credit before pointer replacement leaves the preceding
+pointer in place. An atomic replacement can already be durable and visible when its readback fails
+or lacks credit: that operation has an uncertain outcome, raises without acknowledging a new owner
+generation, and does not prove that the previous pointer is still selected. The visible pointer
+may reference a fully validated immutable index; earlier immutable pins remain intact. No blind
+rollback is performed over a possible replacement. A later reader must validate its exact selected
+bytes independently. After a phase-discovery failure the owner attempts an explicit incomplete close of its last good
+accepted prefix, retaining a `capture_failed` control event and incomplete close binding. It does
+not retry scientific publication or claim recovery of the missing tail. Failed cleanup preserves
+the primary failure and cannot invent an acknowledged index. Existing immutable pins remain
+readable when a current pointer advances; consumers use
+exact retained operands and closed bindings without a new mutable lookup.
+
+`observe(..., native_performance_inputs=...)` is a source/L opt-in for these explicit typed
+operands and technical v2. It is exercised with tiny manufactured native5/history-only fixtures.
+The ordinary native CLI still lacks a production transport for all original operands:
+`capture-spec.v1.selection` has calcjob/execution/provider-attempt/plan fingerprint, but no
+`run_uuid`; original submit-script NodePin is also absent. Native input
+`storage.execution_binding_uuid` already carries the native-execution UUID claim, and the AiiDA
+actor independently compares it with the actual input node UUID. `request_id` is a different
+identity and is never used as `run_uuid`. Plan/source-graph NodePins already exist in that input.
+
+The native calculation path currently also explicitly unsets `QCL_NEGF_CAPTURE_SPEC`; the ordinary
+capture-spec generator is called only by the non-native path. The existing native `presubmit`
+creates and reads back the genuine `native_submit_script` CREATE after generating the script.
+
+A later narrow owning extension of the existing capture-spec/launch input must carry genuine
+original performance operands from the AiiDA graph. It belongs to AiiDA `capture_spec.py` and
+`calculation.py`, with Runner's existing exact capture-spec admission and Results `_spec` reader
+updated together after design review. A possible ordering is to fix the existing script's capture
+path in `_prepare_native`, then fill a versioned capture-spec after the `presubmit` CREATE/readback
+from original graph values. The spec can contain the script pin without changing the script bytes.
+This is a design proposal, not an implemented launch/admission policy. No extra attestation
+sideband or DTO flag supplies that
+proof. Until that producer wire, actual graph/root qualification and native lifetime checks are
+complete, source fixture success and staging do not establish actual native capture or mandatory
+R5 availability. Installed backend, NFS/RO lifetime, AiiDA origin and scientific acceptance remain
+separate open gates.

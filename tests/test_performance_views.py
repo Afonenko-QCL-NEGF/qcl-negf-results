@@ -819,3 +819,52 @@ def test_S2_R1_every_decoded_after_leaf_shares_complete_operation_object_credit(
                 assert len(json.loads(matches[0])['retained'])==entries
             assert not any('/opaque/' in ref['path'] or ref['path'].startswith('opaque/') for _,ref,_ in files)
         assert reader._shared_budget is None and reader._budget._source_guard is None
+
+
+def test_T3_exact_index_pin_reads_closed_history_without_mutable_pointer_or_missing_binding(tmp_path):
+    import json
+    from test_capture import _T3_capture, _T3_anchor
+    from qcl_negf_results.state import StateReader
+    from qcl_negf_results.performance_views import TelemetrySelection, read_performance_context
+    fixture = _T3_capture(tmp_path, history_only=True)
+    anchor, raw, immutable = _T3_anchor(fixture)
+    ref = dict(path=str(immutable.relative_to(fixture['result'])), bytes=str(len(raw)),
+        sha256=hashlib.sha256(raw).hexdigest(), schema=anchor['schema'], media_type='application/json')
+    capture = fixture['capture']; writer = fixture['writer']; capture.remember(anchor, ref, raw)
+    close = writer.close_context()
+    pin = capture.publish(close_context=close, capture_status=dict(terminal_tail='unknown', scalar_live_route='unavailable',
+        scalar_live_reason='external_root', performance_status='incomplete', reason='tail_unknown'))
+    index = json.loads((writer.root / pin['path']).read_bytes()); data = index['entries'][0]['telemetry']
+    # A previously pinned selection cannot rebase through mutable lookup.
+    (writer.root / 'current-source.json').write_bytes(b'{"foreign_pointer":true}')
+    selected = TelemetrySelection(writer.root, canonical_plan_root=fixture['job'], **data)
+    with StateReader(fixture['context']['science'], state_ref=fixture['context']['state'],
+            expected_identity=fixture['context']['state']['identity']) as reader:
+        view = read_performance_summary(reader, telemetry=selected, limits=PerformanceLimits(maximum_objects=16384))
+        assert view['status'] == 'available' and view['closed'] is True
+        _, originals = read_performance_context(reader, telemetry=selected, limits=PerformanceLimits(maximum_objects=16384))
+        assert any(scope == 'scientific' and raw == anchor['scientific']['manifest_utf8'].encode() for scope, _, raw in originals)
+        missing = dict(data, binding_ref=None)
+        with pytest.raises(ContractError):
+            read_performance_summary(reader, telemetry=TelemetrySelection(writer.root, canonical_plan_root=fixture['job'], **missing),
+                limits=PerformanceLimits(maximum_objects=16384))
+        for limits in (PerformanceLimits(maximum_objects=16384, maximum_io_bytes=1),
+                       PerformanceLimits(maximum_objects=16384, maximum_json_bytes=1)):
+            with pytest.raises(ContractError) as error:read_performance_context(reader, telemetry=selected, limits=limits)
+            assert error.value.code == 'budget_exceeded'
+        assert reader._shared_budget is None and reader._budget._source_guard is None
+
+
+def test_T3_joined_retained_forest_keeps_default_object_credit_and_explicit_ceiling(tmp_path):
+    from qcl_negf_results.state import StateReader
+    from qcl_negf_results.performance_views import read_performance_context
+    context = _s2_r1_index_leaves(tmp_path, groups=(64, 64), generations=3)
+    with StateReader(context['science'], state_ref=context['state'], expected_identity=context['state']['identity']) as reader:
+        with pytest.raises(ContractError, match='object') as error:
+            read_performance_context(reader, telemetry=context['selection'])
+        assert error.value.code == 'budget_exceeded'
+        _, originals = read_performance_context(reader, telemetry=context['selection'],
+            limits=PerformanceLimits(maximum_objects=16384))
+        for leaf in context['object_leaves']:
+            assert any(ref == leaf['ref'] for _, ref, _ in originals)
+        assert reader._shared_budget is None and reader._budget._source_guard is None
