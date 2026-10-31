@@ -10,6 +10,7 @@ import subprocess
 import sys
 import time
 from copy import deepcopy
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -28,6 +29,9 @@ from ._capture_io import (
 from .commits import decode_json, json_bytes
 
 MIB = 1024 * 1024
+# F4 private retained/owned-buffer operational allowance. Public JSON/FileRef
+# bounds stay1MiB. This is neither a transitive callee peak nor an RSS limit.
+CAPTURE_METADATA_BYTES = 4 * MIB
 
 
 @dataclass(frozen=True)
@@ -434,7 +438,37 @@ def journal_batch(path, cursor, *, source_key, maximum_bytes=65536, maximum_rows
         )
 
 
-def make_binding(reader,*,telemetry,destination,capture_status,budget=None):
+
+def _capture_reader_settle(budget, reserved, delivered):
+    """Consume an admitted reservation; settlement is never a new admission.
+
+    Delivered reads remain spent even when validation or cleanup fails. The
+    protected reader cannot deliver beyond its reserved temporary maximum.
+    """
+    budget.reserved -= reserved
+    budget.read_bytes += delivered
+    if not 0 <= delivered <= reserved:
+        error = ValueError('reader delivery exceeded its admitted reservation')
+        primary = sys.exception()
+        if primary is None:raise error
+        primary.add_note(str(error))
+
+
+@contextmanager
+def _capture_reader_credit(budget, io):
+    """Reserve one whole reader operation, including its nested guard checks."""
+    before = io.bytes_read_total; maximum = io.maximum
+    io.require(1); budget.require(1)
+    allowance = min(budget.remaining, maximum-before)
+    budget.reserve(allowance)
+    io.maximum = before+allowance
+    try:
+        yield
+    finally:
+        io.maximum = maximum
+        _capture_reader_settle(budget, allowance, io.bytes_read_total-before)
+
+def make_binding(reader,*,telemetry,destination,capture_status,budget=None,_retained=()):
     """Retain the exact returned close with explicit selected source/input contexts."""
     from .state import StateReader
     from .performance_views import TelemetrySelection,PerformanceLimits,_load_telemetry,_check_bindings
@@ -447,36 +481,43 @@ def make_binding(reader,*,telemetry,destination,capture_status,budget=None):
     from qcl_negf_contracts.artifacts import relative_path
     relative_path(relative)
     # Explicit retained-v2 closure uses S00's ceiling; public default remains4096.
-    limits=PerformanceLimits(maximum_objects=16384) if telemetry.commit_ref['schema']=='qcl-negf.telemetry-commit.v2' else PerformanceLimits()
-    reservation=None;consumed=0;bindings={}
+    limits=_capture_limits(_retained) if _retained else (PerformanceLimits(maximum_objects=16384) if telemetry.commit_ref['schema']=='qcl-negf.telemetry-commit.v2' else PerformanceLimits())
+    reservation=None;io=None;before=None;bindings={}
     allowance=limits.maximum_io_bytes
     if budget is not None:
-        allowance=min(allowance,budget.remaining-MIB)
-        if allowance<1:raise ValueError('binding metadata/output allowance unavailable')
+        allowance=min(allowance,budget.remaining)
+        if allowance<1:raise ValueError('binding metadata/read allowance unavailable')
         budget.reserve(allowance);reservation=allowance
     try:
         with reader._consumer_operation(allowance,verify_source_stability=True,maximum_stability_bytes=limits.maximum_metadata_bytes) as io:
             before=io.bytes_read_total
-            try:
-                loaded=_load_telemetry(reader,telemetry,limits,bindings,creating_binding=True);data=loaded['input'];commit=loaded['commit'];summary=loaded['summary']
-                value=dict(schema=('qcl-negf.telemetry-binding.v2' if commit['schema']=='qcl-negf.telemetry-commit.v2' else 'qcl-negf.telemetry-binding.v1'),contract_set='qcl-negf.results.v2',
-                    scope='selected_state_with_execution_attempt_telemetry',selected_state=reader.source.state,
-                    transport=deepcopy(data['expected_transport']),capture_status=deepcopy(capture_status),
-                    commit=dict(ref=data['commit_ref'],raw_utf8=loaded['commit_raw'].decode('utf-8')),
-                    summary=dict(ref=commit['summary'],raw_utf8=loaded['summary_raw'].decode('utf-8')),
-                    source_binding=dict(ref=data['source_binding_ref'],raw_utf8=loaded['source_binding_raw'].decode('utf-8')))
-                validate_telemetry_binding(value,expected_state=reader.source.state,expected_transport=data['expected_transport'],
-                    commit=commit,commit_ref=data['commit_ref'],summary=summary,summary_ref=commit['summary'],
-                    source_binding=loaded['source_binding'],source_binding_ref=data['source_binding_ref'],
-                    manifest=reader._manifest,manifest_ref=reader.source.state['manifest'],source_transport=data['source_transport'],
-                    canonical_plan_ref=data['canonical_plan_ref'],expected_producer_provenance=data['expected_producer_provenance'])
-                payload=json_bytes(value)
-                if len(payload)>MIB:fail('budget_exceeded','retained technical binding metadata cap exceeded')
-                _check_bindings(bindings)
-            finally:consumed=io.bytes_read_total-before
+            loaded=_load_telemetry(reader,telemetry,limits,bindings,creating_binding=True);data=loaded['input'];commit=loaded['commit'];summary=loaded['summary']
+            if _retained:
+                copies=(data['expected_transport'],capture_status)
+                _capture_credit(*_retained,loaded,bindings,
+                    extra_bytes=_capture_decoded_bound(copies)+128*_capture_objects((copies,))+
+                        4*sum(len(loaded[key]) for key in ('commit_raw','summary_raw','source_binding_raw'))+
+                        3*sys.getsizeof('\U00010000')+8192,
+                    extra_objects=_capture_objects((copies,))+64)
+            value=dict(schema=('qcl-negf.telemetry-binding.v2' if commit['schema']=='qcl-negf.telemetry-commit.v2' else 'qcl-negf.telemetry-binding.v1'),contract_set='qcl-negf.results.v2',
+                scope='selected_state_with_execution_attempt_telemetry',selected_state=reader.source.state,
+                transport=deepcopy(data['expected_transport']),capture_status=deepcopy(capture_status),
+                commit=dict(ref=data['commit_ref'],raw_utf8=loaded['commit_raw'].decode('utf-8')),
+                summary=dict(ref=commit['summary'],raw_utf8=loaded['summary_raw'].decode('utf-8')),
+                source_binding=dict(ref=data['source_binding_ref'],raw_utf8=loaded['source_binding_raw'].decode('utf-8')))
+            if _retained:_capture_encoding_credit(value,*_retained,loaded,bindings)
+            validate_telemetry_binding(value,expected_state=reader.source.state,expected_transport=data['expected_transport'],
+                commit=commit,commit_ref=data['commit_ref'],summary=summary,summary_ref=commit['summary'],
+                source_binding=loaded['source_binding'],source_binding_ref=data['source_binding_ref'],
+                manifest=reader._manifest,manifest_ref=reader.source.state['manifest'],source_transport=data['source_transport'],
+                canonical_plan_ref=data['canonical_plan_ref'],expected_producer_provenance=data['expected_producer_provenance'])
+            payload=_capture_encode(value,*_retained,loaded,bindings) if _retained else json_bytes(value)
+            if len(payload)>MIB:fail('budget_exceeded','retained technical binding metadata cap exceeded')
+            _check_bindings(bindings)
     finally:
         if reservation is not None:
-            budget.reserved-=reservation;budget.account(consumed)
+            delivered=0 if io is None or before is None else io.bytes_read_total-before
+            _capture_reader_settle(budget,reservation,delivered)
     # Both actual source guards have succeeded before the single atomic publication.
     if budget is not None:budget.write(len(payload))
     atomic_write(destination,payload)
@@ -851,8 +892,599 @@ def _final_points(actual, selection, known, *, budget=None):
     return points,[p['selected_state'] for p in points if p['selected_state'] is not None]
 
 
+
+def _performance_anchor(actual, *, budget, retained=()):
+    """Read the fixed T2 current sideband and its exact immutable original.
+
+    This validates local bytes, not original AiiDA origin or current RO access.
+    No scientific publication, directory discovery or synthesized StateRef occurs.
+    """
+    from qcl_negf_contracts.telemetry import validate_performance_anchor
+    from .state import _metadata_weight
+    from .performance_views import _bounded_objects
+    with regular(actual / 'performance-anchor-current.json') as stream:
+        before = stamp(stream, include_change=True); count = before[2]
+        if count > MIB:fail('budget_exceeded', 'Runner anchor raw byte allowance exhausted')
+        _capture_credit(*retained,extra_bytes=count+sys.getsizeof(b''),extra_objects=1)
+        budget.require(count); raw = stream.read(count); budget.account(len(raw))
+        if len(raw) != count or stamp(stream, include_change=True) != before:
+            fail('source_changed', 'Runner current anchor changed during read')
+    value = _capture_decode(raw, *retained, source='original Runner anchor')
+    _bounded_objects((value, raw), 16384)
+    _capture_credit(*retained,value,raw,extra_bytes=2*_metadata_weight(value))
+    validate_performance_anchor(value)
+    _capture_credit(*retained,value,raw,extra_bytes=4096,extra_objects=16)
+    reference = dict(path='performance-anchors/' + digest(raw) + '.json', bytes=str(len(raw)),
+        sha256=digest(raw), schema='qcl-negf.performance-anchor.v1', media_type='application/json')
+    _capture_credit(*retained,value,raw,reference,extra_bytes=len(raw)+sys.getsizeof(b''),extra_objects=1)
+    with regular(beneath(actual, reference['path']), size=len(raw)) as stream:
+        before = stamp(stream, include_change=True)
+        budget.require(len(raw))
+        original = stream.read(len(raw)); budget.account(len(original))
+        if original != raw or stamp(stream, include_change=True) != before:
+            fail('source_changed', 'immutable Runner anchor differs from current bytes')
+    return value, reference, raw
+
+
+def _capture_objects(values):
+    from .performance_views import _bounded_objects
+    return _bounded_objects(values, 16384)
+
+
+def _capture_credit(*values, extra_bytes=0, extra_objects=0, maximum_bytes=CAPTURE_METADATA_BYTES):
+    from .state import _metadata_weight
+    if not 0 < maximum_bytes <= CAPTURE_METADATA_BYTES:raise ValueError('capture metadata bound may only tighten')
+    if _metadata_weight(values) + extra_bytes > maximum_bytes:
+        fail('budget_exceeded', 'combined performance capture metadata allowance exhausted')
+    if _capture_objects(values) + extra_objects > 16384:
+        fail('budget_exceeded', 'aggregate performance capture metadata object cap exceeded')
+
+
+def _capture_path_bound(value):
+    """Simultaneously live validate_json diagnostic paths, without making them.
+
+    Each recursive frame has one path string. A child adds one dict separator
+    and key, or an array index. Four-byte characters and the largest compact
+    header bound every string, even mixed Unicode keys. A failed leaf formats
+    its path once more. No caller/callee stack introspection is used.
+    """
+    header = sys.getsizeof('\U00010000'); peak = 0
+    def visit(item, length=1, active=0, depth=0):
+        nonlocal peak
+        if depth > 64:fail('budget_exceeded','capture metadata depth allowance exhausted')
+        active += header + 4*length
+        peak = max(peak,active + header + 4*(length+64))
+        if type(item) is dict:
+            for key,child in item.items():
+                if type(key) is not str:fail('invalid_input','JSON string keys required')
+                visit(child,length+1+len(key),active,depth+1)
+        elif type(item) in (list,tuple):
+            for index,child in enumerate(item):visit(child,length+2+len(str(index)),active,depth+1)
+    visit(value)
+    return peak + 8192
+
+
+def _capture_raw_workspace(raw):
+    """Owned complete-JSON decoder workspace, including legal whitespace.
+
+    Parsed trees/pair hooks use the existing bounded token recipe. In addition,
+    validate_json can keep D+1 diagnostic paths live. A path contains at most
+    all raw string characters plus D array subscripts (at most8 chars under the
+    raw1MiB bound), so whitespace contributes to Unicode but not diagnostic keys.
+    Malformed raw is bounded before the decoder too; no validity is inferred.
+    """
+    from .state import _context_raw_tree_bound
+    depth=maximum=characters=punctuation=0; inside=escaped=False
+    for byte in raw:
+        if inside:
+            if byte==34 and not escaped:inside=False
+            else:
+                characters+=1
+                if escaped:escaped=False
+                elif byte==92:escaped=True
+        elif byte==34:inside=True
+        elif byte in (91,123):
+            depth+=1;maximum=max(maximum,depth);punctuation+=1
+            if maximum>64:fail('budget_exceeded','capture metadata depth allowance exhausted')
+        elif byte in (93,125):depth=max(0,depth-1);punctuation+=1
+        elif byte in (44,58):punctuation+=1
+    tree=_context_raw_tree_bound(raw)
+    parser=max(512*(1+punctuation)+4*len(raw),3*tree+4*len(raw)+4096)
+    paths=(maximum+1)*(sys.getsizeof('\U00010000')+4*(characters+8*maximum+1))
+    return parser+paths+8*characters+8192
+
+
+def _capture_decode(raw, *retained, source='performance metadata', maximum_bytes=CAPTURE_METADATA_BYTES):
+    from .state import _context_raw_tree_bound
+    if len(raw)>MIB:fail('budget_exceeded','performance JSON original exceeds byte allowance')
+    # Each token/tree unit is at least64B in this conservative scanner. Two
+    # forests cover parsed/detached operands; at most65 active diagnostic paths
+    # plus Unicode/error/output headers are reserved before entering the codec.
+    objects=2*(_context_raw_tree_bound(raw)//64+1)+67
+    _capture_credit(raw,*retained,extra_bytes=_capture_raw_workspace(raw),extra_objects=objects,maximum_bytes=maximum_bytes)
+    return decode_json(raw,source)
+
+
+def _capture_decoded_bound(value):
+    """Prospective JSON tree with the decoder's key memo, no value aliases.
+
+    Measure only shallow container capacities, using incremental insertion as
+    the prepared decoder does. Values are never copied into a second tree.
+    """
+    keys = set()
+    def visit(item):
+        if type(item) is dict:
+            size = sys.getsizeof(dict.fromkeys(iter(item)))
+            for key, child in item.items():
+                if key not in keys:keys.add(key);size += sys.getsizeof(key)
+                size += visit(child)
+            return size
+        if type(item) in (list,tuple):
+            return sys.getsizeof([None for _ in item])+sum(visit(child) for child in item)
+        return sys.getsizeof(item)
+    size = visit(value)
+    return size + sys.getsizeof(dict.fromkeys(iter(keys))) + max((sys.getsizeof(k) for k in keys),default=0)
+
+
+def _capture_copy(value, *retained):
+    # Detached JSON container capacities plus deepcopy's finite per-node memo.
+    # Scalar occurrences deliberately overcount aliases in this scratch bound.
+    objects=_capture_objects((value,))
+    _capture_credit(value,*retained,extra_bytes=_capture_decoded_bound(value)+128*objects,
+        extra_objects=objects)
+    return deepcopy(value)
+
+
+def _capture_text_bound(value, raw_bytes):
+    # json.loads(bytes) also owns a temporary Unicode string. Its kind is set by
+    # the widest input character; UTF8 bytes conservatively bound character count.
+    def widest(item):
+        if type(item) is str:return max(map(ord,item),default=0)
+        if type(item) is dict:return max((max(widest(k),widest(v)) for k,v in item.items()),default=0)
+        if type(item) in (tuple,list):return max(map(widest,item),default=0)
+        return 0
+    code = widest(value)
+    return (1 if code<=255 else 2 if code<=65535 else 4)*raw_bytes+sys.getsizeof('\U00010000')
+
+
+def _capture_document(inputs, *retained, maximum_bytes=CAPTURE_METADATA_BYTES):
+    _capture_credit(inputs._raw, *retained, extra_bytes=inputs._decoded_bound,
+        extra_objects=inputs._decoded_objects, maximum_bytes=maximum_bytes)
+    value = inputs.document()
+    _capture_credit(inputs._raw, value, *retained, maximum_bytes=maximum_bytes)
+    return value
+
+
+def _capture_limits(retained):
+    from .state import _metadata_weight
+    from .performance_views import PerformanceLimits
+    _capture_credit(*retained)
+    memory=min(MIB,CAPTURE_METADATA_BYTES-_metadata_weight(retained));objects=16384-_capture_objects(retained)
+    if memory<1 or objects<1:fail('budget_exceeded','remaining performance metadata allowance exhausted')
+    return PerformanceLimits(maximum_metadata_bytes=memory,maximum_objects=objects)
+
+
+def _capture_encoding_credit(value, *retained, maximum_bytes=CAPTURE_METADATA_BYTES):
+    from .state import _metadata_weight, _context_json_size
+    size = _context_json_size(value)
+    if size>MIB:fail('budget_exceeded','performance JSON original exceeds byte allowance before encoding')
+    # Detachment, Unicode encoder output and UTF8 bytes share the caller forest.
+    _capture_credit(value, *retained, extra_bytes=_capture_decoded_bound(value)+_capture_path_bound(value)+_capture_text_bound(value,size)+size+sys.getsizeof(b''),
+        extra_objects=_capture_objects((value,))+67,maximum_bytes=maximum_bytes)
+
+
+def _capture_encode(value, *retained, maximum_bytes=CAPTURE_METADATA_BYTES):
+    _capture_encoding_credit(value,*retained,maximum_bytes=maximum_bytes)
+    return json_bytes(value)
+
+
+def _capture_reader_metadata(reader):
+    # Protected StateReader validation/library W is separate. Its selected JSON
+    # documents and source guards are live metadata shared by this operation.
+    names = ('_state_ref','_manifest','_pages','_index','_known_states','_catalog_by_hash',
+        '_published_paths','_catalog_by_leaf','_page_proofs','_parent_anchor_cache',
+        '_declarations','_verified_refs','_metadata_bindings','_checkpoint')
+    return tuple(getattr(reader,name,None) for name in names)
+
+
+def _capture_small_json(path, budget, retained):
+    with regular(path) as stream:
+        before=stamp(stream,include_change=True);count=before[2]
+        if count>MIB:fail('budget_exceeded','performance JSON original exceeds allowance')
+        _capture_credit(*retained,extra_bytes=count+sys.getsizeof(b''),extra_objects=1)
+        budget.require(count);raw=stream.read(count);budget.account(len(raw))
+        if len(raw)!=count or stamp(stream,include_change=True)!=before:
+            fail('source_changed','performance JSON original changed')
+    value=_capture_decode(raw,*retained)
+    _capture_credit(*retained,raw,value)
+    return value,raw
+
+
+def _capture_ref(path, raw, schema):
+    return dict(path=path, bytes=str(len(raw)), sha256=digest(raw), schema=schema, media_type='application/json')
+
+
+def _capture_read_admitted(root, reference, budget, *, retained=()):
+    if int(reference['bytes'])>MIB:fail('budget_exceeded','performance metadata original exceeds allowance')
+    _capture_credit(*retained,extra_bytes=int(reference['bytes'])+sys.getsizeof(b''),extra_objects=1)
+    return _capture_read(root,reference,budget)
+
+
+def _capture_read(root, reference, budget):
+    count = int(reference['bytes'])
+    if count > MIB:
+        fail('budget_exceeded', 'performance metadata original exceeds allowance')
+    _capture_credit(extra_bytes=count+sys.getsizeof(b''))
+    with regular(beneath(root, reference['path']), size=count) as stream:
+        before = stamp(stream, include_change=True); budget.require(count)
+        raw = stream.read(count); budget.account(len(raw))
+        if len(raw) != count or digest(raw) != reference['sha256'] or stamp(stream, include_change=True) != before:
+            fail('source_changed', 'performance metadata original changed')
+    return raw
+
+
+def _capture_write(root, path, raw, schema, budget, *, immutable=False, retained=()):
+    # Reference construction and the mandatory readback are admitted before a
+    # write can escape; memory refusal must not advance a pointer first.
+    if len(raw)>MIB:fail('budget_exceeded','performance publication original exceeds byte allowance')
+    _capture_credit(*retained,raw,path,schema,extra_bytes=2048+len(path)+len(schema)+len(raw)+sys.getsizeof(b''))
+    reference = _capture_ref(path, raw, schema)
+    _capture_credit(*retained,raw,reference,extra_bytes=len(raw)+sys.getsizeof(b''),extra_objects=1)
+    target = beneath(root, path)
+    if immutable and target.exists():
+        if _capture_read_admitted(root, reference, budget,retained=(*retained,raw,reference)) != raw:
+            fail('source_changed', 'immutable performance metadata differs')
+    else:
+        budget.write(len(raw)); atomic_write(target, raw, immutable=immutable)
+        if _capture_read_admitted(root, reference, budget,retained=(*retained,raw,reference)) != raw:
+            fail('source_changed', 'performance publication readback differs')
+    return reference
+
+
+@dataclass(frozen=True, init=False)
+class NativePerformanceInputs:
+    """Explicit original operands for the owning factory, never an origin proof.
+
+    AiiDA must supply these from its original graph and qualify every root. The
+    current capture-spec/native-execution ingress does not carry these operands.
+    Local DTO consistency cannot certify native origin, RO access or acceptance.
+    """
+    _raw: bytes
+    _decoded_bound: int
+    _decoded_objects: int
+
+    def __init__(self, *, provider_selection, original_inputs, runner_anchor_root, technical_root, sources):
+        from qcl_negf_contracts import schema_validator
+        from qcl_negf_contracts.artifacts import relative_path
+        from .state import _schema_check
+        value = dict(provider_selection=provider_selection, original_inputs=original_inputs,
+            runner_anchor_root=runner_anchor_root, technical_root=technical_root, sources=sources)
+        _capture_credit(value)
+        if type(sources) is not list or len(sources) > 256:
+            raise ValueError('bounded explicit original source operands required')
+        validator = schema_validator('telemetry-envelope.schema.json')
+        def shape(name, item):
+            _schema_check(validator.evolve(schema={'$ref': '#/$defs/' + name, '$defs': validator.schema['$defs']}), item)
+        shape('PerformanceProviderSelection', provider_selection)
+        shape('PerformanceOriginalInputs', original_inputs)
+        def root_shape(root):
+            shape('PerformanceRoot', root)
+            relative_path(root['storage']['relative_execution_root'])
+            if root['relative_path'] != '.':relative_path(root['relative_path'])
+        for root in (runner_anchor_root, technical_root):root_shape(root)
+        if runner_anchor_root['area'] != 'native_execution' or technical_root['area'] != 'native_workdir':
+            raise ValueError('explicit enclosing execution and workdir roots required')
+        if technical_root['relative_path'] != 'performance':
+            raise ValueError('fixed workdir performance root required')
+        for source in sources:
+            if type(source) is not dict or set(source) != {'selected_state', 'artifact_root', 'scientific_root',
+                    'canonical_plan_root', 'scientific_directory', 'canonical_plan_directory', 'source_transport'}:
+                raise ValueError('exact original scientific source operands required')
+            if source['artifact_root'] != '.':relative_path(source['artifact_root'])
+            root_shape(source['scientific_root']);root_shape(source['canonical_plan_root'])
+            common = schema_validator('result-common.schema.json')
+            if source['selected_state'] is not None:
+                _schema_check(common.evolve(schema={'$ref': '#/$defs/StateRef', '$defs': common.schema['$defs']}), source['selected_state'])
+            shape('Transport', source['source_transport'])
+            for field in ('scientific_directory', 'canonical_plan_directory'):
+                if (type(source[field]) is not str or not Path(source[field]).is_absolute()
+                        or os.path.abspath(source[field]) != source[field]):
+                    raise ValueError('explicit normalized local scientific and plan mappings required')
+        raw = _capture_encode(value); _capture_credit(value, raw)
+        object.__setattr__(self, '_raw', raw)
+        object.__setattr__(self, '_decoded_bound', _capture_decoded_bound(value)+_capture_text_bound(value,len(raw)))
+        # Occurrence count is a conservative bound even when JSON memoizes keys.
+        def objects(item):
+            if type(item) is dict:return 1+sum(objects(k)+objects(v) for k,v in item.items())
+            if type(item) in (list,tuple):return 1+sum(objects(v) for v in item)
+            return 1
+        object.__setattr__(self, '_decoded_objects', objects(value))
+
+    def document(self):
+        import json
+        _capture_credit(self._raw, extra_bytes=self._decoded_bound, extra_objects=self._decoded_objects)
+        # _raw is immutable, canonical JSON produced after complete validation.
+        # A second validate_json copy adds no validation and doubles the live tree.
+        return json.loads(self._raw)
+
+
+class NativePerformanceCapture:
+    """Small source-only factory/index owner on explicit original operands.
+
+    Owns no RO lease or AiiDA graph. No newest lookup selects scientific state;
+    only remembered exact T2 publications and explicit source operands qualify
+    local byte relationships. An index is an assertion input to the T4 gate.
+    """
+    def __init__(self, workdir, artifact_root, *, writer, transport, inputs, budget):
+        if not isinstance(inputs, NativePerformanceInputs):
+            raise TypeError('NativePerformanceInputs required; callback is not native origin')
+        from .telemetry import TelemetryWriter
+        if not isinstance(writer, TelemetryWriter):raise TypeError('owning TelemetryWriter required')
+        from .state import _metadata_weight
+        _capture_credit(inputs._raw,transport,extra_bytes=_metadata_weight(transport),extra_objects=_capture_objects((transport,)))
+        self.workdir = Path(workdir); self.actual = Path(artifact_root); self.writer = writer
+        self.inputs = inputs; self.transport = _capture_copy(transport,inputs._raw); self.budget = budget
+        self.anchors = {}; self.generation = 0
+        data = _capture_document(inputs, self.transport); selection = transport['selection']
+        if any(data['provider_selection'][k] != selection[k] for k in ('calcjob_uuid', 'execution_id', 'attempt')):
+            raise ValueError('original provider/enclosing transport differs')
+        if writer.metadata_budget is not budget:
+            raise ValueError('capture and writer must share one aggregate I/O ledger')
+        if writer.root != self.workdir / 'performance' or writer.transport != transport:
+            raise ValueError('writer differs from explicit native workdir/transport')
+        self._roots = tuple((path, (path.stat().st_dev, path.stat().st_ino))
+            for path in (self.workdir, self.actual, writer.root))
+        _capture_credit(data, self.transport)
+
+    def _guard(self):
+        for path, expected in self._roots:
+            current = path.stat()
+            if (current.st_dev, current.st_ino) != expected:
+                fail('source_changed', 'performance capture root replaced')
+        for row in self.anchors.values():
+            for path, expected in row['root_identities']:
+                current = Path(path).stat()
+                if (current.st_dev, current.st_ino) != expected:
+                    fail('source_changed', 'performance source root replaced')
+
+    def _publication_guard(self, context, *, retained):
+        """Recheck held roots and exact source bytes within this publication."""
+        self._guard()
+        for row in self.anchors.values():
+            science = row['anchor']['scientific']; source = row['source']
+            _capture_credit(*retained,extra_bytes=2*max(int(row['reference']['bytes']),
+                int(science['selected_state']['manifest']['bytes']))+2*sys.getsizeof(b''))
+            if _capture_read_admitted(self.actual,row['reference'],self.budget,retained=retained) != row['raw'].encode():
+                fail('source_changed','remembered Runner anchor changed')
+            if _capture_read_admitted(Path(source['scientific_directory']),science['selected_state']['manifest'],
+                    self.budget,retained=retained) != science['manifest_utf8'].encode():
+                fail('source_changed','selected manifest changed during source index publication')
+            _capture_read_admitted(Path(source['canonical_plan_directory']),source['source_transport']['frozen_plan'],
+                self.budget,retained=retained)
+        _capture_read_admitted(self.writer.root,context[0],self.budget,retained=retained)
+        self._guard()
+
+    def remember(self, anchor, reference, raw):
+        from qcl_negf_contracts.telemetry import validate_performance_anchor
+        from .state import _metadata_weight
+        _capture_credit(self.inputs._raw,self.anchors,self.transport,anchor,reference,raw,
+            extra_bytes=2*_metadata_weight(anchor),extra_objects=2*_capture_objects((anchor,)))
+        validate_performance_anchor(anchor)
+        if _capture_ref('performance-anchors/' + digest(raw) + '.json', raw, anchor['schema']) != reference:
+            raise ValueError('exact immutable Runner anchor reference required')
+        if _capture_decode(raw,self.inputs._raw,self.anchors,self.transport,anchor,reference) != anchor or _capture_read_admitted(self.actual, reference, self.budget,retained=(self.inputs._raw,self.anchors,self.transport,anchor,reference,raw)) != raw:
+            fail('source_changed', 'Runner anchor original differs')
+        science = anchor['scientific']
+        if science is None:return
+        inputs = _capture_document(self.inputs, self.anchors, self.transport, anchor, reference, raw)
+        candidates = [s for s in inputs['sources'] if s['artifact_root'] == science['artifact_root']
+            and (s['selected_state'] == science['selected_state'] or s['selected_state'] is None
+                and science['relation'] == 'produced' and s['source_transport'] == self.transport)]
+        if len(candidates) != 1:
+            raise ValueError('one explicit original scientific root/transport required')
+        source = candidates[0]
+        if anchor['origin'] is not None and anchor['origin'] != dict(calcjob_uuid=self.transport['selection']['calcjob_uuid'],
+                native_execution_uuid=inputs['original_inputs']['native_execution']['node_uuid']):
+            raise ValueError('Runner current origin differs from explicit original inputs')
+        _capture_credit(inputs,self.inputs._raw,self.anchors,self.transport,anchor,reference,raw,source,
+            extra_bytes=4096,extra_objects=32)
+        operands = dict(scientific_root=source['scientific_root'], selected_state=science['selected_state'],
+            invocation=science['invocation'], source_transport=source['source_transport'], source_origin=science['source_origin'])
+        key = digest(_capture_encode(operands,inputs,self.inputs._raw,self.anchors,self.transport,anchor,reference,raw))
+        _capture_credit(inputs,self.inputs._raw,self.anchors,self.transport,anchor,reference,raw,source,
+            extra_bytes=4*len(raw)+sys.getsizeof('\U00010000')+1024,extra_objects=16)
+        roots = []
+        for field in ('scientific_directory','canonical_plan_directory'):
+            current = Path(source[field]).stat()
+            roots.append((source[field],(current.st_dev,current.st_ino)))
+        row = dict(anchor=anchor, reference=reference, raw=raw.decode('utf-8'), source=source,
+            root_identities=tuple(roots))
+        old = self.anchors.get(key)
+        if old is not None:
+            if old['anchor'] != anchor or old['source'] != source:
+                raise ValueError('selector collides with a different Runner/source association')
+            return
+        if len(self.anchors) >= 256:
+            fail('budget_exceeded', 'whole performance anchor inventory exceeds 256')
+        _capture_credit(inputs, self.inputs._raw, self.anchors, row, raw, raw)
+        _capture_credit(inputs, self.inputs._raw, self.anchors, self.transport, row, raw,
+            extra_bytes=_metadata_weight(row),
+            extra_objects=_capture_objects((row,)))
+        self.anchors[key] = _capture_copy(row,inputs,self.inputs._raw,self.anchors,self.transport,raw)
+
+    def _entry(self, key, row, context, closed, status, *, inputs=None, retained=()):
+        from .state import StateReader, ResultReadLimits, _IOBudget, _context_raw_tree_bound
+        from .performance_views import TelemetrySelection, PerformanceLimits, read_performance_summary
+        anchor = row['anchor']; science = anchor['scientific']; source = row['source']
+        state = science['selected_state']
+        if int(state['manifest']['bytes'])>MIB:
+            fail('budget_exceeded','selected scientific manifest exceeds capture byte allowance before reader initialization')
+        if inputs is None:inputs = _capture_document(self.inputs,self.anchors,self.transport,context,status,retained)
+        live = (self.inputs._raw,inputs,self.anchors,self.transport,context,status,retained)
+        _capture_credit(*live)
+        root = Path(source['scientific_directory'])
+        plan_root = Path(source['canonical_plan_directory'])
+        io = _IOBudget(4*MIB); reader = StateReader.__new__(StateReader)
+        try:
+            with _capture_reader_credit(self.budget, io):
+                reader._initialize(root, state_ref=state, expected_identity=state['identity'], limits=ResultReadLimits(maximum_metadata_bytes=MIB), budget=io)
+            live += _capture_reader_metadata(reader)
+            _capture_credit(*live)
+            manifest_raw = _capture_read_admitted(root, state['manifest'], self.budget,retained=live)
+            _capture_credit(*live,manifest_raw,extra_bytes=int(state['manifest']['bytes'])+sys.getsizeof(b''))
+            if manifest_raw != science['manifest_utf8'].encode('utf-8'):
+                fail('source_changed', 'selected scientific manifest differs from original Runner anchor')
+            provenance = reader._manifest['provenance']
+            _capture_credit(*live,manifest_raw,provenance,extra_bytes=4096,extra_objects=32)
+            binding = dict(schema='qcl-negf.telemetry-source-binding.v1', contract_set='qcl-negf.results.v2',
+                enclosing_transport=self.transport, source_transport=source['source_transport'], selected_state=state,
+                invocation=science['invocation'], relation=science['relation'], canonical_plan=source['source_transport']['frozen_plan'],
+                producer_provenance=provenance, plan_relation='identical_frozen_bytes')
+            raw = _capture_encode(binding, *live, manifest_raw, provenance)
+            _capture_credit(*live, manifest_raw, provenance, binding, raw)
+            source_ref = _capture_write(self.writer.root, 'source-bindings/' + digest(raw) + '.json', raw,
+                binding['schema'], self.budget, immutable=True,retained=(*live,manifest_raw,provenance,binding))
+            operands = dict(commit_ref=context[0],source_binding_ref=source_ref,
+                expected_transport=self.transport,source_transport=source['source_transport'],
+                canonical_plan_ref=source['source_transport']['frozen_plan'],expected_producer_provenance=provenance,
+                phase_context_refs=list(context[1]),resume_context_refs=list(context[2]))
+            _capture_encoding_credit(operands,*live,manifest_raw,provenance,binding,raw,source_ref)
+            selected = TelemetrySelection(self.writer.root,canonical_plan_root=plan_root,**operands)
+            del operands
+            if closed:
+                operands = dict(state=state,source=source_ref,context=[context[0],list(context[1]),list(context[2])],status=status)
+                name_raw = _capture_encode(operands,*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw)
+                name = 'bindings/'+digest(name_raw)+'.json'
+                del operands,name_raw
+                if not (self.writer.root / name).exists():
+                    make_binding(reader,telemetry=selected,destination=self.writer.root/name,capture_status=status,budget=self.budget,
+                        _retained=(*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw))
+                value,raw_binding = _capture_small_json(self.writer.root/name,self.budget,
+                    (*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw))
+                binding_ref = _capture_ref(name,raw_binding,value['schema'])
+                _capture_credit(*live,value,raw_binding,binding_ref,selected._raw,
+                    extra_bytes=2*_context_raw_tree_bound(selected._raw))
+                operands = selected.document();operands['binding_ref'] = binding_ref
+                _capture_encoding_credit(operands,*live,manifest_raw,provenance,binding,raw,source_ref,value,raw_binding,selected._raw)
+                selected = TelemetrySelection(self.writer.root,canonical_plan_root=plan_root,**operands)
+                del value,raw_binding,operands,binding_ref
+            with _capture_reader_credit(self.budget, io):
+                read_performance_summary(reader, telemetry=selected, limits=_capture_limits(
+                    (*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw)))
+        finally:
+            primary = sys.exception()
+            try:reader.close()
+            except BaseException as cleanup:
+                if primary is None:raise
+                primary.add_note('native performance source cleanup: ' + str(cleanup))
+        _capture_credit(*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw,
+            extra_bytes=2*_context_raw_tree_bound(selected._raw))
+        return dict(anchor_key=key, runner_anchor_ref=row['reference'], runner_anchor_utf8=row['raw'],
+            runner_anchor_root=inputs['runner_anchor_root'], scientific_root=source['scientific_root'],
+            technical_root=inputs['technical_root'], canonical_plan_root=source['canonical_plan_root'], telemetry=selected.document())
+
+    def publish(self, *, close_context=None, capture_status=None):
+        from qcl_negf_contracts.telemetry import validate_performance_source_index, validate_performance_source_pointer
+        self._guard()
+        from .state import _metadata_weight, _context_raw_tree_bound
+        before = (self.inputs._raw,self.anchors,self.transport,close_context,capture_status)
+        # Snapshot before the large operands decode. T0 owns the snapshot, but
+        # its metadata scratch still shares this caller's remaining allowance.
+        if close_context is None:
+            stored = self.writer._published_context_raw
+            _capture_credit(*before,stored,self.writer._previous,
+                extra_bytes=2*_context_raw_tree_bound(stored)+4*_metadata_weight(self.writer._previous))
+            context = self.writer.published_context()
+        else:
+            _capture_credit(*before,extra_bytes=_metadata_weight(close_context),extra_objects=_capture_objects((close_context,)))
+            context = _capture_copy(close_context,*before)
+        inputs = _capture_document(self.inputs,*before,context)
+        live = (self.inputs._raw,inputs,self.anchors,self.transport,context,close_context,capture_status)
+        commit_raw = _capture_read_admitted(self.writer.root, context[0], self.budget,retained=live)
+        commit = _capture_decode(commit_raw,*live)
+        del commit_raw
+        live += (commit,)
+        closed = commit['closed']
+        if (close_context is not None) != closed:
+            raise ValueError('closed publication requires the exact owner close context')
+        if commit['transport'] != self.transport:
+            raise ValueError('acknowledged technical transport differs')
+        entries = []
+        for key, row in self.anchors.items():
+            _capture_credit(self.inputs._raw, inputs, self.anchors,self.transport, entries, row, context,commit,capture_status)
+            entries.append(self._entry(key, row, context, closed, capture_status,inputs=inputs,
+                retained=(commit,entries,capture_status,close_context)))
+        value = dict(schema='qcl-negf.performance-source-index.v1', contract_set='qcl-negf.results.v2',
+            provider_selection=inputs['provider_selection'], generation=str(self.generation+1), closed=closed,
+            technical=dict(root=inputs['technical_root'], commit_ref=context[0], phase_context_refs=list(context[1]), resume_context_refs=list(context[2])),
+            entries=entries)
+        _capture_credit(self.inputs._raw, inputs, self.anchors,self.transport,context,commit,capture_status, value)
+        # Retained operands and conservative call buffers share capture W.
+        # F4 does not qualify all transitive Contracts temporaries under W.
+        # The public encoded index cap is checked before the validator's encoder.
+        _capture_encoding_credit(value,*live)
+        copied = 2*_metadata_weight(value)
+        copy_objects = 2*_capture_objects((value,))
+        for row in self.anchors.values():
+            _capture_credit(*live,value,extra_bytes=int(row['anchor']['scientific']['selected_state']['manifest']['bytes'])+sys.getsizeof(b''))
+            copied += 2*_capture_decoded_bound(row['anchor'])
+            manifest_bound = _context_raw_tree_bound(row['anchor']['scientific']['manifest_utf8'].encode())
+            copied += 2*manifest_bound
+            copy_objects += 2*_capture_objects((row['anchor'],))+manifest_bound//64+1
+        _capture_credit(*live,value,extra_bytes=copied,extra_objects=copy_objects)
+        validate_performance_source_index(value)
+        raw = _capture_encode(value, self.inputs._raw, inputs, self.anchors,self.transport,context,commit,capture_status)
+        _capture_credit(self.inputs._raw, inputs, self.anchors,self.transport,context,commit,capture_status, value, raw)
+        if len(raw) > MIB:fail('budget_exceeded', 'whole performance source index exceeds byte bound')
+        self._publication_guard(context,retained=(*live,value,raw))
+        # F4 prepare every own suffix object/encoding before the first immutable
+        # index write. The stable retained roots plus the conservative suffix
+        # reserve dominate each existing _capture_write/readback preflight.
+        # This does not qualify transitive validators or a process RSS peak.
+        _capture_credit(*live,value,raw,extra_bytes=8192,extra_objects=64)
+        index_path='sources/' + digest(raw) + '.json'
+        reference = _capture_ref(index_path,raw,value['schema'])
+        pointer = dict(schema='qcl-negf.performance-source-pointer.v1', index=reference)
+        pointer_raw = _capture_encode(pointer,self.inputs._raw,inputs,self.anchors,self.transport,context,commit,capture_status,value,raw,reference)
+        validate_performance_source_pointer(pointer)
+        _capture_credit(*live,value,raw,reference,pointer,pointer_raw,extra_bytes=_metadata_weight(reference),extra_objects=_capture_objects((reference,)))
+        returned = _capture_copy(reference,*live,value,raw,pointer,pointer_raw)
+        final = (*live,value,raw,reference,pointer,pointer_raw,returned)
+        # Known fixed suffix paths/schema/ref constructions, tuple/header/file
+        # buffering and one active same-open readback. Two payload capacities
+        # also cover the current helper's prospective raw/readback reservations.
+        guard_bytes = int(context[0]['bytes']); guard_capacity = guard_bytes
+        for row in self.anchors.values():
+            counts = (int(row['reference']['bytes']),int(row['anchor']['scientific']['selected_state']['manifest']['bytes']),
+                int(row['source']['source_transport']['frozen_plan']['bytes']))
+            guard_bytes += sum(counts); guard_capacity = max(guard_capacity,*counts)
+        _capture_credit(*final,extra_bytes=131072+2*max(len(raw),len(pointer_raw),guard_capacity)
+            +4*_metadata_weight((reference,pointer)),extra_objects=128)
+        # One synchronous owner uses this ledger. Admit every remaining write,
+        # delivered readback and source check before the first index effect;
+        # existing helpers charge actual bytes without refunds or a second debit.
+        # The finally check also covers a failed write/check, preserving its
+        # primary exception. Successful open/closed suffixes use two/three checks.
+        self.budget.require(2*(len(raw)+len(pointer_raw)+(len(raw) if closed else 0))
+            +(3 if closed else 2)*guard_bytes)
+        try:
+            _capture_write(self.writer.root,index_path,raw,value['schema'],self.budget,immutable=True,retained=final)
+            self._publication_guard(context,retained=final)
+            _capture_write(self.writer.root, 'current-source.json', pointer_raw, pointer['schema'], self.budget,retained=final)
+            if closed:
+                self._publication_guard(context,retained=final)
+                _capture_write(self.workdir, 'performance-source.json', raw, value['schema'], self.budget,retained=final)
+        finally:
+            primary = sys.exception()
+            try:self._publication_guard(context,retained=final)
+            except BaseException as cleanup:
+                if primary is None:raise
+                primary.add_note('native performance publication source cleanup: '+str(cleanup))
+        self.generation += 1
+        return returned
+
 def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetry_selection_factory=None,
-            native_execution_path=None, solver_arguments=()):
+            native_execution_path=None, solver_arguments=(), native_performance_inputs=None):
     """Only this disposable process imports Arrow or touches job/scratch/NFS files."""
     budget = ObserverIO(16384)
     try:
@@ -862,7 +1494,10 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         return 2 # No traceback/inherited-log write before capture credit.
     selection = spec["selection"]
     native_output = None
+    performance_capture = None
     try:
+        if native_performance_inputs is not None and (native_execution_path is None or not isinstance(native_performance_inputs, NativePerformanceInputs)):
+            raise ValueError('explicit typed native operands require the native ingress')
         if native_execution_path is not None:
             if transport is not None or telemetry_selection_factory is not None:
                 raise ValueError('native ingress cannot accept caller transport/factory assertions')
@@ -957,14 +1592,15 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
     def capture_point(actual, point, mode, terminal, epoch):
         nonlocal journal_bytes,phase_source,phase_key,closed_page_bytes
         state=point['selected_state'];descriptor=point['phase_source']
-        if state is None:
+        identity=point.get('phase_identity') or (None if state is None else state['identity'])
+        if identity is None:
             missing_sources.add(point['point_id']);return
-        key=digest(json_bytes(dict(identity=state['identity'],session=descriptor['session_id'])))
+        key=digest(json_bytes(dict(identity=identity,session=descriptor['session_id'])))
         if descriptor['status']=='available':
             qualified=(str(actual),key,epoch)
             if phase_key!=qualified:
                 if phase_source is not None:phase_source.close()
-                phase_source=PhaseCaptureSource(actual,descriptor=descriptor,expected_identity=state['identity'],route_epoch=epoch)
+                phase_source=PhaseCaptureSource(actual,descriptor=descriptor,expected_identity=identity,route_epoch=epoch)
                 phase_key=qualified
             while True:
                 before=budget.read_bytes
@@ -998,7 +1634,8 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 if _metadata_weight(cursors)>MIB:raise ValueError('whole-observer cursor metadata bound exceeded')
                 if not terminal:break
         else:missing_sources.add(point['point_id'])
-        publisher.publish(actual,point,mode=mode,terminal=terminal,io_remaining=budget.remaining)
+        if state is not None:
+            publisher.publish(actual,point,mode=mode,terminal=terminal,io_remaining=budget.remaining)
 
     def bind_selected(actual,point,close_context,capture_status):
         from .state import StateReader,ResultReadLimits,_IOBudget
@@ -1033,8 +1670,11 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
             selected = TelemetrySelection(selected.artifact_root,
                 canonical_plan_root=selected.canonical_plan_root, **inputs)
             name='performance-binding.json' if len(last_points)==1 else 'performance-bindings/'+digest(json_bytes(point['selected_state']))+'.json'
-            make_binding(reader,telemetry=selected,destination=writer.root/name,capture_status=capture_status,budget=budget)
-            charged=io.bytes_read_total  # make_binding already charged its exact delta
+            try:
+                make_binding(reader,telemetry=selected,destination=writer.root/name,capture_status=capture_status,budget=budget)
+            finally:
+                # The binder settles its reservation on success and failure.
+                charged=io.bytes_read_total
         finally:
             primary=sys.exception()
             try:
@@ -1066,7 +1706,11 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 "allocated_logical_cpus": spec["allocated_logical_cpus"],
             },
             metadata_budget=budget,transport=transport,
+            **({'technical_version': 2} if native_performance_inputs is not None else {}),
         )
+        if native_performance_inputs is not None:
+            performance_capture = NativePerformanceCapture(root, native_output, writer=writer,
+                transport=transport, inputs=native_performance_inputs, budget=budget)
         while True:
             try:
                 os.read(control_fd, 64)
@@ -1095,16 +1739,26 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 if locator["epoch"] < previous_epoch:
                     raise ValueError("actual source epoch reversed")
                 previous_epoch = locator["epoch"]
-                if not terminal and not (actual / "current_point.json").exists():
+                has_anchor = (actual / 'performance-anchor-current.json').exists()
+                if not terminal and not has_anchor and not (actual / "current_point.json").exists():
                     admit()
                     writer_call(writer.flush_due)
                     time.sleep(2)
                     continue
-                points, pins = (
-                    _final_points(actual, selection, known, budget=budget)
-                    if terminal
-                    else ([_current(actual, selection, known, budget=budget)], None)
-                )
+                if has_anchor:
+                    anchor, anchor_ref, anchor_raw = _performance_anchor(actual,budget=budget,
+                        retained=() if performance_capture is None else (performance_capture.inputs._raw,performance_capture.anchors,performance_capture.transport))
+                    if performance_capture is not None:performance_capture.remember(anchor, anchor_ref, anchor_raw)
+                    identity = anchor['phase_identity']; science = anchor['scientific']
+                    if identity['execution_id'] != selection['execution_id'] or identity['point_id'] not in known:
+                        raise ValueError('Runner phase anchor differs from frozen execution')
+                    points = [dict(point_id=identity['point_id'], phase_identity=identity,
+                        source_attempt=None if science is None else int(science['selected_state']['identity']['attempt']),
+                        artifact_root='.' if science is None else science['artifact_root'],
+                        selected_state=None if science is None else science['selected_state'], phase_source=anchor['phase_source'])]
+                else:
+                    points, _ = (_final_points(actual, selection, known, budget=budget) if terminal
+                        else ([_current(actual, selection, known, budget=budget)], None))
                 last_actual=actual;last_points=points
                 for point in points:
                     capture_point(actual,point,locator['mode'],terminal,locator['epoch'])
@@ -1116,12 +1770,14 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
             writer_call(writer.flush_due)
             if terminal:
                 admit()
-                if telemetry_selection_factory is None or transport is None:
+                if performance_capture is None and (telemetry_selection_factory is None or transport is None):
                     writer_call(writer.record_control,dict(event='source_binding_missing',reason='explicit_transport_or_factory_missing'))
+                if performance_capture is not None and not performance_capture.anchors:
+                    writer_call(writer.record_control, dict(event='scientific_anchor_pending', reason='no_published_scientific_anchor'))
                 close_context = writer_call(writer.close_context)
                 close_ref, _, _ = close_context
                 closed = writer.root / close_ref['path']
-                if telemetry_selection_factory is None or transport is None:
+                if performance_capture is None and (telemetry_selection_factory is None or transport is None):
                     raise ValueError('source_binding_missing: explicit transport/factory and production ingress policy required')
                 if last_actual is None or not last_points:raise ValueError('selected source unavailable for exact close binding')
                 complete=not missing_sources and bool(cursors) and all(c['complete_at_observation'] for c in cursors.values())
@@ -1129,8 +1785,14 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                     scalar_live_route=locator['mode'] if not publisher.disabled else 'unavailable',
                     scalar_live_reason='live_publication_incomplete' if publisher.disabled else None,
                     performance_status='available' if complete else 'incomplete',reason=None if complete else 'phase_sources_or_tail_incomplete')
-                for point in last_points:bind_selected(last_actual,point,close_context,status)
+                if performance_capture is not None:
+                    performance_capture.publish(close_context=close_context, capture_status=status)
+                    if not performance_capture.anchors:
+                        raise ValueError('scientific_anchor_pending: technical evidence is not available R5')
+                else:
+                    for point in last_points:bind_selected(last_actual,point,close_context,status)
                 break
+            if performance_capture is not None:performance_capture.publish()
             time.sleep(2)
     except Exception as error:
         failure = error
@@ -1139,9 +1801,20 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         if writer is not None and closed is None:
             try:
                 admit()
-                writer_call(writer.close)
-            except Exception:
-                pass
+                if performance_capture is not None and failure is not None:
+                    # Retain the last good accepted prefix and the failure as
+                    # acknowledged technical evidence, without replaying phase
+                    # discovery or publishing any new scientific state.
+                    writer_call(writer.record_control, dict(event='capture_failed', reason='observer_source_or_tail_failed'))
+                    close_context = writer_call(writer.close_context)
+                    closed = writer.root / close_context[0]['path']
+                    performance_capture.publish(close_context=close_context, capture_status=dict(
+                        terminal_tail='known_incomplete', scalar_live_route='unavailable',
+                        scalar_live_reason='capture_failed', performance_status='incomplete', reason='capture_failed'))
+                else:
+                    writer_call(writer.close)
+            except Exception as cleanup:
+                if failure is not None:failure.add_note('observer incomplete close: ' + str(cleanup))
         if phase_source is not None:phase_source.close()
         os.close(control_fd)
     return 0 if failure is None else 2

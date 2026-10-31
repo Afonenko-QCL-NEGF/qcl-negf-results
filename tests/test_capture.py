@@ -1056,3 +1056,575 @@ def test_S3_make_binding_dispatches_v2_without_changing_source_binding(tmp_path)
     binding=json.loads((c['technical']/selected.binding_ref['path']).read_bytes())
     assert binding['schema']=='qcl-negf.telemetry-binding.v2'
     assert binding['source_binding']['raw_utf8'].encode()==original
+
+
+def _T3_anchor(fixture, *, pending=False):
+    """Publish literal T2 wire, retaining its original whitespace and immutable bytes."""
+    from copy import deepcopy
+    from qcl_negf_results.commits import json_bytes
+    c = fixture['context']
+    manifest = json.loads(fixture['manifest'].read_bytes())
+    value = dict(schema='qcl-negf.performance-anchor.v1', contract_set='qcl-negf.results.v2',
+        phase_identity=deepcopy(c['state']['identity']),
+        phase_source=dict(status='available', session_id='native', current_path='phase-current.json', reason=None),
+        origin=None, invocation=deepcopy(manifest['invocation']), scientific=None)
+    if not pending:
+        value['scientific'] = dict(artifact_root='science', selected_state=deepcopy(c['state']),
+            manifest_utf8=fixture['manifest'].read_bytes().decode(), invocation=deepcopy(manifest['invocation']),
+            source_origin=None, relation='produced')
+    raw = b' \n' + json_bytes(value) + b'\n'
+    target = fixture['result'] / 'performance-anchors' / (__import__('hashlib').sha256(raw).hexdigest() + '.json')
+    target.parent.mkdir(exist_ok=True)
+    target.write_bytes(raw)
+    (fixture['result'] / 'performance-anchor-current.json').write_bytes(raw)
+    return value, raw, target
+
+
+def test_T3_typed_anchor_requires_original_immutable_copy(tmp_path):
+    import qcl_negf_results.capture as module
+    from qcl_negf_results._capture_io import ObserverIO
+    from qcl_negf_contracts.messages import ContractError
+    fixture = _T1_native_job(tmp_path)
+    value, raw, immutable = _T3_anchor(fixture, pending=True)
+    observed, ref, original = module._performance_anchor(fixture['result'], budget=ObserverIO(4 << 20))
+    assert observed == value and original == raw
+    assert ref['path'] == 'performance-anchors/' + __import__('hashlib').sha256(raw).hexdigest() + '.json'
+    immutable.write_bytes(raw + b' ')
+    with pytest.raises((ContractError, ValueError)):
+        module._performance_anchor(fixture['result'], budget=ObserverIO(4 << 20))
+
+
+def test_T3_native_phase0_keeps_original_rows_without_fabricating_science(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as module
+    fixture = _T1_native_job(tmp_path)
+    _T3_anchor(fixture, pending=True)
+    (fixture['result'] / 'series_result.json').unlink()
+    monkeypatch.setattr(module, 'proc_sample', lambda *a, **k: dict(wall_seconds=2., monotonic_ns=2_000_000_000,
+        cpu_time_seconds=None, missing_reason='synthetic process sample unavailable'))
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 7\n'); os.close(write_fd)
+    assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+        native_execution_path=fixture['job'] / 'native-execution.json', solver_arguments=fixture['arguments']) == 2
+    technical = fixture['job'] / 'performance'
+    pointer = next(technical.glob('sessions/*/current.json'))
+    commit = json.loads((technical / json.loads(pointer.read_bytes())['commit']['path']).read_bytes())
+    summary = json.loads((technical / commit['summary']['path']).read_bytes())
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert summary['totals']['accepted_aggregate_calls'] == '3'
+    assert commit['source_cursors'][0]['identity'] == fixture['context']['state']['identity']
+    assert not (technical / 'performance-binding.json').exists()
+    assert not (fixture['job'] / 'performance-source.json').exists()
+
+
+def _T3_capture(tmp_path, *, history_only=False):
+    from copy import deepcopy
+    import qcl_negf_results.capture as module
+    from qcl_negf_results.telemetry import TelemetryWriter
+    from qcl_negf_results._capture_io import ObserverIO
+    fixture = _T1_native_job(tmp_path)
+    if history_only:
+        from native_consumer_fixture import technical_source, sealed_phase
+        c = technical_source(tmp_path / 'history', checkpoint=False, execution='exec')
+        fixture['context'] = c
+        fixture['manifest'] = c['science'] / c['state']['manifest']['path']
+        fixture['result'] = c['root']
+        sealed_phase(c['root'], c['state']['identity'])
+        plan_raw = (c['root'] / c['plan']['path']).read_bytes()
+        (fixture['job'] / 'plan.json').write_bytes(plan_raw)
+        fixture['spec']['selection']['plan_fingerprint'] = json.loads(plan_raw)['fingerprint']
+    raw = (fixture['job'] / 'plan.json').read_bytes()
+    plan_ref = dict(path='plan.json', bytes=str(len(raw)), sha256=__import__('hashlib').sha256(raw).hexdigest(),
+        schema=json.loads(raw)['schema'], media_type='application/json')
+    transport = dict(selection=deepcopy(fixture['spec']['selection']), frozen_plan=plan_ref)
+    storage = fixture['native']['storage']
+    root = lambda area, path: dict(storage=deepcopy(storage), area=area, relative_path=path)
+    uid = lambda n: f'00000000-0000-4000-8000-{n:012d}'
+    pins = {key: dict(node_uuid=uid(n), bytes='1', sha256='1' * 64)
+        for n, key in enumerate(('plan', 'source_graph', 'native_execution', 'submit_script'), 10)}
+    inputs = module.NativePerformanceInputs(provider_selection=dict(run_uuid=uid(9),
+        **{k: transport['selection'][k] for k in ('execution_id', 'attempt', 'calcjob_uuid')}),
+        original_inputs=pins, runner_anchor_root=root('native_execution', '.'),
+        technical_root=root('native_workdir', 'performance'),
+        sources=[dict(selected_state=fixture['context']['state'], artifact_root='science',
+            scientific_root=root('native_execution', 'science'), scientific_directory=str(fixture['context']['science']),
+            canonical_plan_root=root('native_workdir', '.'),
+            canonical_plan_directory=str(fixture['job']), source_transport=transport)])
+    budget = ObserverIO(128 << 20)
+    writer = TelemetryWriter(fixture['job'] / 'performance', {}, {}, transport=transport, technical_version=2, metadata_budget=budget)
+    capture = module.NativePerformanceCapture(fixture['job'], fixture['result'], writer=writer,
+        transport=transport, inputs=inputs, budget=budget)
+    fixture.update(writer=writer, capture=capture, inputs=inputs, transport=transport)
+    return fixture
+
+
+def test_T3_history_only_factory_publishes_open_then_exact_closed_index(tmp_path):
+    from qcl_negf_results.performance_views import TelemetrySelection, PerformanceLimits, read_performance_summary
+    from qcl_negf_results.state import StateReader
+    from qcl_negf_contracts.telemetry import validate_performance_source_index
+    fixture = _T3_capture(tmp_path, history_only=True)
+    anchor, raw, immutable = _T3_anchor(fixture)
+    capture = fixture['capture']; writer = fixture['writer']
+    capture.remember(anchor, dict(path=str(immutable.relative_to(fixture['result'])), bytes=str(len(raw)),
+        sha256=__import__('hashlib').sha256(raw).hexdigest(), schema=anchor['schema'], media_type='application/json'), raw)
+    first = capture.publish()
+    opened = json.loads((writer.root / first['path']).read_bytes())
+    assert opened['closed'] is False and len(opened['entries']) == 1
+    assert not writer.closed
+    capture.remember(anchor, opened['entries'][0]['runner_anchor_ref'], raw)
+    assert len(capture.anchors) == 1
+    writer.record_resource(dict(wall_seconds=1.))
+    writer.flush()
+    close = writer.close_context()
+    exact = capture.publish(close_context=close, capture_status=dict(terminal_tail='unknown', scalar_live_route='unavailable',
+        scalar_live_reason='external_root', performance_status='incomplete', reason='tail_unknown'))
+    closed_raw = (writer.root / exact['path']).read_bytes()
+    index = validate_performance_source_index(json.loads(closed_raw))
+    assert index['closed'] is True and index['generation'] == '2'
+    assert (fixture['job'] / 'performance-source.json').read_bytes() == closed_raw
+    assert (writer.root / first['path']).read_bytes() == __import__('qcl_negf_results.commits', fromlist=['json_bytes']).json_bytes(opened)
+    row = index['entries'][0]
+    assert row['telemetry']['commit_ref'] == close[0]
+    selection = TelemetrySelection(writer.root, canonical_plan_root=fixture['job'], **row['telemetry'])
+    with StateReader(fixture['context']['science'], state_ref=fixture['context']['state'],
+            expected_identity=fixture['context']['state']['identity']) as reader:
+        view = read_performance_summary(reader, telemetry=selection, limits=PerformanceLimits(maximum_objects=16384))
+        assert view['status'] == 'available' and view['closed'] is True
+        assert reader._manifest['checkpoint'] is None
+        assert view['transport']['selection']['attempt'] == 3
+
+
+def test_T3_native_explicit_operands_use_owned_factory_and_v2_index(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path)
+    # The factory fixture's private writer is quiesced; the real observe owns a
+    # separate fresh workdir rather than reusing a live writer directory.
+    fixture['writer'].close()
+    import shutil
+    shutil.rmtree(fixture['job'] / 'performance')
+    _T3_anchor(fixture)
+    monkeypatch.setattr(module, 'proc_sample', lambda *a, **k: dict(wall_seconds=2., monotonic_ns=2_000_000_000,
+        cpu_time_seconds=None, missing_reason='synthetic process sample unavailable'))
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 0\n'); os.close(write_fd)
+    assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+        native_execution_path=fixture['job'] / 'native-execution.json', solver_arguments=fixture['arguments'],
+        native_performance_inputs=fixture['inputs']) == 0
+    index = json.loads((fixture['job'] / 'performance-source.json').read_bytes())
+    assert index['closed'] is True and len(index['entries']) == 1
+    technical = fixture['job'] / 'performance'; row = index['entries'][0]
+    commit = json.loads((technical / row['telemetry']['commit_ref']['path']).read_bytes())
+    summary = json.loads((technical / commit['summary']['path']).read_bytes())
+    assert commit['schema'] == 'qcl-negf.telemetry-commit.v2'
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert summary['totals']['accepted_aggregate_calls'] == '3'
+    assert not any(r['event'] == 'source_binding_missing' for r in summary['control_events'])
+    assert row['telemetry']['binding_ref'] is not None
+    retained = [p.read_bytes() for p in technical.glob('sessions/*/raw/*')]
+    assert (fixture['result'] / 'phase-segment-1.json').read_bytes() in retained
+
+
+def test_T3_phase0_to_scientific_anchor_keeps_one_cursor_and_unknown_capacity(tmp_path, monkeypatch):
+    import shutil
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path)
+    fixture['writer'].close(); shutil.rmtree(fixture['job'] / 'performance')
+    _T3_anchor(fixture, pending=True)
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    samples = iter(((0, 1.), (2_000_000_000, 4.)))
+    def sample(*args, **kwargs):
+        stamp, cpu = next(samples)
+        return dict(wall_seconds=stamp / 1e9, monotonic_ns=stamp, cpu_time_seconds=cpu,
+            pid=42, process_start_ticks=7, clock_domain_id='root-clock', cgroup_scope='root_julia_process_including_threads')
+    snapshots = []
+    def ready(_):
+        pointer = json.loads((fixture['job'] / 'performance' / 'current-source.json').read_bytes())
+        snapshot = json.loads((fixture['job'] / 'performance' / pointer['index']['path']).read_bytes())
+        snapshots.append(snapshot)
+        assert snapshot['closed'] is False and snapshot['entries'] == []
+        _T3_anchor(fixture)
+        os.write(write_fd, b'exit 0\n')
+    monkeypatch.setattr(module, 'proc_sample', sample)
+    monkeypatch.setattr(module.time, 'sleep', ready)
+    try:
+        assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+            native_execution_path=fixture['job'] / 'native-execution.json', solver_arguments=fixture['arguments'],
+            native_performance_inputs=fixture['inputs']) == 0
+    finally:
+        os.close(write_fd)
+    index = json.loads((fixture['job'] / 'performance-source.json').read_bytes())
+    technical = fixture['job'] / 'performance'
+    commit = json.loads((technical / index['technical']['commit_ref']['path']).read_bytes())
+    summary = json.loads((technical / commit['summary']['path']).read_bytes())
+    assert len(snapshots) == 1 and len(index['entries']) == 1
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert summary['totals']['accepted_aggregate_calls'] == '3'
+    assert len(commit['source_cursors']) == 1
+    cpu = summary['cpu_coverage']['allocations'][0]
+    assert cpu['cpu_seconds'] == 3. and cpu['allocated_cpu_seconds'] is None
+    assert cpu['fraction_of_observed_capacity'] is None
+
+
+@pytest.mark.parametrize('fault', ['root_traversal', 'state_type', 'plan_alias'])
+def test_T3_input_roots_and_states_remain_explicit_typed_operands(tmp_path, fault):
+    import qcl_negf_results.capture as module
+    from qcl_negf_contracts.messages import ContractError
+    fixture = _T3_capture(tmp_path)
+    values = fixture['inputs'].document()
+    if fault == 'root_traversal':values['sources'][0]['canonical_plan_root']['relative_path'] = '../other'
+    elif fault == 'state_type':values['sources'][0]['selected_state'] = {'manifest': None}
+    else:values['sources'][0]['canonical_plan_directory'] = str(fixture['job']) + '/../other'
+    with pytest.raises((ValueError, ContractError)):
+        module.NativePerformanceInputs(**values)
+    fixture['writer'].close()
+
+
+def test_T3_produced_root_operands_need_no_future_StateRef(tmp_path):
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path, history_only=True)
+    values = fixture['inputs'].document()
+    values['sources'][0]['selected_state'] = None
+    inputs = module.NativePerformanceInputs(**values)
+    capture = module.NativePerformanceCapture(fixture['job'], fixture['result'], writer=fixture['writer'],
+        transport=fixture['transport'], inputs=inputs, budget=fixture['capture'].budget)
+    anchor, raw, immutable = _T3_anchor(fixture)
+    capture.remember(anchor, module._capture_ref(str(immutable.relative_to(fixture['result'])), raw, anchor['schema']), raw)
+    pin = capture.publish()
+    assert len(json.loads((fixture['writer'].root / pin['path']).read_bytes())['entries']) == 1
+    fixture['writer'].close()
+
+
+def test_T3_distinct_qualified_roots_keep_distinct_selectors_and_borrowed_cost(tmp_path):
+    from copy import deepcopy
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path, history_only=True)
+    values = fixture['inputs'].document()
+    original = tmp_path / 'original-plan-domain'; original.mkdir()
+    original_raw = (fixture['job'] / 'plan.json').read_bytes()
+    (original / 'frozen.json').write_bytes(original_raw)
+    source = values['sources'][0]
+    source['source_transport'] = deepcopy(fixture['transport'])
+    source['source_transport']['selection'].update(calcjob_uuid='00000000-0000-4000-8000-000000000008', attempt=2)
+    source['source_transport']['frozen_plan']['path'] = 'frozen.json'
+    source['canonical_plan_directory'] = str(original)
+    source['canonical_plan_root']['storage']['execution_binding_uuid'] = '00000000-0000-4000-8000-000000000014'
+    source['scientific_root']['storage']['execution_binding_uuid'] = '00000000-0000-4000-8000-000000000015'
+    # One exact state in two explicitly supplied domains remains two anchors.
+    import shutil
+    shutil.copytree(fixture['context']['science'], fixture['result'] / 'other-science')
+    other = deepcopy(source); other['artifact_root'] = 'other-science'; other['scientific_root']['relative_path'] = 'other-science'
+    other['scientific_directory'] = str(fixture['result'] / 'other-science')
+    values['sources'].append(other)
+    inputs = module.NativePerformanceInputs(**values)
+    capture = module.NativePerformanceCapture(fixture['job'], fixture['result'], writer=fixture['writer'],
+        transport=fixture['transport'], inputs=inputs, budget=fixture['capture'].budget)
+    anchor, _, _ = _T3_anchor(fixture)
+    anchor['scientific']['relation'] = 'borrowed'
+    anchor['phase_identity'] = dict(anchor['phase_identity'], attempt='9')
+    anchor['invocation'] = dict(source_epoch='current-technical-epoch')
+    for artifact_root in ('science', 'other-science'):
+        anchor['scientific']['artifact_root'] = artifact_root
+        raw = module.json_bytes(anchor)
+        path = 'performance-anchors/' + __import__('hashlib').sha256(raw).hexdigest() + '.json'
+        (fixture['result'] / path).write_bytes(raw)
+        capture.remember(anchor, module._capture_ref(path, raw, anchor['schema']), raw)
+    pin = capture.publish()
+    index = json.loads((fixture['writer'].root / pin['path']).read_bytes())
+    assert len(index['entries']) == 2
+    assert len({entry['anchor_key'] for entry in index['entries']}) == 2
+    assert all(entry['telemetry']['expected_transport']['selection']['attempt'] == 3 for entry in index['entries'])
+    assert all(entry['telemetry']['source_transport']['selection']['attempt'] == 2 for entry in index['entries'])
+    assert all(json.loads(entry['runner_anchor_utf8'])['phase_identity']['attempt'] == '9' for entry in index['entries'])
+    assert index['entries'][0]['telemetry']['commit_ref'] == index['entries'][1]['telemetry']['commit_ref']
+    fixture['writer'].close()
+
+
+def test_T3_scientific_mapping_is_read_independently_of_runner_anchor_root(tmp_path):
+    import shutil
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path, history_only=True)
+    anchor, raw, immutable = _T3_anchor(fixture)
+    original = tmp_path / 'independently-qualified-science'
+    shutil.copytree(fixture['context']['science'], original)
+    values = fixture['inputs'].document()
+    values['sources'][0]['scientific_directory'] = str(original)
+    inputs = module.NativePerformanceInputs(**values)
+    capture = module.NativePerformanceCapture(fixture['job'], fixture['result'], writer=fixture['writer'],
+        transport=fixture['transport'], inputs=inputs, budget=fixture['capture'].budget)
+    # The enclosing Runner copy is a decoy; the original scientific mapping is
+    # supplied independently and must be the one consumed by StateReader.
+    fixture['manifest'].write_bytes(b'{"decoy":true}')
+    capture.remember(anchor, module._capture_ref(str(immutable.relative_to(fixture['result'])), raw, anchor['schema']), raw)
+    pin = capture.publish()
+    assert len(json.loads((fixture['writer'].root / pin['path']).read_bytes())['entries']) == 1
+    fixture['writer'].close()
+
+
+def test_T3_pending_terminal_retains_technical_index_without_scientific_state(tmp_path, monkeypatch):
+    import shutil
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path)
+    fixture['writer'].close(); shutil.rmtree(fixture['job'] / 'performance')
+    _T3_anchor(fixture, pending=True)
+    monkeypatch.setattr(module, 'proc_sample', lambda *a, **k: dict(wall_seconds=2., monotonic_ns=2_000_000_000,
+        cpu_time_seconds=None, missing_reason='synthetic process sample unavailable'))
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    os.write(write_fd, b'exit 7\n'); os.close(write_fd)
+    assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+        native_execution_path=fixture['job'] / 'native-execution.json', solver_arguments=fixture['arguments'],
+        native_performance_inputs=fixture['inputs']) == 2
+    index = json.loads((fixture['job'] / 'performance-source.json').read_bytes())
+    assert index['closed'] is True and index['entries'] == []
+    root = fixture['job'] / 'performance'
+    commit = json.loads((root / index['technical']['commit_ref']['path']).read_bytes())
+    summary = json.loads((root / commit['summary']['path']).read_bytes())
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert summary['control_events'] == [dict(event='scientific_anchor_pending', count='1')]
+    assert not (root / 'bindings').exists()
+
+
+def test_T3_unacknowledged_writer_tail_cannot_publish_source_index(tmp_path, monkeypatch):
+    import qcl_negf_results.telemetry as telemetry
+    fixture = _T3_capture(tmp_path, history_only=True)
+    writer = fixture['writer']; writer.record_resource(dict(wall_seconds=1.))
+    original = telemetry.publish_pointer
+    def lost_ack(*args, **kwargs):
+        original(*args, **kwargs)
+        raise OSError('original technical ACK unavailable')
+    with monkeypatch.context() as patch:
+        patch.setattr(telemetry, 'publish_pointer', lost_ack)
+        with pytest.raises(OSError, match='ACK unavailable'):writer.flush()
+    with pytest.raises(ValueError, match='pending'):fixture['capture'].publish()
+    assert not (writer.root / 'current-source.json').exists()
+    assert not (fixture['job'] / 'performance-source.json').exists()
+    writer.flush(); writer.close()
+
+
+def test_T3_source_change_before_pointer_keeps_previous_exact_index(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path, history_only=True)
+    capture = fixture['capture']; writer = fixture['writer']
+    anchor, raw, immutable = _T3_anchor(fixture)
+    ref = module._capture_ref(str(immutable.relative_to(fixture['result'])), raw, anchor['schema'])
+    capture.remember(anchor, ref, raw); first = capture.publish()
+    pointer = (writer.root / 'current-source.json').read_bytes()
+    original = module._capture_read; changed = []
+    def late_change(root, reference, budget):
+        result = original(root, reference, budget)
+        if root == fixture['result'] and reference == ref and not changed:
+            changed.append(True); fixture['manifest'].write_bytes(b'{"changed":true}')
+        return result
+    with monkeypatch.context() as patch:
+        patch.setattr(module, '_capture_read', late_change)
+        with pytest.raises(__import__('qcl_negf_contracts.messages', fromlist=['ContractError']).ContractError):capture.publish()
+    assert changed
+    assert (writer.root / 'current-source.json').read_bytes() == pointer
+    assert json.loads(pointer)['index'] == first
+    assert capture.generation == 1
+    writer.close()
+
+
+@pytest.mark.parametrize('window', ['index', 'pointer', 'terminal'])
+@pytest.mark.parametrize('role', ['manifest', 'technical_root'])
+def test_F5_publication_suffix_change_is_not_acknowledged(tmp_path, monkeypatch, window, role):
+    import qcl_negf_results.capture as cap
+    fixture = _T3_capture(tmp_path, history_only=True)
+    owner, writer = fixture['capture'], fixture['writer']
+    anchor, raw, original = _T3_anchor(fixture)
+    owner.remember(anchor, cap._capture_ref(str(original.relative_to(fixture['result'])), raw, anchor['schema']), raw)
+    first = owner.publish()
+    previous = (writer.root / 'current-source.json').read_bytes()
+    options = dict(close_context=writer.close_context(), capture_status=dict(terminal_tail='unknown',
+        scalar_live_route='unavailable', scalar_live_reason='source_fixture',
+        performance_status='incomplete', reason='tail_unknown')) if window == 'terminal' else {}
+    before = fixture['manifest'].read_bytes()
+    saved = writer.root.with_name('performance-original-owned-root')
+    replacement = writer.root.with_name('performance-replacement-owned-root')
+    effects = []; changed = []
+    write = cap._capture_write
+    def changed_after_readback(root, path, raw, schema, budget, **kwargs):
+        result = write(root, path, raw, schema, budget, **kwargs)
+        if path.startswith('sources/'):effects.append('index')
+        elif path == 'current-source.json':effects.append('pointer')
+        elif path == 'performance-source.json':effects.append('terminal')
+        if effects and effects[-1] == window and not changed:
+            changed.append(True)
+            if role == 'manifest':fixture['manifest'].write_bytes(b'{"changed":true}')
+            else:writer.root.rename(saved);writer.root.mkdir()
+        return result
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(cap, '_capture_write', changed_after_readback)
+            with pytest.raises((OSError, ValueError)):
+                owner.publish(**options)
+        assert changed and owner.generation == 1
+        # Effects already visible are retained; no rollback or success is invented.
+        original_root = saved if saved.exists() else writer.root
+        pointer = (original_root / 'current-source.json').read_bytes()
+        if window == 'index':assert pointer == previous and effects == ['index']
+        else:
+            assert pointer != previous
+            assert (original_root / json.loads(pointer)['index']['path']).exists()
+        assert (original_root / first['path']).exists()
+        if window == 'terminal':assert (fixture['job'] / 'performance-source.json').exists()
+    finally:
+        fixture['manifest'].write_bytes(before)
+        if saved.exists():writer.root.rename(replacement);saved.rename(writer.root)
+        writer.close()
+
+
+@pytest.mark.parametrize('role', ['anchor', 'plan', 'commit', 'scientific_root', 'plan_root'])
+def test_F5_original_source_roles_are_held_through_pointer_readback(tmp_path, monkeypatch, role):
+    import shutil
+    import qcl_negf_results.capture as cap
+    fixture = _T3_capture(tmp_path, history_only=True)
+    owner, writer = fixture['capture'], fixture['writer']
+    anchor, raw, original = _T3_anchor(fixture)
+    owner.remember(anchor, cap._capture_ref(str(original.relative_to(fixture['result'])), raw, anchor['schema']), raw)
+    context = writer.published_context()
+    target = dict(anchor=original, plan=fixture['job'] / fixture['transport']['frozen_plan']['path'],
+        commit=writer.root / context[0]['path'], scientific_root=fixture['context']['science'],
+        plan_root=fixture['job'])[role]
+    directory = role.endswith('_root')
+    saved = target.with_name(target.name + '-original-owned')
+    replacement = target.with_name(target.name + '-replacement-owned')
+    before = None if directory else target.read_bytes()
+    changed = []
+    write = cap._capture_write
+    def changed_after_pointer(root, path, raw, schema, budget, **kwargs):
+        result = write(root, path, raw, schema, budget, **kwargs)
+        if path == 'current-source.json' and not changed:
+            changed.append(True)
+            if directory:target.rename(saved);shutil.copytree(saved, target)
+            else:target.write_bytes(b'{"changed":true}')
+        return result
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(cap, '_capture_write', changed_after_pointer)
+            with pytest.raises((OSError, ValueError)):owner.publish()
+        assert changed and owner.generation == 0
+        assert (writer.root / 'current-source.json').exists()
+    finally:
+        if directory and saved.exists():target.rename(replacement);saved.rename(target)
+        elif before is not None:target.write_bytes(before)
+        writer.close()
+
+
+@pytest.mark.parametrize('cancel', [False, True])
+def test_F5_publication_primary_error_retains_secondary_guard_diagnostic(tmp_path, monkeypatch, cancel):
+    import qcl_negf_results.capture as cap
+    fixture = _T3_capture(tmp_path, history_only=True)
+    owner, writer = fixture['capture'], fixture['writer']
+    anchor, raw, original = _T3_anchor(fixture)
+    owner.remember(anchor, cap._capture_ref(str(original.relative_to(fixture['result'])), raw, anchor['schema']), raw)
+    before = fixture['manifest'].read_bytes()
+    primary = KeyboardInterrupt('publication cancelled') if cancel else OSError('publication primary failure')
+    write = cap._capture_write
+    def fail_after_pointer(root, path, raw, schema, budget, **kwargs):
+        result = write(root, path, raw, schema, budget, **kwargs)
+        if path == 'current-source.json':
+            fixture['manifest'].write_bytes(b'{"changed":true}')
+            raise primary
+        return result
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(cap, '_capture_write', fail_after_pointer)
+            with pytest.raises(type(primary)) as caught:owner.publish()
+        assert caught.value is primary and owner.generation == 0
+        assert any('publication source cleanup' in note for note in primary.__notes__)
+        assert (writer.root / 'current-source.json').exists()
+    finally:fixture['manifest'].write_bytes(before);writer.close()
+
+
+def test_T3_phase_failure_retains_last_ack_with_explicit_incomplete_close(tmp_path, monkeypatch):
+    import shutil
+    import qcl_negf_results.capture as module
+    fixture = _T3_capture(tmp_path)
+    fixture['writer'].close(); shutil.rmtree(fixture['job'] / 'performance')
+    _T3_anchor(fixture)
+    before = fixture['manifest'].read_bytes()
+    read_fd, write_fd = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    monkeypatch.setattr(module, 'proc_sample', lambda *a, **k: dict(wall_seconds=2., monotonic_ns=2_000_000_000,
+        cpu_time_seconds=None, missing_reason='synthetic process sample unavailable'))
+    def fail_tail(_):
+        (fixture['result'] / 'phase-current.json').write_bytes(b'{')
+        os.write(write_fd, b'exit 7\n')
+    monkeypatch.setattr(module.time, 'sleep', fail_tail)
+    try:
+        assert module.observe(fixture['job'] / 'capture-spec.json', 42, 7, read_fd,
+            native_execution_path=fixture['job'] / 'native-execution.json', solver_arguments=fixture['arguments'],
+            native_performance_inputs=fixture['inputs']) == 2
+    finally:
+        os.close(write_fd)
+    index = json.loads((fixture['job'] / 'performance-source.json').read_bytes())
+    row = index['entries'][0]; technical = fixture['job'] / 'performance'
+    binding = json.loads((technical / row['telemetry']['binding_ref']['path']).read_bytes())
+    assert index['closed'] is True
+    assert binding['capture_status']['performance_status'] == 'incomplete'
+    assert binding['capture_status']['terminal_tail'] == 'known_incomplete'
+    commit = json.loads((technical / index['technical']['commit_ref']['path']).read_bytes())
+    summary = json.loads((technical / commit['summary']['path']).read_bytes())
+    assert summary['totals']['accepted_source_rows'] == '2'
+    assert any(event['event'] == 'capture_failed' for event in summary['control_events'])
+    assert fixture['manifest'].read_bytes() == before
+
+
+def test_F2_post_replace_readback_error_leaves_uncertain_valid_pointer(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as module
+    from qcl_negf_contracts.telemetry import validate_performance_source_index
+    fixture = _T3_capture(tmp_path, history_only=True)
+    anchor, raw, immutable = _T3_anchor(fixture)
+    capture = fixture['capture']; writer = fixture['writer']
+    capture.remember(anchor, module._capture_ref(str(immutable.relative_to(fixture['result'])), raw, anchor['schema']), raw)
+    first = capture.publish(); old = (writer.root / first['path']).read_bytes()
+    pointer_before = (writer.root / 'current-source.json').read_bytes()
+    writer.record_resource(dict(wall_seconds=1.)); writer.flush()
+    read = module._capture_read
+    primary = OSError('F2 readback unavailable after durable pointer replacement')
+    def unavailable(root, ref, budget):
+        answer = read(root, ref, budget)
+        if ref['schema'] == 'qcl-negf.performance-source-pointer.v1':raise primary
+        return answer
+    with monkeypatch.context() as patch:
+        patch.setattr(module, '_capture_read', unavailable)
+        with pytest.raises(OSError) as failure:capture.publish()
+        assert failure.value is primary
+    pointer_after = (writer.root / 'current-source.json').read_bytes()
+    assert pointer_after != pointer_before
+    selected = json.loads(pointer_after)['index']
+    original = (writer.root / selected['path']).read_bytes()
+    assert len(original) == int(selected['bytes'])
+    assert __import__('hashlib').sha256(original).hexdigest() == selected['sha256']
+    assert validate_performance_source_index(json.loads(original))['generation'] == '2'
+    assert capture.generation == 1  # Failed acknowledgement is not success.
+    assert (writer.root / first['path']).read_bytes() == old
+    writer.close()
+
+
+@pytest.mark.parametrize('stage',['inputs_decode','index_encode'])
+def test_F3_materialization_failure_keeps_primary_old_pin_and_actual_spent(tmp_path,monkeypatch,stage):
+    import qcl_negf_results.capture as cap
+    from test_capture_credit import _F1_remembered,_F1_actual_delivery
+    f=_F1_remembered(tmp_path);owner=f['capture'];writer=f['writer']
+    first=owner.publish();pointer=(writer.root/'current-source.json').read_bytes()
+    original=(writer.root/first['path']).read_bytes();inputs=owner.inputs._raw
+    primary=MemoryError('F3 synthetic materialization failure after admission')
+    if stage=='inputs_decode':
+        document=cap.NativePerformanceInputs.document
+        def decode(value):
+            if value is owner.inputs:raise primary
+            return document(value)
+        monkeypatch.setattr(cap.NativePerformanceInputs,'document',decode)
+    else:
+        serializer=cap.json_bytes
+        def encode(value):
+            if isinstance(value,dict) and value.get('schema')=='qcl-negf.performance-source-index.v1':raise primary
+            return serializer(value)
+        monkeypatch.setattr(cap,'json_bytes',encode)
+    trace,error=_F1_actual_delivery(f,monkeypatch)
+    assert error is primary and owner.generation==1
+    assert trace['reserved']==0 and not trace['before_effect_overshoot']
+    assert trace['ledger_delta']==trace['reads']+trace['writes']
+    assert (writer.root/'current-source.json').read_bytes()==pointer
+    assert (writer.root/first['path']).read_bytes()==original and owner.inputs._raw==inputs
+    assert len(list((writer.root/'sources').glob('*.json')))==1
+    writer.close()
