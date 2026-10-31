@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import os
 import stat
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -75,41 +76,92 @@ def stamp(stream, *, include_change=False):
 def regular(path, *, size=None):
     """Open every absolute ancestor relative to an owned nofollow directory FD."""
     path = Path(os.path.abspath(path))
-    directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    descriptor = None
+    owned = []
+    local_failure = False
     try:
-        for part in path.parts[1:-1]:
-            child = os.open(
-                part,
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        try:
+            directory = os.open("/", os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+            owned.append(directory)
+            for part in path.parts[1:-1]:
+                child = os.open(
+                    part,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory,
+                )
+                owned.append(child)
+                owned.remove(directory)
+                os.close(directory)
+                directory = child
+            descriptor = os.open(
+                path.name,
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
                 dir_fd=directory,
             )
-            os.close(directory)
-            directory = child
-        descriptor = os.open(
-            path.name,
-            os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
-            dir_fd=directory,
-        )
-        value = os.fstat(descriptor)
-        if not stat.S_ISREG(value.st_mode) or (
-            size is not None and value.st_size != size
-        ):
-            fail(
-                "corrupt_result",
-                "closed source is not a regular file of its declared size",
-            )
-        with os.fdopen(descriptor, "rb", buffering=0) as stream:
-            descriptor = None
+            owned.append(descriptor)
+            value = os.fstat(descriptor)
+            if not stat.S_ISREG(value.st_mode) or (
+                size is not None and value.st_size != size
+            ):
+                fail(
+                    "corrupt_result",
+                    "closed source is not a regular file of its declared size",
+                )
+            manager = os.fdopen(descriptor, "rb", buffering=0)
+            owned.remove(descriptor)  # fdopen owns it after successful transfer.
+        except OSError as error:
+            raise ContractError(
+                "selected closed source cannot be opened safely", "corrupt_result"
+            ) from error
+
+        try:
+            stream = manager.__enter__()
+        except BaseException as error:
+            try:
+                manager.close()
+            except BaseException:
+                pass
+            if isinstance(error, OSError):
+                raise ContractError(
+                    "selected closed source cannot be opened safely", "corrupt_result"
+                ) from error
+            raise
+
+        try:
             yield stream
-    except OSError as error:
-        raise ContractError(
-            "selected closed source cannot be opened safely", "corrupt_result"
-        ) from error
+        except BaseException as error:
+            try:
+                manager.__exit__(*sys.exc_info())
+            except BaseException:
+                pass
+            if isinstance(error, OSError):
+                raise ContractError(
+                    "selected closed source cannot be opened safely", "corrupt_result"
+                ) from error
+            raise
+        else:
+            try:
+                manager.__exit__(None, None, None)
+            except OSError as error:
+                raise ContractError(
+                    "selected closed source cannot be opened safely", "corrupt_result"
+                ) from error
+    except BaseException:
+        local_failure = True
+        raise
     finally:
-        if descriptor is not None:
-            os.close(descriptor)
-        os.close(directory)
+        cleanup_error = None
+        for fd in reversed(owned):
+            try:
+                os.close(fd)
+            except BaseException as error:
+                if cleanup_error is None:
+                    cleanup_error = error
+        if not local_failure and cleanup_error is not None:
+            if isinstance(cleanup_error, OSError):
+                raise ContractError(
+                    "selected closed source cannot be opened safely", "corrupt_result"
+                ) from cleanup_error
+            raise cleanup_error
 
 
 def small_json(path, maximum, *, budget=None):
