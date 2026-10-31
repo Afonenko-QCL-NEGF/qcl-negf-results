@@ -183,3 +183,129 @@ def test_retired_recovery_directory_api_is_not_a_format_fallback(tmp_path):
     with pytest.raises(ContractError) as error:
         verify_recovery_bundle(tmp_path)
     assert error.value.code == 'unsupported_format'
+
+
+def _profile_context(root):
+    """Explicit synthetic original input refs for the public whole-call reader."""
+    import json
+    from consumer_context_fixture import fixture
+    selected, _, _, _, _ = fixture(root, plan_kind='scientific_plan_v2')
+    manifest = json.loads((root / selected['manifest']['path']).read_bytes())
+    refs = {item['role']: {key: item[key] for key in
+            ('path', 'bytes', 'sha256', 'schema', 'media_type')}
+            for item in manifest['artifacts'] if item['role'] in ('plan', 'model')}
+    return dict(artifact_root=str(root), state_ref=selected,
+                expected_identity=selected['identity'], plan_ref=refs['plan'],
+                model_ref=refs['model'], diagnostics_ref=None, observations_ref=None,
+                limits=ResultReadLimits(), maximum_context_bytes=128*1024*1024), manifest
+
+
+def test_selected_contracts_profile_reads_original_context_with_full_shared_cache(tmp_path):
+    """A qualified schema update must admit the real owner call, cold and warm."""
+    from qcl_negf_contracts import results as contracts
+    from qcl_negf_results.final_observations import describe_native_metadata_context
+    args, manifest = _profile_context(tmp_path)
+    # Public Results/telemetry callsite domain, independently enumerated here.
+    kinds = ('checkpoint-declaration', 'core-state', 'final-diagnostics',
+             'final-observations', 'nested-sweep-plan', 'producer-phase-segment',
+             'producer-phase-source', 'result-common', 'result-cursor',
+             'result-manifest', 'result-pointer', 'scientific-catalog',
+             'scientific-plan', 'scientific-record', 'telemetry-envelope')
+    for kind in kinds:
+        contracts._validator(kind + '.schema.json')
+    before = contracts._validator.cache_info()
+    first = describe_native_metadata_context(**args)
+    second = describe_native_metadata_context(**args)
+    assert first[0] == second[0] == manifest
+    assert first[2].plan_raw == second[2].plan_raw == (tmp_path / 'plan.json').read_bytes()
+    assert first[2].model_raw == second[2].model_raw == (tmp_path / 'model.json').read_bytes()
+    assert first[2].source == second[2].source == args['state_ref']
+    assert first[3:] == second[3:] == (None, None)
+    assert before.currsize == contracts._validator.cache_info().currsize == 15
+    assert first[2].io_counters['metadata_high_water_bytes'] <= 128*1024*1024
+
+
+@pytest.mark.parametrize('resource', ['model-help.schema.json', 'telemetry-envelope.schema.json'])
+def test_changed_cached_resource_rejects_before_factory_or_artifact_access(tmp_path, monkeypatch, resource):
+    """Qualifying new help content must not trust mutable bundled cache content."""
+    import sys
+    from qcl_negf_contracts import results as contracts, schema_validator
+    from qcl_negf_results.final_observations import describe_native_metadata_context
+    args, _ = _profile_context(tmp_path)
+    validator = contracts._validator('result-manifest.schema.json')
+    document = validator._registry['https://qcl-negf.invalid/schema/' + resource].contents
+    original = copy.deepcopy(document)
+    if resource == 'model-help.schema.json':
+        document['$defs']['FragmentInput']['properties']['reference_value_origin'] = {
+            '$ref': '#/$defs/ReferenceValueOrigin'}  # Superseded non-null branch.
+    else:
+        document['title'] = 'unqualified telemetry resource'
+    def forbidden_root(reader):
+        pytest.fail('artifact root accessed before profile rejection')
+    def observe(frame, event, arg):
+        if event == 'call' and frame.f_code is schema_validator.__code__:
+            pytest.fail('schema factory called before profile rejection')
+    monkeypatch.setattr(StateReader, '_root_identity', forbidden_root)
+    previous = sys.getprofile()
+    try:
+        sys.setprofile(observe)
+        with pytest.raises(ContractError, match='validation profile') as caught:
+            describe_native_metadata_context(**args)
+        assert caught.value.code == 'incompatible_contract'
+    finally:
+        sys.setprofile(previous)
+        document.clear()
+        document.update(original)
+
+
+@pytest.mark.parametrize('relative', ['model_help.py', 'schemas/model-help.schema.json'])
+def test_changed_contracts_package_source_rejects_before_factory_or_artifact_access(tmp_path, relative):
+    """A disk-only source change must reject even with pristine loaded validators."""
+    import json
+    from pathlib import Path
+    import shutil
+    import subprocess
+    import sys
+    import qcl_negf_contracts
+    import qcl_negf_results
+    args, _ = _profile_context(tmp_path / 'artifacts')
+    package = tmp_path / 'source' / 'qcl_negf_contracts'
+    shutil.copytree(Path(qcl_negf_contracts.__file__).parent, package,
+                    ignore=shutil.ignore_patterns('__pycache__'))
+    path = package / relative
+    raw = path.read_bytes()
+    before, after = (b'Public', b'public') if path.suffix == '.py' else (b'Model help', b'model help')
+    changed = raw.replace(before, after, 1)
+    assert changed != raw and len(changed) == len(raw)
+    path.write_bytes(changed)
+    env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(package.parent),
+        str(Path(qcl_negf_results.__file__).parent.parent))))
+    script = '''
+import json,sys
+from qcl_negf_contracts import schema_validator
+from qcl_negf_contracts.messages import ContractError
+from qcl_negf_results.state import StateReader, ResultReadLimits
+from qcl_negf_results.final_observations import describe_native_metadata_context
+def root(reader):
+    raise AssertionError('artifact access before profile rejection')
+def observe(frame,event,arg):
+    if event=='call' and frame.f_code is schema_validator.__code__:
+        raise AssertionError('factory called before profile rejection')
+StateReader._root_identity=root
+sys.setprofile(observe)
+try:
+    args=json.loads(sys.argv[1])
+    args['limits']=ResultReadLimits(**args['limits'])
+    describe_native_metadata_context(**args)
+except ContractError as error:
+    assert error.code=='incompatible_contract' and 'validation profile' in str(error)
+    print('REJECTED_BEFORE_EFFECT')
+else:
+    raise AssertionError('changed package admitted')
+finally:
+    sys.setprofile(None)
+'''
+    result = subprocess.run([sys.executable, '-c', script, json.dumps(args, default=lambda value: value.__dict__)], env=env,
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.strip() == 'REJECTED_BEFORE_EFFECT'

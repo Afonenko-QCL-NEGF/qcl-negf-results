@@ -120,3 +120,29 @@ For completed restore, the immediate `lineage.parent_state`, parent checkpoint, 
 and frozen history pin are verified under the shared allowance. The reader does not search another
 attempt or a newer checkpoint. A valid raw read is not exact-restore numerical equivalence,
 independent equilibrium acceptance or a complete scientific archive export.
+
+## Offline validation profile
+
+The bounded original metadata-context operation qualifies the exact Contracts
+`5eb0e61a9fc12fa2215291e47b7cd28888ce64cc` Python corpus and every bundled schema,
+including schemas retained in the shared Results/telemetry validator caches.
+This coordinated revision permits an explicit null help reference origin and
+checks retained capture context and nested frozen passports. Its JSON pointer
+reader admits authored array roots; public message decoding still requires an
+object. Result schemas, Core layout, validator factory and the 15-kind shared
+cache domain are unchanged. No unknown origin becomes a scientific assertion.
+
+Qualification checks source bytes, loaded code, cache structure and cached
+schema contents before calling a schema factory or opening an artifact root,
+and again before returning metadata. Changed source or mutable cache contents
+reject with `incompatible_contract`; package versions alone cannot establish
+compatibility. The qualified CPython 3.14.7 environment retains the 112 MiB
+logical validation reserve and 6 MiB profile-source I/O allowance. The complete
+15 cached plus 3 direct schema bundles account for 103680570 logical metadata
+units within the 117440512-unit reserve. This accounting does not bound process
+RSS, allocator overhead or native-library scratch.
+
+The prepared Python runtime uses SQLite 3.53.4. The older Nix SQLite 3.51.2
+runtime remains a separate open compatibility gate; this schema qualification
+establishes neither that runtime nor ORM, transport, installed-service or
+scientific acceptance.

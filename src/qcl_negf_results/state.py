@@ -88,10 +88,12 @@ _context_call_lock = Lock()
 _CONTEXT_HEADER = 65536
 
 
+# Contracts 5eb0e61: coordinated nullable help-origin branch and retained-context
+# checks. Result schemas, factory/results code and cache domain are unchanged.
 _VALIDATION_PACKAGES = {
     'qcl_negf_contracts': (48,
-    885024,
-    '06177da7369959b136666bf827e2a16120c2bc78cfe06bcbab80479c0a02d702'),
+    890995,
+    '01757730990f76fe8b50c35d55d2497e87c2e43e2b848c0e1c1a0a70f6c5c903'),
     'jsonschema': (38,
     463467,
     '96a04a34eea376cc3afe479fd5115e5648679d15a22028bacfec62eaf8f08766'),
@@ -138,7 +140,7 @@ _VALIDATION_SCHEMAS = {
     'https://qcl-negf.invalid/schema/final-diagnostics.schema.json': 'de147df663138580b7af1a75f9b689abfe9f527056dd65f727f166a55f3f082f',
     'https://qcl-negf.invalid/schema/final-fixed-point-audit.schema.json': 'b4020be18f7cf2aa0d9436e0f4705867442a41e354a76c4fd526be0513ec5f00',
     'https://qcl-negf.invalid/schema/final-observations.schema.json': 'ee7dce5448500b1e3d4591875383ea76d1207013da7b4dd62c21062e5303fb03',
-    'https://qcl-negf.invalid/schema/model-help.schema.json': 'abf98022602de243e0d7d5bb42ea3e8a80b7a12b4fddf9cc3ebdd3fc8592e8ac',
+    'https://qcl-negf.invalid/schema/model-help.schema.json': '7b67ece936684c0ceac2f966dd5c04883bbe140938bb34aee86a145d2b8eb426',
     'https://qcl-negf.invalid/schema/nested-sweep-plan.schema.json': '1fdfd5da1d9c3e2b1c99943ed40111046e12a065ac427a1d03ed7bac268c432b',
     'https://qcl-negf.invalid/schema/output-policy.schema.json': 'b5bf6d025994d351f3b99f2d036dc9a24438880bb0fc3ddab20b0d618aeee110',
     'https://qcl-negf.invalid/schema/outward-result.schema.json': '2bc4faef56a2d1812880cb4e58ad0d389e6bc6c3aa05fa0348a27246658c080c',

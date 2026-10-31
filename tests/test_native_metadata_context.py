@@ -359,7 +359,7 @@ def test_actual_full_shared_cache_and_retained_first_output(tmp_path,monkeypatch
     finally:sys.setprofile(old)
     assert first[0]==second[0]==manifest and first[4] is not None and second[4] is not None
     assert state._context_weight(first)==retained<=4*M
-    assert max(maxima)==94_695_342 and max(maxima)+2_676_240+6*M<112*M  # includes real shared standard metaschemas
+    assert max(maxima)==94_712_874 and max(maxima)+2_676_240+6*M<112*M  # includes real shared standard metaschemas
     assert calls and arenas[0].validation_reservation==112*M
     assert 112*M<=second[2].io_counters['metadata_high_water_bytes']<=128*M
     assert arenas[0].profile_bytes_read>5*M and arenas[1].profile_bytes_read==arenas[0].profile_bytes_read
