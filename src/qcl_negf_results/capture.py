@@ -6,11 +6,12 @@ import hashlib
 import os
 import re
 import signal
+import stat
 import subprocess
 import sys
 import time
 from copy import deepcopy
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -643,7 +644,7 @@ class ScalarPublisher:
 def _spec(path, *, budget=None):
     """Private operational port, written by AiiDA before launch, never HTTP input."""
     budget = budget if budget is not None else ObserverIO(16384)
-    value, _ = small_json(path, 16384, budget=budget)
+    value, _ = _capture_small_json(path,budget,(),maximum=16384)
     keys = {
         "schema",
         "selection",
@@ -656,10 +657,12 @@ def _spec(path, *, budget=None):
     }
     from .performance_views import _selection
 
+    native3 = isinstance(value,dict) and value.get('schema') == 'qcl-negf.capture-spec.v3'
+    if native3:keys.add('native_performance')
     if (
         not isinstance(value, dict)
         or set(value) != keys
-        or value["schema"] != "qcl-negf.capture-spec.v1"
+        or value["schema"] not in ("qcl-negf.capture-spec.v1", "qcl-negf.capture-spec.v3")
     ):
         raise ValueError("unsupported capture spec")
     # A valid grant prepays the one-time bounded spec read before revealing itself.
@@ -671,6 +674,16 @@ def _spec(path, *, budget=None):
         raise ValueError("existing admitted observer partitions/startup credit required")
     budget.maximum = credits["io_bytes"]
     _selection(value["selection"])
+    if native3:
+        performance=value['native_performance']; selection=value['selection']
+        if (type(performance) is not dict or set(performance)!={'run_uuid'}
+                or not _native_uuid(performance['run_uuid']) or not _native_uuid(selection['calcjob_uuid'])
+                or not integer(selection['attempt'],1,9007199254740991)
+                or value['allocated_logical_cpus'] is not None or value['scratch_root'] is not None
+                or value['allocation_id']!=f"calcjob-process:{selection['calcjob_uuid']}:{selection['attempt']}"
+                or credits['performance_bytes']!=32*MIB or credits['scalar_bytes']!=64*MIB
+                or credits['io_bytes']>128*MIB):
+            raise ValueError('closed native3 ingress differs from original launch')
     for identifier in (value["selection"]["execution_id"],):
         if "/" in identifier or "\\" in identifier or identifier in (".", ".."):
             raise ValueError("execution identity is not one path component")
@@ -694,7 +707,8 @@ def _spec(path, *, budget=None):
     ):
         raise ValueError("bounded frozen plan pin required")
     root = Path(path).absolute().parent
-    parsed, raw = small_json(beneath(root, plan["path"]), MIB, budget=budget)
+    parsed, raw = (_capture_small_json(beneath(root,plan['path']),budget,(value,)) if native3
+        else small_json(beneath(root, plan["path"]), MIB, budget=budget))
     if len(raw) != plan["bytes"] or digest(raw) != plan["sha256"]:
         raise ValueError("frozen plan bytes differ")
     rows = parsed.get("points")
@@ -731,6 +745,11 @@ def _spec(path, *, budget=None):
     return root, value, known
 
 
+def _native_uuid(value):
+    return (type(value) is str and re.fullmatch(r'[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}',value) is not None
+        and value!='00000000-0000-0000-0000-000000000000')
+
+
 def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budget):
     """Fixed worker input assertions, never an original creator/access proof.
 
@@ -758,17 +777,24 @@ def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budg
     path = Path(os.path.abspath(native_execution_path))
     if path != root / 'native-execution.json':
         raise ValueError('native execution must be the explicit original workdir input')
-    native, native_raw = small_json(path, 16384, budget=budget)
+    native3=spec['schema']=='qcl-negf.capture-spec.v3'
+    if native3 and len(arguments)!=11:raise ValueError('native3 requires paired original native CLI operands')
+    native, native_raw = (_capture_small_json(path,budget,(spec,arguments),maximum=16384) if native3
+        else small_json(path,16384,budget=budget))
     if (set(native) != {'schema', 'request_id', 'execution_id', 'storage', 'source_graph',
                        'code', 'input_plan', 'access_receipt_ref'}
             or native['schema'] != 'qcl-negf.aiida-native-execution.v1'
             or native['execution_id'] != spec['selection']['execution_id']):
         raise ValueError('original native execution input differs')
-    plan, plan_raw = small_json(root / 'plan.json', MIB, budget=budget)
-    graph, graph_raw = small_json(root / 'source-graph.json', MIB, budget=budget)
-    if (_metadata_weight((native, native_raw, plan, plan_raw, graph, graph_raw, arguments, spec)) > MIB):
+    plan, plan_raw = (_capture_small_json(root/'plan.json',budget,(native,native_raw,arguments,spec)) if native3
+        else small_json(root / 'plan.json', MIB, budget=budget))
+    graph, graph_raw = (_capture_small_json(root/'source-graph.json',budget,
+        (native,native_raw,plan,plan_raw,arguments,spec),maximum=65536) if native3
+        else small_json(root/'source-graph.json',MIB,budget=budget))
+    if native3:_capture_credit(native,native_raw,plan,plan_raw,graph,graph_raw,arguments,spec)
+    elif _metadata_weight((native, native_raw, plan, plan_raw, graph, graph_raw, arguments, spec)) > MIB:
         raise ValueError('combined native input metadata allowance exhausted')
-    _bounded_objects((native, plan, graph), 4096)
+    _bounded_objects((native, plan, graph), 16384 if native3 else 4096)
     scientific_plan(plan)
     schema_validator('scientific-plan.schema.json').validate(plan)
     graph_validator = schema_validator('model-help.schema.json')
@@ -779,7 +805,7 @@ def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budg
         raise ValueError('original native plan/source graph differs')
     uuid = re.compile(r'[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}')
     def require_uuid(value):
-        if type(value) is not str or uuid.fullmatch(value) is None:
+        if type(value) is not str or uuid.fullmatch(value) is None or native3 and not _native_uuid(value):
             raise ValueError('canonical original native UUID required')
     def opaque(value):
         if (type(value) is not str or not 1 <= len(value) <= 256 or value.startswith('/')
@@ -810,42 +836,69 @@ def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budg
             or re.fullmatch(r'/nix/store/[A-Za-z0-9][A-Za-z0-9+._?-]*/bin/qcl-negf', code['solver_executable']) is None):
         raise ValueError('original native code/storage declaration differs')
     relative_path(storage['relative_execution_root'])
+    if native3 and arguments[2] != os.path.abspath(arguments[2]):
+        raise ValueError('native3 original output argv must be literal canonical path')
     output = Path(arguments[2]); suffix = Path(storage['relative_execution_root']).parts
     if (not output.is_absolute() or str(output) != os.path.abspath(output)
             or output.parts[-len(suffix):] != suffix or output.is_relative_to(root) or root.is_relative_to(output)):
         raise ValueError('original native output argv/storage suffix differs')
     # The absolute trusted jobs_root and actual InstalledCode/wrapper origins
     # remain controller/Platform gates; suffix/JSON/token are not authority.
+    if native3:
+        _capture_credit(native,native_raw,plan,plan_raw,graph,graph_raw,arguments,spec,
+            extra_bytes=2*_metadata_weight(spec['selection'])+4096,
+            extra_objects=2*_capture_objects((spec['selection'],))+32)
     transport = dict(selection=deepcopy(spec['selection']), frozen_plan=dict(
         path='plan.json', bytes=str(len(plan_raw)), sha256=digest(plan_raw),
         schema=plan['schema'], media_type='application/json'))
-    return output, transport
+    if not native3:return output, transport
+    if not _native_uuid(storage['execution_binding_uuid']):raise ValueError('original native UUID required')
+    root_claim=lambda area,relative:dict(storage=storage,area=area,relative_path=relative)
+    retained=(native,native_raw,plan,plan_raw,graph,graph_raw,arguments,spec,transport)
+    _capture_credit(*retained,extra_bytes=4096,extra_objects=32)
+    inputs=NativePerformanceInputs(provider_selection=dict(run_uuid=spec['native_performance']['run_uuid'],
+        **{k:spec['selection'][k] for k in ('execution_id','attempt','calcjob_uuid')}),
+        native_execution_uuid=storage['execution_binding_uuid'],runner_anchor_root=root_claim('native_execution','.'),
+        technical_root=root_claim('native_execution','performance'),sources=[dict(selected_state=None,artifact_root='.',
+            scientific_root=root_claim('native_execution','.'),scientific_directory=str(output),
+            canonical_plan_root=root_claim('native_workdir','.'),canonical_plan_directory=str(root),source_transport=transport)],
+        _retained=retained)
+    return output,transport,inputs
 
 
 def _locator(root, spec, *, budget=None, native_output=None):
-    value, _ = small_json(root / "capture-source.json", 16384, budget=budget)
+    native3=spec['schema']=='qcl-negf.capture-spec.v3'
+    if native3 and budget is None:budget=ObserverIO(16384)
+    value, _ = (_capture_small_json(root/'capture-source.json',budget,(spec,),maximum=16384) if native3
+        else small_json(root/'capture-source.json',16384,budget=budget))
+    keys={'schema','capture_token','execution_id','plan_fingerprint','mode','actual_root','epoch'}
+    if native3:keys.add('root_birth')
     if (
         not isinstance(value, dict)
-        or set(value)
-        != {
-            "schema",
-            "capture_token",
-            "execution_id",
-            "plan_fingerprint",
-            "mode",
-            "actual_root",
-            "epoch",
-        }
-        or value["schema"] != "qcl-negf.capture-source.v1"
+        or set(value) != keys
+        or value["schema"] != ('qcl-negf.capture-source.v3' if native3 else 'qcl-negf.capture-source.v1')
         or value["capture_token"] != spec["capture_token"]
         or value["execution_id"] != spec["selection"]["execution_id"]
         or value["plan_fingerprint"] != spec["selection"]["plan_fingerprint"]
         or not integer(value["epoch"])
         or value["mode"] not in ("direct", "scratch", "staged")
         or not isinstance(value["actual_root"], str)
-        or not Path(value["actual_root"]).is_absolute()
+        or (not native3 and not Path(value["actual_root"]).is_absolute())
     ):
         raise ValueError("actual-root locator differs from launch")
+    if native3:
+        if native_output is None or value['actual_root'] != str(native_output):
+            raise ValueError('native3 actual root differs from literal original output')
+        birth=value['root_birth']
+        fields={'boot_id','mount_namespace_device','mount_namespace_inode','producer_pid','producer_start_ticks','device','inode'}
+        if (value['mode']!='direct' or value['epoch']!=0 or native_output is None
+                or type(birth) is not dict or set(birth)!=fields or not _native_uuid(birth['boot_id'])):
+            raise ValueError('closed native3 birth locator required')
+        for name in fields-{'boot_id'}:
+            text=birth[name]
+            if (type(text) is not str or re.fullmatch(r'0|[1-9][0-9]{0,19}',text) is None
+                    or int(text)>2**64-1 or name in ('producer_pid','producer_start_ticks','inode','mount_namespace_inode') and int(text)==0):
+                raise ValueError('canonical UInt64 native3 birth field required')
     actual = Path(value["actual_root"])
     if str(actual) != os.path.abspath(actual):
         raise ValueError("actual source root is not canonical")
@@ -861,6 +914,142 @@ def _locator(root, spec, *, budget=None, native_output=None):
     ):
         raise ValueError("scratch locator outside trusted worker parent")
     return value, actual
+
+
+class _NativeResultGuard:
+    """Finite native3 named/held directory identity; not a physical writer lease."""
+    def __init__(self, workdir, output, birth, pid, start_ticks, budget):
+        self.entries=[];self.closed=False;self.budget=budget;self.birth=birth
+        self.credentials=(os.geteuid(),os.getegid());self.cleanup_reserved=0
+        try:
+            if (self.credentials[0]==0 or birth['producer_pid']!=str(pid)
+                    or birth['producer_start_ticks']!=str(start_ticks)):
+                raise ValueError('native3 original worker/producer generation differs')
+            self._scope()
+            self._chain(workdir);self.root_fd=self._chain(output)
+            root=os.fstat(self.root_fd)
+            if (str(root.st_dev)!=birth['device'] or str(root.st_ino)!=birth['inode']
+                    or (root.st_uid,root.st_gid)!=self.credentials or stat.S_IMODE(root.st_mode)!=0o700):
+                raise ValueError('native3 original born root differs')
+            self.validate()
+        except BaseException:
+            self.close(validate=False)
+            raise
+
+    def _proc(self, path, maximum):
+        _capture_credit(self.entries,self.birth,extra_bytes=maximum+8192,extra_objects=32)
+        self.budget.require(maximum+1)
+        stream=open(path,'rb',buffering=0)
+        try:
+            raw=stream.read(maximum+1);self.budget.account(len(raw))
+        finally:
+            primary=sys.exception()
+            try:stream.close()
+            except BaseException as cleanup:
+                if primary is None:raise
+                primary.add_note('native3 process metadata close: '+str(cleanup))
+        if len(raw)>maximum:raise ValueError('native3 process metadata exceeds bound')
+        return raw
+
+    def _scope(self):
+        boot=self._proc('/proc/sys/kernel/random/boot_id',128).decode('ascii').strip()
+        ns=os.stat('/proc/self/ns/mnt')
+        if (boot!=self.birth['boot_id'] or str(ns.st_dev)!=self.birth['mount_namespace_device']
+                or str(ns.st_ino)!=self.birth['mount_namespace_inode']
+                or (os.geteuid(),os.getegid())!=self.credentials):
+            raise ValueError('native3 worker boot/namespace/credentials changed')
+
+    def _mount(self, fd):
+        raw=self._proc(f'/proc/self/fdinfo/{fd}',4096)
+        rows=re.findall(rb'^mnt_id:\s*([0-9]+)$',raw,re.M)
+        if len(rows)!=1:raise ValueError('native3 held mount identity unavailable')
+        return int(rows[0])
+
+    @staticmethod
+    def _stamp(value):
+        return value.st_dev,value.st_ino,value.st_uid,value.st_gid,stat.S_IMODE(value.st_mode)
+
+    def _hold(self, parent, name):
+        _capture_credit(self.entries,self.birth,extra_bytes=16384,extra_objects=32)
+        fd=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+        entry=[fd,parent,name,None,None];self.entries.append(entry)
+        current=os.fstat(fd);entry[3]=self._stamp(current);entry[4]=self._mount(fd)
+        if (not stat.S_ISDIR(current.st_mode) or current.st_uid not in (0,self.credentials[0])
+                or stat.S_IMODE(current.st_mode)&0o022):
+            raise ValueError('native3 original parent owner/mode differs')
+        return fd
+
+    def _chain(self, path):
+        path=Path(path)
+        if not path.is_absolute() or str(path)!=os.path.abspath(path) or len(str(path).encode())>4096:
+            raise ValueError('native3 original parent path exceeds bound')
+        fd=self._hold(None,'/')
+        for part in path.parts[1:]:fd=self._hold(fd,part)
+        return fd
+
+    @property
+    def validation_bytes(self):
+        return 129+2*len(self.entries)*4097
+
+    def validate(self):
+        if self.closed:raise ValueError('native3 directory handle closed')
+        self._scope()
+        for fd,parent,name,expected,mount in self.entries:
+            if self._stamp(os.fstat(fd))!=expected or self._mount(fd)!=mount:
+                raise ValueError('native3 held directory identity/credentials/mount changed')
+            named=os.open(name,os.O_RDONLY|os.O_DIRECTORY|os.O_NOFOLLOW|os.O_CLOEXEC,dir_fd=parent)
+            try:
+                if self._stamp(os.fstat(named))!=expected or self._mount(named)!=mount:
+                    raise ValueError('native3 selected directory name/mount changed')
+            finally:
+                primary=sys.exception()
+                try:os.close(named)
+                except BaseException as cleanup:
+                    if primary is None:raise
+                    primary.add_note('native3 named validation close: '+str(cleanup))
+        ns=os.stat('/proc/self/ns/mnt')
+        if (str(ns.st_dev),str(ns.st_ino))!=(self.birth['mount_namespace_device'],self.birth['mount_namespace_inode']):
+            raise ValueError('native3 namespace changed during validation')
+
+    @contextmanager
+    def effect(self, *, new_directories=0):
+        self.validate()
+        allowance=self.validation_bytes+2*new_directories*4097
+        self.budget.reserve(allowance)
+        try:yield
+        finally:
+            primary=sys.exception();self.budget.reserved-=allowance
+            try:self.validate()
+            except BaseException as cleanup:
+                if primary is None:raise
+                primary.add_note('native3 effect validation: '+str(cleanup))
+
+    def create_technical(self):
+        with self.effect(new_directories=1):
+            os.mkdir('performance',0o700,dir_fd=self.root_fd)  # EEXIST never adopted.
+            fd=self._hold(self.root_fd,'performance');current=os.fstat(fd)
+            self.technical_fd=fd
+            if (current.st_uid,current.st_gid)!=self.credentials or stat.S_IMODE(current.st_mode)!=0o700:
+                raise ValueError('native3 fresh technical directory credentials differ')
+            os.fsync(fd);os.fsync(self.root_fd)
+            self.budget.reserve(self.validation_bytes);self.cleanup_reserved=self.validation_bytes
+
+    def close(self, *, validate=True):
+        if self.closed:return
+        primary=sys.exception();error=None
+        self.budget.reserved-=self.cleanup_reserved;self.cleanup_reserved=0
+        try:
+            if validate:self.validate()
+        except BaseException as cleanup:error=cleanup
+        self.closed=True
+        for fd,*_ in reversed(self.entries):
+            try:os.close(fd)
+            except BaseException as cleanup:
+                if error is None:error=cleanup
+                else:error.add_note('native3 held close: '+str(cleanup))
+        if error is not None:
+            if primary is None:raise error
+            primary.add_note('native3 final validation/close: '+str(error))
 
 
 def _outward_point(row, selection, known, *, current=False):
@@ -1087,10 +1276,10 @@ def _capture_reader_metadata(reader):
     return tuple(getattr(reader,name,None) for name in names)
 
 
-def _capture_small_json(path, budget, retained):
+def _capture_small_json(path, budget, retained, *, maximum=MIB):
     with regular(path) as stream:
         before=stamp(stream,include_change=True);count=before[2]
-        if count>MIB:fail('budget_exceeded','performance JSON original exceeds allowance')
+        if count>maximum:fail('budget_exceeded','performance JSON original exceeds allowance')
         _capture_credit(*retained,extra_bytes=count+sys.getsizeof(b''),extra_objects=1)
         budget.require(count);raw=stream.read(count);budget.account(len(raw))
         if len(raw)!=count or stamp(stream,include_change=True)!=before:
@@ -1145,35 +1334,35 @@ def _capture_write(root, path, raw, schema, budget, *, immutable=False, retained
 class NativePerformanceInputs:
     """Explicit original operands for the owning factory, never an origin proof.
 
-    AiiDA must supply these from its original graph and qualify every root. The
-    current capture-spec/native-execution ingress does not carry these operands.
+    Native3 derives these claims from the compact spec and original worker
+    inputs. Four genuine original node pins remain the separate T4 binder's job.
     Local DTO consistency cannot certify native origin, RO access or acceptance.
     """
     _raw: bytes
     _decoded_bound: int
     _decoded_objects: int
 
-    def __init__(self, *, provider_selection, original_inputs, runner_anchor_root, technical_root, sources):
+    def __init__(self, *, provider_selection, native_execution_uuid, runner_anchor_root, technical_root, sources, _retained=()):
         from qcl_negf_contracts import schema_validator
         from qcl_negf_contracts.artifacts import relative_path
         from .state import _schema_check
-        value = dict(provider_selection=provider_selection, original_inputs=original_inputs,
+        value = dict(provider_selection=provider_selection, native_execution_uuid=native_execution_uuid,
             runner_anchor_root=runner_anchor_root, technical_root=technical_root, sources=sources)
-        _capture_credit(value)
+        _capture_credit(value,*_retained)
         if type(sources) is not list or len(sources) > 256:
             raise ValueError('bounded explicit original source operands required')
         validator = schema_validator('telemetry-envelope.schema.json')
         def shape(name, item):
             _schema_check(validator.evolve(schema={'$ref': '#/$defs/' + name, '$defs': validator.schema['$defs']}), item)
         shape('PerformanceProviderSelection', provider_selection)
-        shape('PerformanceOriginalInputs', original_inputs)
+        if not _native_uuid(native_execution_uuid):raise ValueError('canonical original native execution UUID required')
         def root_shape(root):
             shape('PerformanceRoot', root)
             relative_path(root['storage']['relative_execution_root'])
             if root['relative_path'] != '.':relative_path(root['relative_path'])
         for root in (runner_anchor_root, technical_root):root_shape(root)
-        if runner_anchor_root['area'] != 'native_execution' or technical_root['area'] != 'native_workdir':
-            raise ValueError('explicit enclosing execution and workdir roots required')
+        if runner_anchor_root['area'] != 'native_execution' or technical_root['area'] not in ('native_workdir','native_execution'):
+            raise ValueError('explicit enclosing execution and technical roots required')
         if technical_root['relative_path'] != 'performance':
             raise ValueError('fixed workdir performance root required')
         for source in sources:
@@ -1190,7 +1379,7 @@ class NativePerformanceInputs:
                 if (type(source[field]) is not str or not Path(source[field]).is_absolute()
                         or os.path.abspath(source[field]) != source[field]):
                     raise ValueError('explicit normalized local scientific and plan mappings required')
-        raw = _capture_encode(value); _capture_credit(value, raw)
+        raw = _capture_encode(value,*_retained); _capture_credit(value,raw,*_retained)
         object.__setattr__(self, '_raw', raw)
         object.__setattr__(self, '_decoded_bound', _capture_decoded_bound(value)+_capture_text_bound(value,len(raw)))
         # Occurrence count is a conservative bound even when JSON memoizes keys.
@@ -1215,7 +1404,7 @@ class NativePerformanceCapture:
     only remembered exact T2 publications and explicit source operands qualify
     local byte relationships. An index is an assertion input to the T4 gate.
     """
-    def __init__(self, workdir, artifact_root, *, writer, transport, inputs, budget):
+    def __init__(self, workdir, artifact_root, *, writer, transport, inputs, budget, _native_guard=None):
         if not isinstance(inputs, NativePerformanceInputs):
             raise TypeError('NativePerformanceInputs required; callback is not native origin')
         from .telemetry import TelemetryWriter
@@ -1225,18 +1414,21 @@ class NativePerformanceCapture:
         self.workdir = Path(workdir); self.actual = Path(artifact_root); self.writer = writer
         self.inputs = inputs; self.transport = _capture_copy(transport,inputs._raw); self.budget = budget
         self.anchors = {}; self.generation = 0
+        self._native_guard=_native_guard
         data = _capture_document(inputs, self.transport); selection = transport['selection']
         if any(data['provider_selection'][k] != selection[k] for k in ('calcjob_uuid', 'execution_id', 'attempt')):
             raise ValueError('original provider/enclosing transport differs')
         if writer.metadata_budget is not budget:
             raise ValueError('capture and writer must share one aggregate I/O ledger')
-        if writer.root != self.workdir / 'performance' or writer.transport != transport:
+        self._terminal_root=self.actual if data['technical_root']['area']=='native_execution' else self.workdir
+        if writer.root != self._terminal_root / 'performance' or writer.transport != transport:
             raise ValueError('writer differs from explicit native workdir/transport')
         self._roots = tuple((path, (path.stat().st_dev, path.stat().st_ino))
             for path in (self.workdir, self.actual, writer.root))
         _capture_credit(data, self.transport)
 
     def _guard(self):
+        if self._native_guard is not None:self._native_guard.validate()
         for path, expected in self._roots:
             current = path.stat()
             if (current.st_dev, current.st_ino) != expected:
@@ -1246,6 +1438,10 @@ class NativePerformanceCapture:
                 current = Path(path).stat()
                 if (current.st_dev, current.st_ino) != expected:
                     fail('source_changed', 'performance source root replaced')
+
+    def _write(self, *args, **kwargs):
+        with self._native_guard.effect() if self._native_guard is not None else nullcontext():
+            return _capture_write(*args, **kwargs)
 
     def _publication_guard(self, context, *, retained):
         """Recheck held roots and exact source bytes within this publication."""
@@ -1284,7 +1480,7 @@ class NativePerformanceCapture:
             raise ValueError('one explicit original scientific root/transport required')
         source = candidates[0]
         if anchor['origin'] is not None and anchor['origin'] != dict(calcjob_uuid=self.transport['selection']['calcjob_uuid'],
-                native_execution_uuid=inputs['original_inputs']['native_execution']['node_uuid']):
+                native_execution_uuid=inputs['native_execution_uuid']):
             raise ValueError('Runner current origin differs from explicit original inputs')
         _capture_credit(inputs,self.inputs._raw,self.anchors,self.transport,anchor,reference,raw,source,
             extra_bytes=4096,extra_objects=32)
@@ -1320,7 +1516,8 @@ class NativePerformanceCapture:
         if int(state['manifest']['bytes'])>MIB:
             fail('budget_exceeded','selected scientific manifest exceeds capture byte allowance before reader initialization')
         if inputs is None:inputs = _capture_document(self.inputs,self.anchors,self.transport,context,status,retained)
-        live = (self.inputs._raw,inputs,self.anchors,self.transport,context,status,retained)
+        live = (self.inputs._raw,inputs,self.anchors,self.transport,context,status,retained,
+            None if self._native_guard is None else self._native_guard.entries)
         _capture_credit(*live)
         root = Path(source['scientific_directory'])
         plan_root = Path(source['canonical_plan_directory'])
@@ -1342,7 +1539,7 @@ class NativePerformanceCapture:
                 producer_provenance=provenance, plan_relation='identical_frozen_bytes')
             raw = _capture_encode(binding, *live, manifest_raw, provenance)
             _capture_credit(*live, manifest_raw, provenance, binding, raw)
-            source_ref = _capture_write(self.writer.root, 'source-bindings/' + digest(raw) + '.json', raw,
+            source_ref = self._write(self.writer.root, 'source-bindings/' + digest(raw) + '.json', raw,
                 binding['schema'], self.budget, immutable=True,retained=(*live,manifest_raw,provenance,binding))
             operands = dict(commit_ref=context[0],source_binding_ref=source_ref,
                 expected_transport=self.transport,source_transport=source['source_transport'],
@@ -1357,8 +1554,9 @@ class NativePerformanceCapture:
                 name = 'bindings/'+digest(name_raw)+'.json'
                 del operands,name_raw
                 if not (self.writer.root / name).exists():
-                    make_binding(reader,telemetry=selected,destination=self.writer.root/name,capture_status=status,budget=self.budget,
-                        _retained=(*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw))
+                    with self._native_guard.effect() if self._native_guard is not None else nullcontext():
+                        make_binding(reader,telemetry=selected,destination=self.writer.root/name,capture_status=status,budget=self.budget,
+                            _retained=(*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw))
                 value,raw_binding = _capture_small_json(self.writer.root/name,self.budget,
                     (*live,manifest_raw,provenance,binding,raw,source_ref,selected._raw))
                 binding_ref = _capture_ref(name,raw_binding,value['schema'])
@@ -1387,7 +1585,8 @@ class NativePerformanceCapture:
         from qcl_negf_contracts.telemetry import validate_performance_source_index, validate_performance_source_pointer
         self._guard()
         from .state import _metadata_weight, _context_raw_tree_bound
-        before = (self.inputs._raw,self.anchors,self.transport,close_context,capture_status)
+        before = (self.inputs._raw,self.anchors,self.transport,close_context,capture_status,
+            None if self._native_guard is None else self._native_guard.entries)
         # Snapshot before the large operands decode. T0 owns the snapshot, but
         # its metadata scratch still shares this caller's remaining allowance.
         if close_context is None:
@@ -1399,7 +1598,8 @@ class NativePerformanceCapture:
             _capture_credit(*before,extra_bytes=_metadata_weight(close_context),extra_objects=_capture_objects((close_context,)))
             context = _capture_copy(close_context,*before)
         inputs = _capture_document(self.inputs,*before,context)
-        live = (self.inputs._raw,inputs,self.anchors,self.transport,context,close_context,capture_status)
+        live = (self.inputs._raw,inputs,self.anchors,self.transport,context,close_context,capture_status,
+            None if self._native_guard is None else self._native_guard.entries)
         commit_raw = _capture_read_admitted(self.writer.root, context[0], self.budget,retained=live)
         commit = _capture_decode(commit_raw,*live)
         del commit_raw
@@ -1466,14 +1666,15 @@ class NativePerformanceCapture:
         # The finally check also covers a failed write/check, preserving its
         # primary exception. Successful open/closed suffixes use two/three checks.
         self.budget.require(2*(len(raw)+len(pointer_raw)+(len(raw) if closed else 0))
-            +(3 if closed else 2)*guard_bytes)
+            +(3 if closed else 2)*guard_bytes
+            +(0 if self._native_guard is None else (12 if closed else 8)*self._native_guard.validation_bytes))
         try:
-            _capture_write(self.writer.root,index_path,raw,value['schema'],self.budget,immutable=True,retained=final)
+            self._write(self.writer.root,index_path,raw,value['schema'],self.budget,immutable=True,retained=final)
             self._publication_guard(context,retained=final)
-            _capture_write(self.writer.root, 'current-source.json', pointer_raw, pointer['schema'], self.budget,retained=final)
+            self._write(self.writer.root, 'current-source.json', pointer_raw, pointer['schema'], self.budget,retained=final)
             if closed:
                 self._publication_guard(context,retained=final)
-                _capture_write(self.workdir, 'performance-source.json', raw, value['schema'], self.budget,retained=final)
+                self._write(self._terminal_root, 'performance-source.json', raw, value['schema'], self.budget,retained=final)
         finally:
             primary = sys.exception()
             try:self._publication_guard(context,retained=final)
@@ -1489,20 +1690,28 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
     budget = ObserverIO(16384)
     try:
         root, spec, known = _spec(spec_path, budget=budget)
-    except (OSError, ValueError, KeyError, TypeError, AttributeError):
-        os.close(control_fd)
+    except BaseException as error:
+        try:os.close(control_fd)
+        except BaseException as cleanup:error.add_note('observer startup control close: '+str(cleanup))
+        if not isinstance(error,Exception):raise
         return 2 # No traceback/inherited-log write before capture credit.
     selection = spec["selection"]
     native_output = None
     performance_capture = None
+    native_guard = None
     try:
         if native_performance_inputs is not None and (native_execution_path is None or not isinstance(native_performance_inputs, NativePerformanceInputs)):
             raise ValueError('explicit typed native operands require the native ingress')
         if native_execution_path is not None:
             if transport is not None or telemetry_selection_factory is not None:
                 raise ValueError('native ingress cannot accept caller transport/factory assertions')
-            native_output, transport = _native_capture_inputs(root, spec, native_execution_path,
-                solver_arguments, budget=budget)
+            if spec['schema']=='qcl-negf.capture-spec.v3' and native_performance_inputs is not None:
+                raise ValueError('native3 factory operands are constructed from original ingress only')
+            operands = _native_capture_inputs(root, spec, native_execution_path,solver_arguments,budget=budget)
+            native_output, transport = operands[:2]
+            if len(operands)==3:native_performance_inputs=operands[2]
+        elif spec['schema']=='qcl-negf.capture-spec.v3':
+            raise ValueError('native3 requires the paired original native ingress')
         if telemetry_selection_factory is not None and not callable(telemetry_selection_factory):
             raise ValueError('trusted programmatic telemetry input factory required')
         if transport is not None:
@@ -1515,8 +1724,11 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
             if transport['selection']!=selection or _metadata_weight(transport)>MIB:
                 raise ValueError('initial telemetry transport differs from explicit launch selection')
             transport=deepcopy(transport)
-    except Exception:
-        os.close(control_fd);return 2
+    except BaseException as error:
+        try:os.close(control_fd)
+        except BaseException as cleanup:error.add_note('observer native input control close: '+str(cleanup))
+        if not isinstance(error,Exception):raise
+        return 2
     credits = spec["credits"]
     began = time.monotonic()
     cursors = {}
@@ -1563,7 +1775,7 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         count = 0
         used = 0
         if writer is not None:used=closed_page_bytes+session_bytes(writer.directory)
-        free = os.statvfs(root)
+        free = os.statvfs(native_output if native_guard is not None else root)
         budget.require(estimate)
         if (
             used + estimate > credits["performance_bytes"]
@@ -1571,23 +1783,48 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         ):
             raise ValueError("observer admitted storage/IO partition exhausted")
 
-    def writer_call(method, *args, **kwargs):
+    def _writer_call(method, *args, **kwargs):
         # Local finite forecast for unchanged Arrow serialization/footer/hash I/O.
         # Exact JSON metadata has its own before-read/write hook on the same grant.
         admit()
         reservation = 4 * (writer.batch_bytes if writer is not None else 4 * MIB) + MIB
         budget.reserve(reservation)
-        before_directory=writer.directory if writer is not None else None
-        before = set(before_directory.glob("*.parquet")) if before_directory is not None else set()
+        def inventory_directory(directory):
+            if native_guard is None:return directory
+            # Read the original owned Arrow inventory even if its pathname was
+            # moved during serialization. No writes or repairs use this FD path.
+            selected=Path(f'/proc/self/fd/{native_guard.technical_fd}')/directory.relative_to(writer.root)
+            if not selected.is_dir():raise ValueError('native3 original Arrow inventory unavailable')
+            return selected
+        before_directory=None;before=set()
         try:
+            before_directory=inventory_directory(writer.directory) if writer is not None else None
+            before = set(before_directory.glob("*.parquet")) if before_directory is not None else set()
             return method(*args, **kwargs)
         finally:
-            paths = set(before_directory.glob("*.parquet")) if before_directory is not None else set()
-            if writer is not None:paths.update(writer.directory.glob("*.parquet"))
-            forecast = 4 * sum(path.stat().st_size for path in paths - before)
-            budget.settle(reservation, forecast)
-            if forecast > reservation:
-                raise ValueError("writer exceeded its finite I/O forecast; capture unknown")
+            primary=sys.exception()
+            try:
+                paths = set(before_directory.glob("*.parquet")) if before_directory is not None else set()
+                if writer is not None:paths.update(inventory_directory(writer.directory).glob("*.parquet"))
+                forecast = 4 * sum(path.stat().st_size for path in paths - before)
+            except BaseException as cleanup:
+                # Unknown serialization tail consumes its entire prepaid
+                # forecast; delivered metadata already stays on the same ledger.
+                budget.settle(reservation,reservation)
+                if primary is None:raise
+                primary.add_note('observer writer inventory cleanup: '+str(cleanup))
+            else:
+                try:budget.settle(reservation, forecast)
+                except BaseException as cleanup:
+                    if primary is None:raise
+                    primary.add_note('observer writer accounting cleanup: '+str(cleanup))
+                if forecast > reservation:
+                    if primary is None:raise ValueError('writer exceeded finite I/O forecast; capture unknown')
+                    primary.add_note('writer exceeded finite I/O forecast; capture unknown')
+
+    def writer_call(method, *args, **kwargs):
+        with native_guard.effect() if native_guard is not None else nullcontext():
+            return _writer_call(method,*args,**kwargs)
 
     def capture_point(actual, point, mode, terminal, epoch):
         nonlocal journal_bytes,phase_source,phase_key,closed_page_bytes
@@ -1695,11 +1932,14 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 raise ValueError("capture unavailable: no credit locator before terminal")
             except BlockingIOError:
                 time.sleep(2)
-        _locator(root, spec, budget=budget, native_output=native_output)  # Refuse foreign before ANY output.
+        locator, _ = _locator(root, spec, budget=budget, native_output=native_output)
+        if spec['schema']=='qcl-negf.capture-spec.v3':
+            native_guard=_NativeResultGuard(root,native_output,locator['root_birth'],pid,start_ticks,budget)
         from .telemetry import TelemetryWriter
         admit()
+        if native_guard is not None:native_guard.create_technical()
         writer = writer_call(TelemetryWriter,
-            root / "performance",
+            (native_output if native_guard is not None else root) / "performance",
             {**selection, "allocation_id": spec["allocation_id"]},
             {
                 "scope": "root_julia_process_including_threads",
@@ -1710,7 +1950,7 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         )
         if native_performance_inputs is not None:
             performance_capture = NativePerformanceCapture(root, native_output, writer=writer,
-                transport=transport, inputs=native_performance_inputs, budget=budget)
+                transport=transport, inputs=native_performance_inputs, budget=budget,_native_guard=native_guard)
         while True:
             try:
                 os.read(control_fd, 64)
@@ -1736,6 +1976,8 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                     time.sleep(2)
                     continue
                 locator, actual = _locator(root, spec, budget=budget, native_output=native_output)
+                if native_guard is not None and locator['root_birth']!=native_guard.birth:
+                    raise ValueError('native3 original birth locator changed')
                 if locator["epoch"] < previous_epoch:
                     raise ValueError("actual source epoch reversed")
                 previous_epoch = locator["epoch"]
@@ -1748,6 +1990,12 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
                 if has_anchor:
                     anchor, anchor_ref, anchor_raw = _performance_anchor(actual,budget=budget,
                         retained=() if performance_capture is None else (performance_capture.inputs._raw,performance_capture.anchors,performance_capture.transport))
+                    if native_guard is not None:
+                        original_origin=dict(calcjob_uuid=selection['calcjob_uuid'],
+                            native_execution_uuid=native_performance_inputs.document()['native_execution_uuid'])
+                        if (anchor['origin']!=original_origin or anchor['scientific'] is not None
+                                and anchor['scientific']['relation']!='produced'):
+                            raise ValueError('native3 exact original produced/phase0 origin required')
                     if performance_capture is not None:performance_capture.remember(anchor, anchor_ref, anchor_raw)
                     identity = anchor['phase_identity']; science = anchor['scientific']
                     if identity['execution_id'] != selection['execution_id'] or identity['point_id'] not in known:
@@ -1816,6 +2064,12 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
             except Exception as cleanup:
                 if failure is not None:failure.add_note('observer incomplete close: ' + str(cleanup))
         if phase_source is not None:phase_source.close()
+        if native_guard is not None:
+            try:native_guard.close()
+            except BaseException as cleanup:
+                if not isinstance(cleanup,Exception):raise
+                if failure is None:failure=cleanup
+                else:failure.add_note('observer native3 final close: '+str(cleanup))
         os.close(control_fd)
     return 0 if failure is None else 2
 

@@ -863,3 +863,50 @@ def test_F5_before_index_admission_dominates_every_owned_suffix_check(tmp_path, 
             preflight=phase['preflight'], actual_checks_maximum=maximum,
             qualification='capture_retained_and_explicit_owned_checks_only'))
     finally:writer.close()
+
+
+@pytest.mark.parametrize('raw_bytes,admitted', [(200000, True), (600000, False)])
+def test_N3_original_plan_role_keeps_public_cap_and_honest_private_admission(tmp_path, raw_bytes, admitted):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    from test_capture import _N3_fixture
+    f=_N3_fixture(tmp_path);raw=(f['job']/'plan.json').read_bytes()
+    raw=b' '*(raw_bytes-len(raw))+raw
+    (f['job']/'plan.json').write_bytes(raw)
+    f['spec']['plan'].update(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    f['native']['input_plan'].update(bytes=str(len(raw)),sha256=hashlib.sha256(raw).hexdigest())
+    (f['job']/'native-execution.json').write_bytes(cap.json_bytes(f['native']))
+    (f['job']/'capture-spec.json').write_bytes(cap.json_bytes(f['spec']))
+    budget=ObserverIO(16384)
+    if not admitted:
+        with pytest.raises(ValueError,match='metadata allowance'):
+            cap._spec(f['job']/'capture-spec.json',budget=budget)
+        assert budget.read_bytes>=raw_bytes and not (f['result']/'performance').exists()
+        return
+    root,spec,_=cap._spec(f['job']/'capture-spec.json',budget=budget)
+    output,transport,inputs=cap._native_capture_inputs(root,spec,f['job']/'native-execution.json',f['arguments'],budget=budget)
+    assert output==f['result'] and transport['frozen_plan']['bytes']==str(raw_bytes)
+    assert inputs.document()['native_execution_uuid']==f['native']['storage']['execution_binding_uuid']
+    assert budget.read_bytes>2*raw_bytes and budget.reserved==0
+    assert not (f['result']/'performance').exists()
+
+
+def test_N3_guard_credit_denial_and_final_close_use_one_spent_ledger(tmp_path):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    from test_capture import _N3_fixture
+    from pathlib import Path
+    f=_N3_fixture(tmp_path);budget=ObserverIO(128 << 20)
+    before=len(list(Path('/proc/self/fd').iterdir()))
+    guard=cap._NativeResultGuard(f['job'],f['result'],f['birth'],os.getpid(),cap._start_ticks(os.getpid()),budget)
+    guard.create_technical();spent=budget.used
+    # The reserved final validation is not offered to another effect.
+    budget.maximum=budget.used+budget.reserved
+    effects=[]
+    try:
+        with pytest.raises(ValueError,match='credit'):
+            with guard.effect():effects.append('unadmitted effect')
+        assert effects==[] and budget.used==spent
+    finally:guard.close()
+    assert budget.used>spent and budget.reserved==0
+    assert len(list(Path('/proc/self/fd').iterdir()))==before
