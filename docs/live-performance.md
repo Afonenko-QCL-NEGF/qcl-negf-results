@@ -591,3 +591,75 @@ another selected inode/pointer. Root birth and local byte consistency remain pro
 not portable provenance or a physical exclusive writer lease. Actual AiiDA ingress/original
 INPUT/CALL/CREATE qualification, current/retained T4, original RO/NFS/writer domain, installed
 wrapper/namespace/cgroup policy, native available R5, RSS/overhead and science remain separate gates.
+
+
+## Explicit synthetic native publication fixture
+
+The fixed `native-publication-fixture` Runner command is an engineering entry for
+constructor-only, invalid scientific state publication. It uses the same eleven
+original native arguments, capture-spec-v3 and native-execution input as native
+`run-plan`. No additional capture flag, ORM input, observer receipt or collector
+wire is introduced. Its original frozen plan must match the source-owned reserved
+fixture profile after the normal whole-file plan/source-graph/native-input joins.
+The command or profile label alone does not authenticate an installed creator.
+
+
+The full selector uses the existing `qcl-negf-canonical-bytes-v1` encoding. It
+excludes only the top-level fingerprint and planning worker-capacity receipt.
+Within execution provenance sources and section input-assigning histories it
+normalizes absolute path leaves for exactly the three source-owned fixture YAML
+files to their source basename, preserving every key, ordered list and `#`
+fragment. All other model, configuration, snapshot, rule, input, output, policy,
+point and identity values remain bound. The schema-valid v3 profile digest is
+`376aedbbfa31311f40bdffdb988242613629d128c0a97e8cdd2d6b14b8c42e47`.
+This is an input selector; actual original file claims and installed creator
+qualification remain required.
+
+`capture_run` selects strict supervision from the literal first command before
+reading remote files. In this mode child0 permits success only after the observer
+was created, received the terminal control message and was reaped with status0.
+Missing/failed observer setup, early exit, nonzero observer status, uncertain
+terminal delivery, timeout or an unreaped observer returns125 for child0. A child
+nonzero exit or signal keeps its original status. Cancellation never retries the
+solver; owned runnable children are killed and given a finite nonblocking reap
+opportunity on exceptional setup/cleanup. Ordinary `run-plan` retains its default
+observational observer contract.
+
+The fixture observer takes a separate read-only branch before constructing
+`NativePerformanceInputs`, `ScalarPublisher`, `TelemetryWriter` or technical
+capture. It checks the original native3 direct epoch0 locator against the actual
+supervised PID/start ticks, worker boot/namespace/credentials and born root
+identity. It holds the existing no-follow workdir/output parent chains, rejects
+preexisting or late technical capture, requires exactly `exit 0\n`, and rereads
+the same locator before checked final validation/close. It creates no performance
+directory, performance source/anchor, scalar mirror or replacement source bytes.
+The ordinary technical capture path remains enabled.
+
+The uniform private metadata workspace allowance is 16 MiB. The actual 131473-byte
+source-owned fixture plan requires a conservative predecode workspace forecast
+of 10378526 bytes and 38291 temporary objects, exceeding the earlier 4 MiB/16384
+forecast. The decoder now prepays a separate conservative temporary-object
+forecast up to 65536; actual retained, native-input and performance metadata still
+use their existing 16384-object guards. Public raw JSON/FileRef bounds remain 1 MiB.
+No JSON decoder or post-allocation size estimate bypasses admission. Inputs over
+either workspace or prospective-object allowance fail before materialization,
+and callers may still tighten their workspace allowance. These are operational
+owned-buffer limits, not a process RSS or campaign cap.
+
+The aggregate I/O credit is unchanged. Before holding directories, the read-only
+branch prepays both guard construction and its final validation, including the
+existing close allowance normally reserved by `create_technical`. Delivered
+metadata reads remain spent on failure; only acquired reservations are released.
+Cancellation and primary errors survive secondary validation/descriptor-close
+errors, and every owned descriptor is still closed. Remote reads stay in the
+disposable observer. An observer stuck in uninterruptible I/O remains scheduler
+and resource authority; no bounded physical-close or resource-release promise is
+made by supervisor return.
+
+Observer success certifies only this bounded birth observation. Real original
+AiiDA INPUT/CALL/CREATE, installed source qualification, strong returned final
+publication, Q1 whole-writer closure/W1, fresh S3 generation joins and resource
+finish remain separate mandatory gates. Synthetic scientific invalidity and the
+parser's scientific-failure status are retained. This fixture does not establish
+SCBA/Poisson execution, convergence, physical acceptance, discretization accuracy
+or experimental validation, and does not open the stationary native gate.

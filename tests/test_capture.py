@@ -1972,3 +1972,522 @@ def test_F3_materialization_failure_keeps_primary_old_pin_and_actual_spent(tmp_p
     assert (writer.root/first['path']).read_bytes()==original and owner.inputs._raw==inputs
     assert len(list((writer.root/'sources').glob('*.json')))==1
     writer.close()
+
+
+@pytest.mark.parametrize('observer_mode,want', [('terminal', 0), ('failed', 125),
+    ('early', 125), ('stalled', 125), ('spawn_error', 125), ('missing', 125)])
+def test_fixture_supervisor_requires_terminal_observer_reaped_zero(tmp_path, observer_mode, want):
+    """Losing the explicit fixture observer must never turn child0 into success."""
+    marker = tmp_path / 'solver-spawns'
+    solver = [sys.executable, '-c',
+        'import pathlib,sys,time; p=pathlib.Path(sys.argv[1]); '
+        'p.open("a").write("spawn\\n"); time.sleep(.15)', str(marker)]
+
+    def observer(pid, start, fd):
+        if observer_mode == 'spawn_error':raise OSError('observer spawn denied')
+        code = {
+            'terminal': 'import os,sys,time; fd=int(sys.argv[1]); data=b""; '
+                '\nwhile not data.endswith(b"\\n"):\n try: data+=os.read(fd,64)'
+                '\n except BlockingIOError: time.sleep(.005)'
+                '\nraise SystemExit(0 if data==b"exit 0\\n" else 2)',
+            'failed': 'raise SystemExit(2)',
+            'early': 'raise SystemExit(0)',
+            'stalled': 'import time; time.sleep(30)',
+        }[observer_mode]
+        return [sys.executable, '-c', code, str(fd)]
+
+    assert supervise(solver, observer_factory=None if observer_mode == 'missing' else observer,
+        drain_seconds=.1, require_observer_success=True) == want
+    assert marker.read_text().splitlines() == ['spawn']
+
+
+@pytest.mark.parametrize('child_code,want', [(7, 7), (-15, 143)])
+def test_fixture_supervisor_preserves_child_failure_once(tmp_path, child_code, want):
+    marker=tmp_path/'solver-spawns'
+    script=('import os,pathlib,signal,sys; pathlib.Path(sys.argv[1]).open("a").write("spawn\\n"); '
+        + ('os.kill(os.getpid(),signal.SIGTERM)' if child_code<0 else 'raise SystemExit(7)'))
+    assert supervise([sys.executable,'-c',script,str(marker)],
+        observer_factory=lambda *a: (_ for _ in ()).throw(OSError('observer unavailable')),
+        drain_seconds=0,require_observer_success=True)==want
+    assert marker.read_text().splitlines()==['spawn']
+
+
+def test_capture_run_selects_strict_fixture_mode_before_remote_read(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as cap
+    observed=[]
+    def run(argv,**kwargs):
+        observed.append((argv,kwargs.get('require_observer_success',False)))
+        return 125 if kwargs.get('require_observer_success') else 0
+    monkeypatch.setattr(cap,'supervise',run)
+    # These paths deliberately do not exist: the reaper must not read them.
+    spec=tmp_path/'remote'/'capture-spec.json'
+    assert cap.capture_run(spec,'/actual/solver',('native-publication-fixture','plan.json'))==125
+    assert cap.capture_run(spec,'/actual/solver',('run-plan','plan.json'))==0
+    assert observed==[(['/actual/solver','native-publication-fixture','plan.json'],True),
+        (['/actual/solver','run-plan','plan.json'],False)]
+
+
+
+def _publication_birth_fixture(tmp_path):
+    """Reader L fixture only: local native3 identities, no original creator authority."""
+    f=_N3_fixture(tmp_path)
+    (f['result']/'performance-anchor-current.json').unlink()
+    anchors=f['result']/'performance-anchors'
+    for path in anchors.iterdir():path.unlink()
+    anchors.rmdir()
+    return f
+
+
+def test_publication_fixture_birth_observer_closes_without_technical_effects(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_publication_birth_fixture(tmp_path);budget=ObserverIO(128<<20)
+    for owner,name in ((cap,'ScalarPublisher'),(cap,'NativePerformanceInputs'),
+        (cap._NativeResultGuard,'create_technical')):
+        monkeypatch.setattr(owner,name,lambda *a,**k:pytest.fail('fixture created technical capture'))
+    monkeypatch.setattr('qcl_negf_results.telemetry.TelemetryWriter',
+        lambda *a,**k:pytest.fail('fixture created telemetry writer'))
+    before={str(p.relative_to(f['result'])):p.read_bytes() for p in f['result'].rglob('*') if p.is_file()}
+    descriptors=len(os.listdir('/proc/self/fd'))
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC)
+    os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+        cap._start_ticks(os.getpid()),read_fd,budget)
+    assert {str(p.relative_to(f['result'])):p.read_bytes() for p in f['result'].rglob('*') if p.is_file()}==before
+    assert budget.read_bytes>0 and budget.reserved==0 and budget.write_bytes==0
+    assert len(os.listdir('/proc/self/fd'))==descriptors
+    assert not(f['job']/'live').exists() and not(f['job']/'performance').exists()
+
+
+@pytest.mark.parametrize('terminal',[b'',b'exit 7\n',b'exit 0',b'exit 0\nexit 0\n',b'unknown\n',b'x'*65])
+def test_publication_birth_observer_requires_exact_successful_terminal(tmp_path, terminal):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_publication_birth_fixture(tmp_path);budget=ObserverIO(128<<20)
+    descriptors=len(os.listdir('/proc/self/fd'))
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC)
+    if terminal:os.write(write_fd,terminal)
+    os.close(write_fd)
+    with pytest.raises(ValueError):
+        cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+            cap._start_ticks(os.getpid()),read_fd,budget)
+    assert budget.reserved==0 and len(os.listdir('/proc/self/fd'))==descriptors
+    assert not(f['result']/'performance').exists()
+
+
+@pytest.mark.parametrize('technical',['performance','performance-source.json',
+    'performance-anchor-current.json','performance-anchors'])
+def test_publication_birth_observer_rejects_existing_technical_without_removal(tmp_path, technical):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_publication_birth_fixture(tmp_path);path=f['result']/technical
+    path.write_bytes(b'preexisting')
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC);os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    with pytest.raises(ValueError):
+        cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+            cap._start_ticks(os.getpid()),read_fd,ObserverIO(128<<20))
+    assert path.read_bytes()==b'preexisting'
+
+
+def test_publication_birth_observer_prepays_final_validation_before_holding(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_publication_birth_fixture(tmp_path)
+    # Locator fits but the whole held-parent final validation allowance does not.
+    budget=ObserverIO(32768)
+    monkeypatch.setattr(cap,'_NativeResultGuard',lambda *a,**k:pytest.fail('guard held before close admission'))
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC);os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    with pytest.raises(ValueError):
+        cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+            cap._start_ticks(os.getpid()),read_fd,budget)
+    assert budget.reserved==0 and budget.read_bytes>0
+    with pytest.raises(OSError):os.fstat(read_fd)
+
+
+@pytest.mark.parametrize('fault',['start_ticks','runtime_error','short_terminal','terminal_oserror','unreaped'])
+def test_fixture_supervisor_uncertain_observation_is_finite_nonzero_once(tmp_path, monkeypatch, fault):
+    import qcl_negf_results.capture as cap
+    marker=tmp_path/'solver-spawns';killed=[]
+    solver=[sys.executable,'-c',
+        'import pathlib,sys,time; pathlib.Path(sys.argv[1]).open("a").write("spawn\\n"); time.sleep(.05)',str(marker)]
+    if fault=='start_ticks':
+        monkeypatch.setattr(cap,'_start_ticks',lambda pid:(_ for _ in ()).throw(ValueError('generation unavailable')))
+    if fault in ('short_terminal','terminal_oserror'):
+        write=os.write
+        def uncertain(fd,data):
+            if data.startswith(b'exit '):
+                if fault=='terminal_oserror':raise OSError('terminal write uncertain')
+                write(fd,data);return 0
+            return write(fd,data)
+        monkeypatch.setattr(os,'write',uncertain)
+    def factory(pid,start,fd):
+        if fault=='runtime_error':raise RuntimeError('observer setup error')
+        return [sys.executable,'-c',
+            'import os,sys,time; fd=int(sys.argv[1]); data=b""; '
+            '\nwhile not data.endswith(b"\\n"):\n try: data+=os.read(fd,64)'
+            '\n except BlockingIOError: time.sleep(.005)',str(fd)]
+    if fault=='unreaped':
+        popen=cap.subprocess.Popen
+        class Stuck:
+            def poll(self):return None
+        stuck=Stuck()
+        def spawn(argv,**kwargs):
+            return stuck if 'pass_fds' in kwargs else popen(argv,**kwargs)
+        kill=cap._kill_group
+        monkeypatch.setattr(cap.subprocess,'Popen',spawn)
+        monkeypatch.setattr(cap,'_kill_group',lambda child,sig:killed.append(sig) if child is stuck else kill(child,sig))
+    began=time.monotonic()
+    assert cap.supervise(solver,observer_factory=factory,drain_seconds=.05,require_observer_success=True)==125
+    assert time.monotonic()-began<2 and marker.read_text().splitlines()==['spawn']
+    if fault=='unreaped':assert killed==[signal.SIGKILL]
+
+
+@pytest.mark.parametrize('fault',['pid','start','boot','namespace','inode','mode','token','no_locator'])
+def test_publication_birth_observer_refuses_wrong_or_missing_actual_birth(tmp_path, fault):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_publication_birth_fixture(tmp_path)
+    field={'pid':'producer_pid','start':'producer_start_ticks','boot':'boot_id',
+        'namespace':'mount_namespace_inode','inode':'inode'}.get(fault)
+    if field:
+        f['birth'][field]='00000000-0000-4000-8000-000000000099' if fault=='boot' else str(int(f['birth'][field])+1)
+    elif fault=='mode':f['result'].chmod(0o755)
+    elif fault=='token':f['locator']['capture_token']='f'*32
+    locator=f['job']/'capture-source.json'
+    locator.write_bytes(cap.json_bytes(f['locator']))
+    if fault=='no_locator':locator.unlink()
+    descriptors=len(os.listdir('/proc/self/fd'))
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC);os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    budget=ObserverIO(128<<20)
+    with pytest.raises(ValueError):
+        cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+            cap._start_ticks(os.getpid()),read_fd,budget)
+    assert budget.reserved==0 and len(os.listdir('/proc/self/fd'))==descriptors
+    assert not(f['result']/'performance').exists()
+
+
+@pytest.mark.parametrize('fault',['namespace','locator','technical'])
+def test_publication_birth_observer_rechecks_scope_and_absence_at_terminal(tmp_path, monkeypatch, fault):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    from types import SimpleNamespace
+    f=_publication_birth_fixture(tmp_path);budget=ObserverIO(128<<20)
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC);os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    original_read=os.read;original_stat=os.stat
+    def terminal(fd,count):
+        value=original_read(fd,count)
+        if fd==read_fd:
+            if fault=='namespace':
+                def changed(path,*a,**k):
+                    st=original_stat(path,*a,**k)
+                    return SimpleNamespace(st_dev=st.st_dev,st_ino=st.st_ino+1) if str(path)=='/proc/self/ns/mnt' else st
+                monkeypatch.setattr(os,'stat',changed)
+            elif fault=='locator':
+                f['locator']['capture_token']='f'*32
+                (f['job']/'capture-source.json').write_bytes(cap.json_bytes(f['locator']))
+            else:(f['result']/'performance-source.json').write_bytes(b'foreign technical')
+        return value
+    monkeypatch.setattr(os,'read',terminal)
+    with pytest.raises(ValueError):
+        cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+            cap._start_ticks(os.getpid()),read_fd,budget)
+    assert budget.reserved==0
+    if fault=='technical':assert (f['result']/'performance-source.json').read_bytes()==b'foreign technical'
+
+
+
+def _publication_fixture_plan():
+    """Source-owned constructor-only plan, with portable provenance; no creator authority.
+
+    Frozen Runner original 19cf3545fd108d38de38d83c46f2828d4557226cf524978b72cf5472bffcf06c.
+    V3 profile canonical SHA256 376aedbbfa31311f40bdffdb988242613629d128c0a97e8cdd2d6b14b8c42e47.
+    Compressed JSON is input metadata only, not numerical output or a solve fixture.
+    """
+    import base64
+    import zlib
+    return json.loads(zlib.decompress(base64.b85decode(
+        'c%1EhU9aTEnciP%aButc@UuxC-$YQfS+Bi{vsMHwj4@GU6}#!fFBQo?b0i$V@&?%id$CwxuQtIVz+MEo(=If&63H?U<a*rm6XahK'
+        'yj4ZA$Y%FBO?ID|kz0V_GfncTVpZ|2x89HE{Y(i^lA~yqD%WWh$8#mflDsNW8D*&#WK~)!*V<emFGx_qZ-sLGv(FSv!YGZ{JrP!}'
+        'l@yiHhFs;9A4dUu_9~2Clocgc8%>!jBn(Law|G&SS7o7Gf2NR>(AAxnpcfwbSh-dg?!5UeO4)B$>cVJ#OfyUh<+{DASVv*0Tq{M6'
+        'XhFO@MyWDa3PLcz2Qf-=_%lRtLF6v*)>Ku~E&1mnKr!5}E>ul7-Ohh=Wkn<Gg>jZq@w{ereypF?7QIKExkAY&6)8%ByG^%0A8wjf'
+        'F;T7+@*<C;AS%7)Ic2WgX7naXR~{)*4Ss(=S4dGt2?FSxpc~J>D`Ds~*HGQ%Twznz%;*(NP>g&ME7!_T|LVh!{_KN~e)#^3Pw7mW'
+        '(wUgj*+%=pEX_)<2qKb}Q5XfYXEPraB#u&|%$0<c>kRXi5oBo?tt!fTo8^QuD3~?A#t^-O3ssp{B}^Nl!8+Oy_%p2H*bAc+#maR_'
+        'D>7H2v?MekI6@`y)=^Pr^iH`p0Jw|-xKB)WPP1RYw6gWee!GY94zdk_Cq7ePL_EL3D^e=gj^((nVOp*ZYYX{oE(8*5a)V;8AVHR5'
+        '7)3`_7b?INgl<SZxJz489cO96g%U-nw}NHL-my@w_4~O}l9(i<6dkC-kWi0oND7~WZY}$5!#w6$l$Kru&Hjx4<4RMW!|$*ZpxMt9'
+        '_)gbRjJ*&=aYbRN1X)@}X$5mp1U~Z0%*(T=DA>RwjB>W%#oAHk$|j3Tv|@uEr5hAS*vl!wBp^kRQ8rmw?)em@!5Zc_!_Z2UVv>^-'
+        'leAP=XKA(}DM|wdRAdzmcn?v$%4k%slVX8VOlXm%3yhK+8o&OTQcDW{#5E-$p(G8+m9A>;m95?^?oblLYYzd5W#D0wm+R?pl&q>4'
+        '(dbjLPDkRw3{VtI!XSxHFdiNxl%n{Kt@$e)p;ej{WfU9)@p3|=jIX58U>(8x=+~N$Zg3sNKA}(3)(xR4i9NrHVmx}z;w(V%)Ws8L'
+        'w;o05%_2cBqNGaLKc=Hm5;K|Zm03*STPCA1ljy~ik2ec~D(5Ojn$hIYh&_7xK<ZLVuty1sy&N62YPwJbi9@em>m{uMfEbNdQj``O'
+        '0xC+9B_u7Y<TxyxC9t0`xy^=Y!3FRR#(piV!D@E>1**zy;m28UQ-Ek-y8)rc^{j^`hAdcD>5YftXqCe2o&xe0nSZig3Yp>sSzIOQ'
+        '$zWqdSH$yC5fxs!rleSB$I6i&VnPzw*lIl^9JQbHF{6}86nUyn0@&-UP>N0foK+>E@I9kACNUdYgr`BnY!^8SY7Ou-L))Ul5h^Ax'
+        'JVYtF;|olTH~Zekw&KUAnEL*pBYIgXV7w$M5>y83v2eer;s}lC(|nTXDzbP(sOO{LhNPpvv7)4?B&)kKDHmg2QK%q6mhx?ft*w+P'
+        'q#jet`JS1hh#t8DhLEEquV_@>d36&b^@2fcunwTui?i&e%ImZHR8)bMXSc@+>mjsSyE<(jr)pV4m_<pWpq!2)t)W`v9r?y-l@JQ+'
+        'y;+yX4%@lEp|*#7FW!IbIi+yww+hw`@^p>1wzTsdm3CW;(kE=~?OkW0gC(ts(n}Cs9W^c;s5nbkQCVRydNrqoBd7HdfN$?up5mR~'
+        'f!72hwdd0eVUiwqkRJUR6>#82@mn`2-1NH$)+D&$=FXgwFgkMf1qvp9wer?Dv_?L@i2~xSNXG26ivVpvKZ;4ZI@Y$h2l4pbXg?N>'
+        '@QQf15gyyOh?0Pt&__JYP7)z1%27|p(P|CC@<n|zVpCsC#A?3$lb{tT%8PYYzAazNp9qfv!PmU6SIiA?H{5x45}h;-8{%!Eq8ek*'
+        'JX#Q(VJvc*ttcsq1xCf%&k)647=b5k#9%a7jf-Xy2snMbI9r{dL+dI*DY%hFe#Q+@3<_)6Ecz34t%z1BI0sQ$dN^7|BNt+W2fjb<'
+        '4LsXAe8jS%B+n?k&=lcGNl_)_&Av#1Hr!N&XjFg`vDl1ymp)D&A15;VNJn+!T;oDs<X|IC5WT_K?UDMt48)w+>@@fmyw$N&bB=!0'
+        '@`Z^kZrvR>x?LdfbDvL*&ewMZw|WFw1y?*wLhxL1dt6pR9K=zQsRJ6v+1)6Vv9E!%6k=A^gp?j8X%Ur2%CQD1j7W?<KSISwfOWK5'
+        'dm)QyNds^o2=iGE(!MMs(7;DRHwMlkpoAT?yj!#(X_ffLF1i*I;z2@g<)^%}Svu;3FaSxjYPC*DQFv<tn%q>tv2zk-snGdGx<(qL'
+        '7?mX)T1t|z*q`GZsT1Un)Zi6*5f!~&-H~H0=<UOqm#?!lOU2P;Jj@A~Wt_cbL!6+Zm?&EEtl%Mr8I6v%skJCHN+Kpv0usmG2E4xH'
+        '2}EpzH*J{|S(RdML*gtLKaxcrr5+}H>VnZI5PcAwR6>iuGv*@Yrja9oXoiJvLoy(ZRxJ*}9jRb+(Z;*mC6Hd=!f2evmp;mYDg&)i'
+        'LA)|b&S%0LV^NfQD9(-}m&9pXpQ@rB*El6bgew$JTyz^kqwvlP!xFTU6lY;L8jDBS)KTSU9SB;biy%ft!3+>ntyhOdKD32N5zr_<'
+        'UQ>dHQ}k4}09vJ25d`dl$bJsd!6+tmT<38e7mtq7e8r>f4#|`S7At);P+1ZhrK|Q}#&xqZFE6=ac6h^4kx@KNxSUuFN_`wSVLaUc'
+        'vBLzxUVR#Sx|SPF{oGBmcqEAV-VnM1&_z3e-X~x|FTt5q73{Ag*ZAYWGnNB$i=xtt$~N!d^ev6DfIklUhQ#=;Sf2y>p)ljg4P-t9'
+        'KElwPWz=~T<jA<v$2Gx^TgNN&k3$CoPeci30ZA+b4^9xMD9$rpQV921;8{SH2a+bq&;7-f5LpZknHP}H1xJ#}t<=G_A}i>WFHl3X'
+        '#G_N<4#&K|VMnagL&?@X(EZ`{FNXg_-@#xTY#vV3KvAL<j7^rdR)8pBd0$6H`X8xcAMVR-l;Z66Nn0-|Nijr_dRY-fF*gHG9^V#~'
+        '5_WPtA*lE)DG{f!6XE7GOQHg7n5WyEIP%f6+Je=Qy_3Y-1WmARf4mGl`{96hv>u=_`CI}*PL`Sg(?m-b6BT6{D2wB0^fx2}Rg^-='
+        'hRCZuLDxoE#s^^TSWfRW5HWcKLk93PsPSf^U92^tB_)%)6eVaCL7Mr9oWNbQDMu6uCM8u#PqN0RA8aJBsfQQ|s>wG$35>Tw)%4Xl'
+        '@r2VsIywVo7i8)gMTW{r01L`%jC)f7K~-S96Vq@?6vd-3q*N8I2sCmEAV<2T_hUDaqf^k!3WJ#^4k`$y^8_gc<V5D6kUx!y7j&_h'
+        'T(Qnby^`XyXa=!;#hdL;tL>dEk?542I#triDf@J~yoOWu>STEZQ#-|3XWncVCfX>bwqHveQ02zvA9AF8os~_5%kjxLgCNI-a14Qr'
+        '325gyt+z=Cz&ANjl;osj!7Xoey-E>0Z?qpG45Szr2XeCRFcPDR<{9kOicivD4FSLkP&(D~#n{j&VVVRpv@v!op?%9#N9<pMRS5oW'
+        '2#+)%kLs}&EdjGjJfx8;4OpW(OhO8r8;J)@0Klr&5(FuXkBxZ28b!c@HbDDhK0ut-aP25zSSn2dvEai|c)&YQg>@)yl>F12{m4mX'
+        ';7z-%HH;~1HzgW~%H~RKFi?Ow3{hYL+e;0jK-xPW^9^~yCS{lLMY*9UA++#rXqHC6ZMBEYg|Uk%b7hd7rI}#met>?3y(6c<O0$%}'
+        'Jq@b>oAs*97{%8vxk@_+J0vMib7_a{L~kZ%khH`B`nEyx5km(uwmmE&>VmP*4Kso`?S)}x4_z~D(=nE&bmu;*4wLiL?V;RI7pf)S'
+        '@F05z`z*R-7}{Lf%WNTt+<H_MT74R5qoAZv6<9Y7J%o~=v_dh=^FUHP|IYVuG#GQ`5Y2){uHfZ|*%Fo(d{;8#fexZ$n6|*ujJ+S4'
+        's_N{07>597(%ZuXpe}T4t}ftzw)Om8${&?qQ#5JLm0pUyR{v6`zcWI;R)tX1g{#iU#~`32r9c6m$L{YtWRKnKYQ<4!3A_J5#<ZfT'
+        '3w4$zKj#dGhcclJAhqi}t1g!9vjey9Wbi85LbpVxdOERg-OCh*1F5cz4H4-2<OEi+aC>Q=456Ess%Q&mmL$qtX@xy3t4@NbqFL(f'
+        ')i((fX>IZnh`K5+i)X;!2wQ2J)+yTGo2qGPx_osf`4YGg2eT=S&hMQ>MO_7fGL(DRGCMNQ2;Wk>iG7^Fv<Xn)E4`m=*C0IO+=~lH'
+        'IGQV+JUaOB2Gil%hxv8!@KC0k351Vz!dgo~*-st=T2Bz{{0iIEcxsq<-@z;`{$_g;ujGrpn|HFBq-%1blJv6xt$Q<=y#umzC>v*K'
+        '-nX&7On^L)J)_tQAqI9*V)zHit_>!yDCWW<nmJ2;ex);wuuV(h%i?i)CYri%TuEjRhv+NnLT{zR;gk@?WkRTP-)^3VqAs-lZA>K>'
+        'KN<^t$^X)roZ){O3yuBxe69?pY%o=GFa<-gK{oz~F~5pj2vA-t*vhM<vpa*50Mw^^yYqaMV&N-b!(iK1JuNcbZb#fUgAIXxY)f)%'
+        '8*~o@ky>ne-;4hpdJmM^eG{VtKXAE@f*T&bCJl+C!wt7|Ki~Iq>i%~d@m5Q_^G?UUk-c!;N4(L}-v2&t>tt!L@qe!-%UPJ}#L0T>'
+        '`*3l5-q+C|H$kU(ohO+dYoR?xIxOw`=g^gYN|$0R7j~m!K5852r(m@rwwnv3ScYcLZdT8dpBtdE^|PF6k-sN#2{t-y>5wbkopFTS'
+        'Orv_h`^iI!rJL$3c?Ki7lM}?w2!}F!_#h9Z>?qc9mV6AFrF4YqYPubT0anUzevR5aAaf;hC-DW&wYym?N`1Hkr9;k4>8Xx8%FAG$'
+        '1~>C`QYaWn_h3Q<|3bU@4I1cs6(5IQCIUBmF?C-`8&J0Yxcy@L+wHg8-)_Hp{Wsf}uRq`ZpY2!M|2^COZu`aS&$qwZe*5~DuYWar'
+        '{hzj9ZGR)(^DW%-&Gy^vm)n=yueV>#{=@q}{=sbfo9!3d-@X28xP|}Y%k3Ah|Nix_UVr}j?`GTIZohc_*RTI(``g!lyZvUi{p$7S'
+        'uRq^@y?wd;a{KM}Us+GS+P>U=vry&=&rmo_^MBPaz~9#){w>Wv*Kqi%Y>zEsr4J_p2x%h)bazz9I<i|#Za)lPrf=^@zSq}w0@EAG'
+        ')J4CqZ3S#DTi*vegY3j>@&j5E!UA?YCK-nVv|)YsPApA~0jm@+S9*3ZcA(ehO2=6*ZruqJu5XrI-(YlL2FC*tx$J~1xu*sGfw)&^'
+        't_%gL@(wUl-~NzOFjMUd8-;7!*fv01|EQ=+eb0TJ$VhnMhoT$R&OLQ}nhIMC6F|)L*$oH;69hBabRzn=9cMQp4=gXrU_@O#k9DJl'
+        '4#w(3ac*GJ*cXOou*w3R$S+>dVknqPU1)Qqb?NV0-c6_#EH7uS48=@|mDg;A@Navrh$tq2f>I-LIFfjxD{V!aO@NSq=|}pA+nUcw'
+        'bWD!D5x4ZdFmdC~2gW}n5!WJm+Y3+;fW6O+|HMpqHBRU25)BSSaljRKuC(D8;zQ(d6>N0wJJviA&>$69=|wbfbL+l%2X&#r!s7cA'
+        'o9X@03_@BChZa1a_a$ZD&ktn0T`&9dT}vDM*7q=jU9xrdK5yg$cjmA%Bg1acW)63qo2@}{z-g&ygV$=Cm7z0TVaL75?G7DRAIx0O'
+        '=O(no=Z$97_kzKM%|7PdsmAeC+gsQcL_$=>C0igKcY(3_e?Oz-x}d=`?!kE0_@>xgW@)kb1!&fWOF~BvbX7M(T~|p+w7_wff$uH@'
+        '-Nx8eiLMhT(AB^<T#YPUf-RF6dZ=rvt1p%LPD><)g$yGl{@^XyR$vE2)9mHaa4f@L8oFu*q3zp9$HXW4a_Or^7}}<3JGS8<gdM}c'
+        's^u(^X$ICnOXXco#CwFM?w}>Kpa(WKZFh;6KG9vrz$6I60Q+H}TcNIzz*JSVR8`e*oTU*iZG+gFFQW^yckv8HDgiCw88`ilwvemi'
+        'B_^R6m<XA+;fDkx4HE~ep@l6HVq#)F2nh-u&BU(0bggBm6Wu}K(pm-&wAE_SOnk!EDH?W6vP8C~x`E?j+d{T)qQEkB4F$St1p3la'
+        'ZO6tT)_pTH1IKj?RZ{~$G<9U+B_3?JS-a0*rx2qVnAkCGJJfM#8rVl}fGpc|RA1LDWEg?#yBZ-_*Y%}lnug)q*w-yn3w7NNY&a18'
+        'WtFCcvZkUmq^R+}J>zcEXC3dUSR#ZhVZv?O3^l{@RaYmPZ!eLqSwwfSuWL96HH1Sm43O;;gCNy*1ERWtuIVnbZW9`T?+!#@TixkW'
+        '7K#hX*z=>5JB?wB2r}V7{v?R6QnCuK0+ePc3p8i0K3>492(p}Xsy2D-T+Phcyr!4OZ(JkYT7t|p{iSO7fr<$UeHRhav`w4nhD!q7'
+        'R}E~~j)`^b7#Ld)wsafTnS*Vx0cn=XPLptqliaZ$CP9o~y|k6Y<_bl(7f1ZX5r1*SUmWolNBqSRe{sZL9Pt-N{KXM}al~I7@fSz@'
+        '#SwpT#9tio7f1ZX5r1*SUmWolNBqSRe{sZL9Pt-N{KXMJ$q`=!Ymy+@ZC3lJt~y>#;XMN<BntrOXNWQ<mIu*+D;8eL^Fkx;z?X{1'
+        '*O{b?CXMu%4Co=CUIyw^xPJQTNW4zA>qrbKE%s-}5xot894H|Bc(6|1?YU^`qz0Q@-Y00Qn<qSS&bmp(qd|BQ@}ir8JQZzfMP~_f'
+        '3_+Uo`2OVR@oRG^i+W`D_M}>mL>tV^9#`reGO`x~>DUv{_N8%8hulg3o&b3$ZF~ako^<mGh<mftr(h0dwx0lSI3xZ9!21&DCqN%a'
+        'ygv!*gW3AyTIr_ukHgr@2rv$=M<8%k9?`bdK1sp2zPDrsZwUh_B*fSGPT4I}eVGEyy30eIA$z6?XjQI{4=4OLJQnSGYE0puz!zB%'
+        'Ptx4yN>%U(!&(9My8JH9&$~n~&80!cmv@cu#oJ+fX|C*Hqj(!wUk+1$Jj4mJj}+$MVQ%M%eQaUh%Wr3QyxLD_MYG#--AO`V>Bf9r'
+        'b#nwXm51;*S6}2PE&7>4jFyKdNyz#MPnYP^^&FhFiw=3wAul@QMTflTkQW{D6#HPi^GGUWRc6426I@8+zK5i7`&r`-DjoyREcVmP'
+        '9djxiLO#S%HyL}7+-@prml$s<+AycyRMe@4;~~tN#&0Ul9s<BeqrQuW5Rt;!IlX^Bi5vUOjR!?dbLZ)(*iT%ortM*maPq81xPGfO'
+        'spS(jI*NPyNH^YYYe$iEPi^h(U1x)=qsPeH7U}>)=_vu<-myHzJHG?3xx)y1{?F)SwHN;AZTszR*(wJg@CEysQl$|XnHdGh2E`TI'
+        'oZb65+yQc7@DAWKzMm_9;eD_dLUr!v%7<`+3;*vk6Xu8B4bwh8^gj7i{P8JJkHH_m|Ih4P^b_uSW#<uQfR|bjWOSkpAh}@wF}C$j'
+        'K0SCdv#m<EzxqwXnlRjbRnx8e`wqA9K}Cb#wiw_)K1L`A6qzY`)Z-mi<wcKD`2>i^D=GW2I!w-E@LIy*5l>5;&?BDS%O5=nYbVKd'
+        '5}HI#{Z<H3sYC_ut5jTexAPqa?NQ^fOSgSKCHD+tQ4=^W`i$Ts2BX0mRp@*Nq{lu!1*=0*J_Tr)+k6V*5CQrWyp}orDXPHiTUNVl'
+        '?IYf)=5v3OFEU6XKjK~XFwT!gI;tDz8kZeX{IRbiGw8qZw>oxe&e4y-VgX}Dcc{3)c}`dFqFGaD-|fNW<ON3B14B>$cht^*;A1&Z'
+        'f@B|zs#z?i=2Dg9QkCRMs*?1|k{mp=);BI5DqeDoU~579bxzJ@G-_HLte!He?{bZmQ2>uC$ubK1fdVe$Fb~#wnFzUC5@s6U*f|-j'
+        'BQpwVu<p!L=p#~tSLj7l^m--A-HdvrojMU?VNSR#`*kPY_z-u?U5t9CouU}yP=+gLoL$837UUS!{eJb1aUlINALCFC76uswIaEjF'
+        '`yGDJs2sA3fs$~)f&G52{HfSrn_E7f^{n=etLc`$a4k!9blU_S{6i0C`Tzab@4oz^YwXwC$4slExwE!D`tHlGqz8V~-fg!xeD~!y'
+        '2k!~Jw)EJ_<6+sIU1`rL0O|_uUVtKBK!HDeRf7_y@@p_6{eAZuTIXJ!-TS;#0qukDe*NF~P6sQW1?QCElT6#yUZJC;$>{p-<v%}A'
+        'P%HWF*I#$<df~kn*Ok3qy=2#*5D&cM!QQI-dkS^N9@*33Dok=O;f}hG>Tz9sU_iBn`)-V<voPO=;XKeoy+4%vEcNzu5XyBu#TY)H'
+        'E1!T++T#M%yZ%xx?jC*rrhDhC=-dmnx7cl;{^3`@+-nTEpDX|GfBycz?g-l6NE)m((yM>?*kdQiy*EO2kXQfk-Ip)F`}P0$?#tip'
+        '`_Q^(91x8f^8o+12cC3$PqK0)@Zdk~>5<Jn%m1r41gwr(y)!lS&EU?LFs8in*sGV`AO6cfH8nba|GAe)7&j}}7$qDiv$jx~f4bgz'
+        'Jw|~4Ao0e#tX$Nu*y<QKDsn=3Z5~!N%?Cp*qzv|}ba2Zbr4gaE{_YjgUKIlBn?N#EQ)5A{-X&`B)=hLyDEwNK262VK{vNDR3dM7T'
+        'Q0nAxwFe~}CD12UKS|{1g^<oJou5RH;tUD}pgS*@zsJ1je`s+gYE`xAheBk;85_rD6hKK$jP6Jn18{kkL$w?}*5#T&DkGFn%hG1x'
+        'YdG?8=M(9O3Xa#jI?MKaL2zd{dZp6jOVVI_KN?on)cVWl)a$#j(OlSQE^IUxHku0?&4rET!bWppqq(rrT-a#-7}#iJJy;G;9v!%H'
+        '2=2)6l`h(NE-MLSr=IpmoZS-KV}Uy5y5Gh{F<d+RteIf@Tb~*LbzI~9D(EBUc(88zNUUz5^)n8{J821$6VjVR*ADCKg|zCAkF;to'
+        'hXr<|7?9!*Z&KYWEKmoMK!k0tvlX#A_AJ=Fh~VG+o}Hb>0Fow7pC~vT1bd>Z>xN<Ls<Ct|)3z-KDtdE1#HMmN>(K6|qtyHiqF`vh'
+        'qut#__!YRlv|wSs%=-tXPt0poLzw`cSRv|hbLvpY)n>Ki#R_2-!dn)t<ArgSLCl#joDXjoP<nbulC$#BT_LMm%egWrGP#koD*<`U'
+        '?f|jU+YgxW_-#UwI8FkKN5@1wiAUSW2-$r3{dW6{d6As{UFS#FVWUA>;U9kWOYhIYFSAs2RxR6vkq{TaaI7x0x$@^-ocCs3^So{v'
+        're>IqYU}pGH5>;#MnB%`dlIg5b_Y0CL{0jn7ol*olCldInri5dtvZgO8O-}*K={F{uf3l@V8TLmElqbc+qHGu(G9UmOYq(C`oovV'
+        '%S+_tCGzqTd3lMvyhL7JA}`;G$V+((Z*wAeSoE2V5^}>VZvsa}M)5RD%!zGAQXdC``=4%rSR6mWUY!W>bS*bQ@)yg@?n$85ecRK('
+        '5C8Npn?vc3|9$gk{bjX3@Hj8=uXbA54@|RW=7ERLf9y6Ww6h^}1=GK1*S+@%Z~&A*hfx*muOmgn<G?dE9JeSc+rxcvj+RE{@IMav'
+        'hQ#=;Sf2y>q1rB!8_0a9TmeIKmQm+sn~{Y<9@hj<5IKGmd>lF$kZJ>7!Ms+m^P-|S&v;38zq7zI0znUCPm-Veiz}ftOex~(nB8!4'
+        'D|L00Jc|lo9XR0&)X-puJ1Ookwf`HYl975SW$O=ge|Y_i;Xl!LFxUp0hZ8kWlxPKG!zyhE?Kw(vnr+CDrJ9b+13TQ8+bG4^?US}%'
+        'Qj%iexb?Ckh~hdxb>jH8sB%Ts(}0T4l9DDk^(44C&622KA+jgioH+8)v)Y2yzNks!ZIsU5ZGXHBJo}l7ceEa$F-7zQgzRCP0Mqye'
+        'i;0S|43x!jH2NEofhtPD4+nLGqO>|e*GA>?4#3<M)89@^9>I_>Fb!&aD8eq*8qt!H$z6&Pw2D$h??x12+(nymM3G=pQh^ur1S??r'
+        '!A1g`dWeyrgk(7pjJHD7^wl}>gwsJfnj?P~Wa=43hN|7_5eC+i=`UD-ssO&<i8xR%Y7~Y<%FY#mMozI3RO5&=_G35Pm!r|&Nk2Nb'
+        'Z%H&)tro`f-1>)69@HWB=UyQ&i1FBGhhniTwdIJ%TL@7qgD?Ut$nBD3TK_uS(8{TSr*}*x^;7NVzf-{sqD2naCyZ_&(Qcau>;VoG'
+        'P3s@vce{5F;ZXYz<q+eu?_k{)X=AnEpyLqB!fm3DI(M=VoQKYiFbEHw|9IBi?#WDrU@8__^qI1AXwrBvSnt%s>pSe8T398!!Ba;)'
+        '&vm1Q&I;2>QiEUFsd)oUH~W<#0+m=85&WYg83quvxzY+ectPsD$Cs5mSE%=X6Zb*Af6KoU2u@<bC}QbBMqzW$Po#T(@>B7I3jg|#'
+        '{4N{*hHp^1#C5j@4|E>sYAQV_G!N-&<`?bQ(Ym}w`$MbGHIEb!2q%_4WdkEM{_3Blw|Vtz>9JQ|w=prV{srDtU1-1=@GtBkh|~e2'
+        'ds*SThi&d~*CIf10NJ6$%W`%&0-2k`3Vs^W9$11gx#C@h4TkqhqVuE~P{9^&wma?7`efxuPT8qbm998tpH5dD;gr2PS#^S`ok~c#'
+        'K5x00hr2M*AUw7GTH=809b1lyBjxL?YzWYfFX=G|axBBw5Xcz*bB@ynr3wM~CMSxLoRp0F?2WEhi9+Cw_Cv&~6yt(bPS%}w^1Q^l'
+        'E*+N+s2?J#U|1J;KJOp3`WrK3_jR|$=aMce{np<SU|?J6{Jc3E@X?1Hi#>9yIVSB&qeI132IS8E;wC%y*CNKyS;YR1)Zpm`oi7;l'
+        '?e3?vmpbkFTp3>NE%jTcgVz1?d&c1bD-jl*M~X56W+XO6O{HzGIm*_NBp4#d2=?kk44#3(dk<kI0V*@<Wg9}*P!+RtT~wZd(>HBe'
+        'WQ4M?c$I6#bbX?u&~&lC3_~3)HL|oq)6rc&^no#YsS=C=+clP<O>D=v^}t2}Qe8JtT>`8slzloLu<TYbYN0L1!Nf5%4Fy_gYQE{}'
+        'nrkfsvh)MTMMSrKL@YnVmWrIfahGbK5o}wQZZ3%#YAgu`zB-ZTp|pMqev+gceoU-VsCe%)Nx(R>17?}`ZX%v{6Qh*LfM&qiJuzZO'
+        'Qk1hgu9P6bCokn&ttf)S$XxoRf@&2_A=B<feu%hZKeF1T(tU;rDIx(%F_?#dzMF|IejK%2NEc`?a<-g|CX5><qllkOG)T9B`<R_U'
+        '0yo{I!we)zj)KxF)=^k`8C%8~Exd@y2R|l|C!kq6ynYHIhuxPTFffqrZR%WM_J1z|Ndi`vwl#fes%j%bI0%e!QKN&UUb<g%UFh}-'
+        '_-<-)XxlK&Hmm10DjAn<ow#G$y3=G3dUaM({X#sis7a<0bt1h01#3Pb6y177^uhzG)250fyHKa?$h|Y!X_AyEN(uIE5lx_zV9wWd'
+        '6KqS65rSxICy<}ERJftcU@4KrCm1s)m1bEm5aNQIM8VRH2)e01Q_VG0m)VF4W?yZ7H&nwh@1>PmJN~+&+np=*vc_#$EN`d@QT_6='
+        '+%L=h?OpD5iPoJ}o)A=208c?s$a`G#GJR0^;;Xcb60&D^EP^#jkaDej62w<2S%p{i=6qFuR971y`U0s1Mll6#P!z-d3@Myh2?TC@'
+        'R~AW(UHmG&Nkxs4en*s{y&Jg4_?EV!D1{mk@>_$NT_+Nv9C4OmP<u9rMo`Kpg5AzX1%aGb1vHc}N>_yDl*M%^z8;v%(DE(UQe6yN'
+        'I|_8))g9fn152}ALIPq~I#!A1>VD|>hUV&aXy~T1)G;KhF%~%3T)A$9NysJ)HVSBbzrxPPu_2Z4B7VScez?-$^%zLg2IE+Zkxzg)'
+        '@~40G;YWY=!AC!Qf5sb`NsY`zBeRY6gISuDUJ*p#s|p!$UXGZ99k4})DdPE%hkN@R2C#{?;K{tS5?Ugo?ei$vh!_B#&kOa3uE3EG'
+        'CfutH3|NYQ!+JvRYu)=Zq3$!!L~mY^uIpytXtru#TMe8g@)5x<)*a2XEEmomu5S@tRm0FAmZteWHq0ROb>DF<Sa#A;LTF9wHL^G+'
+        'nC+w8dm3%J9#ZLU7+rBZz$7OrE<EP#dM@u&U0t@83i9#*6<=B$b0y5EA7M<OrdF*I0%%Sn$d%`6SL15v-a`p!i|xq?+z5m>Qj{pg'
+        'C<gjMnDE9f0XiW{p}4&Ak@hUi=q;i!QZ0WXvmx^Y{THP0P@cz8>w@Z>7riwC$G&11261d##eS&ie&A?E=p!939mjTU&CxV12z_EB'
+        'kf*MWUF0rJ%^*bARm%!}SWtlEku=D-=xs$;fYK~wK|E|!`3J|>X`_<6W`J}DyEYD7%hFX#)d(^SUH3yDlDHjB3mwPML(|dxrG+(h'
+        'sbk-8HR3p`hAohKUA96v3pFPp=^*5>v{x1Qf)CCr`-u%Y|0fs!ZEAi1?iV=D<0d7WU=om`$f)#5AKNRwCRnb0TUc#)JAiwxI<v`#'
+        'w%#h(3TRjM&~8^t5pe9V5>{dage(z`C|($-e%4-sUMha8;p<AGN|nOb2o5cR8<8S1hGvLTbXWXf2HQ(K13H2kQ@dwTF^f|EQIfQr'
+        'W#Oz`lUaMLnjspj0g5O4GXl#s!Bxzcn)nBy?HhO)t>BzSvkdB!9Jd>=hlIGP%^$mS&`QHAIAw6L%6<%pCpyduC$SQX?bcpD)f1Ms'
+        'W!QG;JH8$gHPFKV8>&l8Csdcd;W{?KXi3~K3^g}2L&tK0r9*7hG?#{k17s-o{~y;Q?@<'
+    )))
+
+
+def _publication_fixture_job(tmp_path, mutate=None, command='native-publication-fixture'):
+    import hashlib
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results.model import canonical_bytes
+    f=_publication_birth_fixture(tmp_path);plan=_publication_fixture_plan()
+    if mutate is not None:mutate(plan)
+    plan.pop('fingerprint')
+    plan['fingerprint']=hashlib.sha256(canonical_bytes(plan)).hexdigest()
+    raw=cap.json_bytes(plan)
+    f['spec']['selection'].update(execution_id='execution-1',plan_fingerprint=plan['fingerprint'])
+    f['spec']['plan'].update(bytes=len(raw),sha256=hashlib.sha256(raw).hexdigest())
+    f['native']['execution_id']='execution-1'
+    f['native']['input_plan'].update(bytes=str(len(raw)),sha256=hashlib.sha256(raw).hexdigest())
+    f['locator'].update(execution_id='execution-1',plan_fingerprint=plan['fingerprint'])
+    f['arguments']=(command,'plan.json',str(f['result']),'--execution-id','execution-1',
+        '--source-graph','source-graph.json','--native-execution','native-execution.json',
+        '--native-calcjob-uuid',f['spec']['selection']['calcjob_uuid'])
+    for name,value in (('plan.json',plan),('capture-spec.json',f['spec']),
+        ('native-execution.json',f['native']),('capture-source.json',f['locator'])):
+        (f['job']/name).write_bytes(cap.json_bytes(value))
+    return f
+
+
+@pytest.mark.parametrize('relocate',[False,True])
+def test_publication_fixture_original_ingress_is_readonly_and_profile_portable(tmp_path, monkeypatch, relocate):
+    import qcl_negf_results.capture as cap
+    def moved(plan):
+        execution=plan['executions'][0]
+        execution['resource_estimate']['worker_capacity']=64
+        for history in [execution['provenance']['sources']]+[
+            section['input_assigning_histories'] for section in execution['resolved_snapshot']['sections'].values()]:
+            for key,values in history.items():
+                history[key]=[value.replace('fixture-source:', '/nix/store/fixture-source/') for value in values]
+    f=_publication_fixture_job(tmp_path,moved if relocate else None)
+    for name in ('ScalarPublisher','NativePerformanceInputs','NativePerformanceCapture'):
+        monkeypatch.setattr(cap,name,lambda *a,**k:pytest.fail('fixture entered technical capture'))
+    monkeypatch.setattr('qcl_negf_results.telemetry.TelemetryWriter',
+        lambda *a,**k:pytest.fail('fixture entered telemetry writer'))
+    before={str(p.relative_to(f['job'])):p.read_bytes() for p in f['job'].rglob('*') if p.is_file()}
+    assert _N3_observe(f)==0
+    assert {str(p.relative_to(f['job'])):p.read_bytes() for p in f['job'].rglob('*') if p.is_file()}==before
+    assert not(f['result']/'performance').exists() and not(f['result']/'performance-source.json').exists()
+
+
+@pytest.mark.parametrize('fault',['root','method','point','scattering','snapshot_model','raw_configuration',
+    'history_nonpath','history_fragment','history_order','history_unknown_source','history_trailing_separator','history_missing_key','worker_count'])
+def test_publication_fixture_rejects_whole_profile_mutation_before_technical_effect(tmp_path, monkeypatch, fault):
+    import qcl_negf_results.capture as cap
+    def mutated(plan):
+        execution=plan['executions'][0]
+        if fault=='root':plan['root_definition_id']='ordinary-study'
+        elif fault=='method':execution['method_id']='other'
+        elif fault=='point':plan['points'][0]['voltage_per_period_V']=.056
+        elif fault=='scattering':execution['resolved_configuration']['scattering']['lo_phonon']=True
+        elif fault=='snapshot_model':execution['resolved_snapshot']['model_binding']['model_sha256']='f'*64
+        elif fault=='raw_configuration':execution['resolved_snapshot']['raw_configuration']['scattering']['lo_phonon']=True
+        elif fault=='worker_count':execution['resolved_configuration']['execution']['worker_count']=2
+        else:
+            history=execution['resolved_snapshot']['sections']['output']['input_assigning_histories']
+            key='output.save_plots'
+            if fault=='history_nonpath':history[key][0]='unexpected-rule'
+            elif fault=='history_fragment':history[key][-1]+='changed'
+            elif fault=='history_order':history[key].reverse()
+            elif fault=='history_unknown_source':history[key][0]='/nix/store/other/unknown.yaml'
+            elif fault=='history_trailing_separator':history[key][0]='/nix/store/source/reference-2019-70k.yaml/'
+            else:del history[key]
+    f=_publication_fixture_job(tmp_path,mutated)
+    for name in ('ScalarPublisher','NativePerformanceInputs'):
+        monkeypatch.setattr(cap,name,lambda *a,**k:pytest.fail('invalid fixture reached capture effects'))
+    assert _N3_observe(f)==2
+    assert not(f['result']/'performance').exists() and not(f['job']/'live').exists()
+
+
+@pytest.mark.parametrize('fault',['ordinary_command','v1','missing_native','wrong_plan_claim','wrong_graph_claim'])
+def test_publication_fixture_never_downgrades_original_ingress(tmp_path, monkeypatch, fault):
+    import qcl_negf_results.capture as cap
+    f=_publication_fixture_job(tmp_path,command='run-plan' if fault=='ordinary_command' else 'native-publication-fixture')
+    if fault=='v1':
+        f['spec']['schema']='qcl-negf.capture-spec.v1';f['spec'].pop('native_performance')
+        (f['job']/'capture-spec.json').write_bytes(cap.json_bytes(f['spec']))
+    elif fault.startswith('wrong_'):
+        f['native']['input_plan' if fault=='wrong_plan_claim' else 'source_graph']['sha256']='f'*64
+        (f['job']/'native-execution.json').write_bytes(cap.json_bytes(f['native']))
+    monkeypatch.setattr(cap,'ScalarPublisher',lambda *a,**k:pytest.fail('fixture downgraded to ordinary capture'))
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC);os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    assert cap.observe(f['job']/'capture-spec.json',os.getpid(),cap._start_ticks(os.getpid()),read_fd,
+        native_execution_path=None if fault=='missing_native' else f['job']/'native-execution.json',
+        solver_arguments=f['arguments'])==2
+    assert not(f['result']/'performance').exists()
+
+
+
+def test_capture_admits_full_source_owned_plan_workspace_without_relaxing_actual_objects():
+    import qcl_negf_results.capture as cap
+    from qcl_negf_contracts.messages import ContractError
+
+    plan=_publication_fixture_plan();raw=cap.json_bytes(plan)
+    assert cap._capture_decode(raw)==plan
+    # The raw decoder has a separate conservative temporary-object forecast;
+    # accepted retained native/performance metadata still has its actual16k cap.
+    with pytest.raises(ContractError):cap._capture_credit([None]*16384)
+
+
+@pytest.mark.parametrize('fault',['caller_bytes','workspace','prospective_objects'])
+def test_capture_rejects_unfunded_decode_before_materialization(monkeypatch, fault):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_contracts.messages import ContractError
+    monkeypatch.setattr(cap,'decode_json',lambda *a,**k:pytest.fail('unfunded JSON materialized'))
+    if fault=='workspace':raw=b'{"long":"'+b'a'*700000+b'"}'
+    elif fault=='prospective_objects':raw=b'['+b'0,'*20000+b'0]'
+    else:raw=b'{"bounded":true}'
+    with pytest.raises((ValueError,ContractError)):
+        cap._capture_decode(raw,maximum_bytes=1024 if fault=='caller_bytes' else cap.CAPTURE_METADATA_BYTES)
+
+
+def test_publication_fixture_insufficient_io_refuses_before_original_plan_read(tmp_path):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    f=_publication_fixture_job(tmp_path)
+    f['spec']['credits']['io_bytes']=16384
+    raw=cap.json_bytes(f['spec']);(f['job']/'capture-spec.json').write_bytes(raw)
+    budget=ObserverIO(16384)
+    with pytest.raises(ValueError):cap._spec(f['job']/'capture-spec.json',budget=budget)
+    assert budget.read_bytes==len(raw) and budget.reserved==0
+    assert not(f['result']/'performance').exists()
+
+
+@pytest.mark.parametrize('strict,want',[(False,0),(True,125)])
+def test_fixture_supervisor_forwarded_cancel_cannot_accept_child_zero(tmp_path, strict, want):
+    solver_ready=tmp_path/'solver-ready';observer_ready=tmp_path/'observer-ready'
+    solver_script=('import os,pathlib,signal,sys,time; '
+        'signal.signal(signal.SIGTERM,lambda *a:sys.exit(0)); '
+        'pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); '
+        '\nwhile True: time.sleep(.01)')
+    observer_script=('import os,pathlib,sys,time; fd=int(sys.argv[1]); '
+        'pathlib.Path(sys.argv[2]).write_text(str(os.getpid())); data=b""; '
+        '\nwhile not data.endswith(b"\\n"):\n try: data+=os.read(fd,64)'
+        '\n except BlockingIOError: time.sleep(.005)')
+    helper=('import sys; from qcl_negf_results.capture import supervise; '
+        'print(supervise('+repr([sys.executable,'-c',solver_script,str(solver_ready)])+
+        ',observer_factory=lambda pid,start,fd:[sys.executable,"-c",'+repr(observer_script)+
+        ',str(fd),'+repr(str(observer_ready))+'],drain_seconds=.5,require_observer_success='+repr(strict)+'))')
+    process=subprocess.Popen([sys.executable,'-c',helper],stdout=subprocess.PIPE,stderr=subprocess.PIPE)
+    try:
+        deadline=time.monotonic()+3
+        while not solver_ready.exists() or not observer_ready.exists():
+            assert process.poll() is None and time.monotonic()<deadline
+            time.sleep(.01)
+        process.send_signal(signal.SIGTERM)
+        output,errors=process.communicate(timeout=3)
+        assert process.returncode==0 and not errors
+        assert output.strip()==str(want).encode()
+    finally:
+        if process.poll() is None:process.kill();process.communicate(timeout=2)
+        for marker in (solver_ready,observer_ready):
+            if marker.exists():
+                try:os.killpg(int(marker.read_text()),signal.SIGKILL)
+                except ProcessLookupError:pass

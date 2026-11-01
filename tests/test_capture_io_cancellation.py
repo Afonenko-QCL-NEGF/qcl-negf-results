@@ -329,3 +329,133 @@ def test_successful_regular_preserves_caller_exception(tmp_path):
                 assert stream.read() == b'data'
             raise
     assert caught.value is ambient
+
+
+@pytest.mark.parametrize('cancel',[False,True])
+def test_publication_birth_observer_preserves_primary_after_late_root_change(tmp_path, monkeypatch, cancel):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    from test_capture import _publication_birth_fixture
+    f=_publication_birth_fixture(tmp_path);budget=ObserverIO(128<<20)
+    saved=f['result'].with_name('original-birth-owned')
+    primary=Cancelled('fixture cancelled') if cancel else OSError('fixture read failed')
+    original=os.read
+    descriptors=len(os.listdir('/proc/self/fd'))
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC)
+    def interrupted(fd,count):
+        if fd==read_fd:
+            f['result'].rename(saved);f['result'].mkdir(mode=0o700)
+            raise primary
+        return original(fd,count)
+    monkeypatch.setattr(os,'read',interrupted)
+    try:
+        with pytest.raises(type(primary)) as caught:
+            cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+                cap._start_ticks(os.getpid()),read_fd,budget)
+        assert caught.value is primary
+        assert any('final validation/close' in note for note in primary.__notes__)
+        assert budget.reserved==0
+        with pytest.raises(OSError):os.fstat(read_fd)
+    finally:
+        os.close(write_fd)
+        if saved.exists():f['result'].rmdir();saved.rename(f['result'])
+    assert len(os.listdir('/proc/self/fd'))==descriptors
+
+
+
+def test_publication_birth_final_guard_error_survives_control_close_error(tmp_path, monkeypatch):
+    import qcl_negf_results.capture as cap
+    from qcl_negf_results._capture_io import ObserverIO
+    from test_capture import _publication_birth_fixture
+    f=_publication_birth_fixture(tmp_path);budget=ObserverIO(128<<20)
+    primary=OSError('held descriptor close failed')
+    original=cap._NativeResultGuard
+    class Guard(original):
+        def close(self,**kwargs):
+            super().close(**kwargs)
+            raise primary
+    monkeypatch.setattr(cap,'_NativeResultGuard',Guard)
+    read_fd,write_fd=os.pipe2(os.O_NONBLOCK|os.O_CLOEXEC);os.write(write_fd,b'exit 0\n');os.close(write_fd)
+    close=os.close
+    def closing(fd):
+        close(fd)
+        if fd==read_fd:raise OSError('control descriptor close failed')
+    monkeypatch.setattr(os,'close',closing)
+    with pytest.raises(OSError) as caught:
+        cap._observe_native_publication_fixture(f['job'],f['spec'],f['result'],os.getpid(),
+            cap._start_ticks(os.getpid()),read_fd,budget)
+    assert caught.value is primary
+    assert any('control close' in note for note in primary.__notes__)
+    assert budget.reserved==0
+
+
+
+def test_fixture_supervisor_setup_cancellation_preserves_primary_and_reaps_child(tmp_path, monkeypatch):
+    import sys
+    import qcl_negf_results.capture as cap
+    primary=Cancelled('observer setup cancelled');children=[]
+    popen=cap.subprocess.Popen
+    def spawn(*args,**kwargs):
+        child=popen(*args,**kwargs);children.append(child);return child
+    monkeypatch.setattr(cap.subprocess,'Popen',spawn)
+    def cancelled(*args):raise primary
+    try:
+        with pytest.raises(Cancelled) as caught:
+            cap.supervise([sys.executable,'-c','import time; time.sleep(30)'],
+                observer_factory=cancelled,require_observer_success=True,drain_seconds=0)
+        assert caught.value is primary
+        assert len(children)==1 and children[0].poll() is not None
+    finally:
+        for child in children:
+            if child.poll() is None:child.kill();child.wait(timeout=2)
+
+
+
+def test_fixture_supervisor_cancellation_survives_setup_pipe_close_error(monkeypatch):
+    import sys
+    import qcl_negf_results.capture as cap
+    primary=Cancelled('observer setup cancelled');failed=[];children=[]
+    popen=cap.subprocess.Popen;close=os.close
+    def spawn(*args,**kwargs):
+        child=popen(*args,**kwargs);children.append(child);return child
+    monkeypatch.setattr(cap.subprocess,'Popen',spawn)
+    def cancelled(pid,start,fd):
+        def closing(value):
+            close(value)
+            if value==fd and not failed:
+                failed.append(value);raise OSError('setup pipe close failed')
+        monkeypatch.setattr(os,'close',closing)
+        raise primary
+    try:
+        with pytest.raises(Cancelled) as caught:
+            cap.supervise([sys.executable,'-c','import time; time.sleep(30)'],
+                observer_factory=cancelled,require_observer_success=True,drain_seconds=0)
+        assert caught.value is primary
+        assert any('setup pipe close' in note for note in primary.__notes__)
+        assert len(children)==1 and children[0].poll() is not None
+    finally:
+        for child in children:
+            if child.poll() is None:child.kill();child.wait(timeout=2)
+
+
+
+def test_fixture_supervisor_final_pipe_close_refuses_success_and_restores_signals(monkeypatch):
+    import signal
+    import sys
+    import qcl_negf_results.capture as cap
+    previous={sig:signal.getsignal(sig) for sig in (signal.SIGINT,signal.SIGTERM)}
+    pipe=os.pipe2;close=os.close;terminal_fds=[]
+    def opening(flags):
+        read_fd,write_fd=pipe(flags);terminal_fds.append(write_fd);return read_fd,write_fd
+    def closing(fd):
+        close(fd)
+        if fd in terminal_fds:raise OSError('terminal pipe close uncertain')
+    monkeypatch.setattr(os,'pipe2',opening);monkeypatch.setattr(os,'close',closing)
+    def observer(pid,start,fd):
+        return [sys.executable,'-c','import os,sys,time; fd=int(sys.argv[1]); data=b""; '
+            '\nwhile not data.endswith(b"\\n"):\n try: data+=os.read(fd,64)'
+            '\n except BlockingIOError: time.sleep(.005)',str(fd)]
+    with pytest.raises(OSError,match='terminal pipe close uncertain'):
+        cap.supervise([sys.executable,'-c','import time; time.sleep(.1)'],
+            observer_factory=observer,require_observer_success=True,drain_seconds=.5)
+    assert {sig:signal.getsignal(sig) for sig in previous}==previous

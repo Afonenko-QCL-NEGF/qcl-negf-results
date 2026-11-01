@@ -32,7 +32,10 @@ from .commits import decode_json, json_bytes
 MIB = 1024 * 1024
 # F4 private retained/owned-buffer operational allowance. Public JSON/FileRef
 # bounds stay1MiB. This is neither a transitive callee peak nor an RSS limit.
-CAPTURE_METADATA_BYTES = 4 * MIB
+CAPTURE_METADATA_BYTES = 16 * MIB
+# Conservative predecode forests can overcount long original provenance. Actual
+# retained/input/performance object guards continue to use their existing16k cap.
+CAPTURE_PROSPECTIVE_OBJECTS = 65536
 
 
 @dataclass(frozen=True)
@@ -277,14 +280,19 @@ def _kill_group(child, signum):
             pass
 
 
-def supervise(solver_argv, *, observer_factory=None, drain_seconds=5.0):
+def supervise(solver_argv, *, observer_factory=None, drain_seconds=5.0,
+              require_observer_success=False):
     """No filesystem I/O after spawn except local proc. D-state observer is not awaited."""
+    if type(require_observer_success) is not bool:
+        raise ValueError("explicit observer requirement must be boolean")
     if not 0 <= drain_seconds <= 5:
         raise ValueError("observer drain must be in 0..5 seconds")
     child = subprocess.Popen(solver_argv, start_new_session=True)
     observer = None
     read_fd = write_fd = None
     termination = None
+    terminal_delivered = False
+    observer_timed_out = False
     previous = {}
 
     def forward(signum, frame):
@@ -304,14 +312,23 @@ def supervise(solver_argv, *, observer_factory=None, drain_seconds=5.0):
                 observer = subprocess.Popen(
                     argv, pass_fds=(read_fd,), start_new_session=True
                 )
-        except OSError, ValueError, IndexError:
+        except Exception as error:
+            if not require_observer_success and not isinstance(error, (OSError, ValueError, IndexError)):
+                raise
             # Julia was already spawned: observational failure can never retry it.
             # Inherited stderr can itself be an uninterruptible NFS write.
             pass
         finally:
+            primary = sys.exception()
             if read_fd is not None:
-                os.close(read_fd)
-                read_fd = None
+                try:
+                    os.close(read_fd)
+                except BaseException as cleanup:
+                    if primary is None:
+                        raise
+                    primary.add_note('supervisor setup pipe close: ' + str(cleanup))
+                finally:
+                    read_fd = None
         while child.poll() is None:
             if termination is not None and time.monotonic() - termination >= 5:
                 _kill_group(child, signal.SIGKILL)
@@ -319,9 +336,11 @@ def supervise(solver_argv, *, observer_factory=None, drain_seconds=5.0):
         code = child.wait()
         if write_fd is not None:
             try:
-                os.write(write_fd, f"exit {code}\n".encode())
-            except BlockingIOError, BrokenPipeError:
-                pass
+                terminal = f"exit {code}\n".encode()
+                terminal_delivered = os.write(write_fd, terminal) == len(terminal)
+            except OSError as error:
+                if not require_observer_success and not isinstance(error, (BlockingIOError, BrokenPipeError)):
+                    raise
         deadline = time.monotonic() + drain_seconds
         while (
             observer is not None
@@ -330,6 +349,7 @@ def supervise(solver_argv, *, observer_factory=None, drain_seconds=5.0):
         ):
             time.sleep(0.025)
         if observer is not None and observer.poll() is None:
+            observer_timed_out = True
             _kill_group(observer, signal.SIGKILL)
             # Ordinary killed observer gets a short nonblocking reap opportunity;
             # uninterruptible remote I/O cannot hold the solver supervisor forever.
@@ -337,12 +357,41 @@ def supervise(solver_argv, *, observer_factory=None, drain_seconds=5.0):
             while observer.poll() is None and time.monotonic() < deadline:
                 time.sleep(0.005)
             # No log write/ack: an unreaped observer remains scheduler authority.
+        if code == 0 and require_observer_success and (
+            observer is None or observer.poll() != 0 or not terminal_delivered
+            or observer_timed_out or termination is not None
+        ):
+            return 125
         return code if code >= 0 else 128 - code
+    except BaseException as error:
+        if require_observer_success:
+            # Cancellation/setup failure cannot leave an ordinary runnable child
+            # behind. No uninterruptible process wait or second solver spawn.
+            for owned in (observer, child):
+                if owned is None:
+                    continue
+                try:
+                    if owned.poll() is None:
+                        _kill_group(owned, signal.SIGKILL)
+                        deadline = time.monotonic() + .1
+                        while owned.poll() is None and time.monotonic() < deadline:
+                            time.sleep(.005)
+                except BaseException as cleanup:
+                    error.add_note('fixture supervisor owned child cleanup: ' + str(cleanup))
+        raise
     finally:
-        if write_fd is not None:
-            os.close(write_fd)
-        for signum, handler in previous.items():
-            signal.signal(signum, handler)
+        primary = sys.exception()
+        try:
+            if write_fd is not None:
+                try:
+                    os.close(write_fd)
+                except BaseException as cleanup:
+                    if primary is None:
+                        raise
+                    primary.add_note('supervisor terminal pipe close: ' + str(cleanup))
+        finally:
+            for signum, handler in previous.items():
+                signal.signal(signum, handler)
 
 
 def journal_batch(path, cursor, *, source_key, maximum_bytes=65536, maximum_rows=128, budget=None):
@@ -750,6 +799,41 @@ def _native_uuid(value):
         and value!='00000000-0000-0000-0000-000000000000')
 
 
+def _require_native_publication_fixture_profile(plan):
+    """Finite source-owned input selector; never creator or installed-source proof."""
+    from .model import canonical_bytes
+
+    value = deepcopy(plan)
+    value.pop('fingerprint', None)
+    sources = ('reference-2019-70k.yaml', 'analytical-diagnostic.yaml',
+               'native-publication-fixture.yaml')
+    for execution in value['executions']:
+        histories = [execution['provenance']['sources']] + [
+            section['input_assigning_histories']
+            for section in execution['resolved_snapshot']['sections'].values()]
+        for history in histories:
+            if type(history) is not dict:
+                raise ValueError('fixture provenance history must be an object')
+            for key, locators in history.items():
+                if type(locators) is not list or any(type(item) is not str for item in locators):
+                    raise ValueError('fixture provenance locators must be strings')
+                normalized = []
+                for locator in locators:
+                    path, separator, fragment = locator.partition('#')
+                    if path.startswith('/'):
+                        name = os.path.basename(path)
+                        if name not in sources:
+                            raise ValueError('unknown fixture provenance source')
+                        locator = 'fixture-source:' + name + separator + fragment
+                    normalized.append(locator)
+                history[key] = normalized
+        execution['resource_estimate'].pop('worker_capacity', None)
+    # Independently matched Julia/Python canonical v3 of the schema-valid source-owned plan.
+    # Keep all histories, rule origins, model/configuration and policy values.
+    if digest(canonical_bytes(value)) != '376aedbbfa31311f40bdffdb988242613629d128c0a97e8cdd2d6b14b8c42e47':
+        raise ValueError('native publication fixture full profile differs')
+
+
 def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budget):
     """Fixed worker input assertions, never an original creator/access proof.
 
@@ -763,10 +847,11 @@ def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budg
     from .state import _metadata_weight
     from .performance_views import _bounded_objects
 
+    fixture = bool(arguments and arguments[0] == 'native-publication-fixture')
     if (not isinstance(arguments, (tuple, list)) or len(arguments) not in (7, 11)
             or any(type(word) is not str for word in arguments)
             or sum(len(word.encode('utf-8')) for word in arguments) > 16384
-            or tuple(arguments[:2]) != ('run-plan', 'plan.json')
+            or tuple(arguments[:2]) != ('native-publication-fixture' if fixture else 'run-plan', 'plan.json')
             or tuple(arguments[3:7]) != ('--execution-id', spec['selection']['execution_id'],
                                       '--source-graph', 'source-graph.json')
             or (len(arguments) == 11 and tuple(arguments[7:]) !=
@@ -778,6 +863,7 @@ def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budg
     if path != root / 'native-execution.json':
         raise ValueError('native execution must be the explicit original workdir input')
     native3=spec['schema']=='qcl-negf.capture-spec.v3'
+    if fixture and not native3:raise ValueError('publication fixture requires original native3 ingress')
     if native3 and len(arguments)!=11:raise ValueError('native3 requires paired original native CLI operands')
     native, native_raw = (_capture_small_json(path,budget,(spec,arguments),maximum=16384) if native3
         else small_json(path,16384,budget=budget))
@@ -848,10 +934,19 @@ def _native_capture_inputs(root, spec, native_execution_path, arguments, *, budg
         _capture_credit(native,native_raw,plan,plan_raw,graph,graph_raw,arguments,spec,
             extra_bytes=2*_metadata_weight(spec['selection'])+4096,
             extra_objects=2*_capture_objects((spec['selection'],))+32)
+    if fixture:
+        # Admit the retained graph, projection copy and canonical encoding before
+        # allocation. No technical input object may be constructed on this path.
+        _capture_credit(native,native_raw,plan,plan_raw,graph,graph_raw,arguments,spec,
+            extra_bytes=3*_metadata_weight(plan)+MIB,
+            extra_objects=2*_capture_objects((plan,)))
+        _require_native_publication_fixture_profile(plan)
+    elif plan.get('root_definition_id') == 'native-publication-fixture-v1':
+        raise ValueError('reserved fixture plan requires its explicit engineering command')
     transport = dict(selection=deepcopy(spec['selection']), frozen_plan=dict(
         path='plan.json', bytes=str(len(plan_raw)), sha256=digest(plan_raw),
         schema=plan['schema'], media_type='application/json'))
-    if not native3:return output, transport
+    if not native3 or fixture:return output, transport
     if not _native_uuid(storage['execution_binding_uuid']):raise ValueError('original native UUID required')
     root_claim=lambda area,relative:dict(storage=storage,area=area,relative_path=relative)
     retained=(native,native_raw,plan,plan_raw,graph,graph_raw,arguments,spec,transport)
@@ -1190,8 +1285,14 @@ def _capture_decode(raw, *retained, source='performance metadata', maximum_bytes
     # forests cover parsed/detached operands; at most65 active diagnostic paths
     # plus Unicode/error/output headers are reserved before entering the codec.
     objects=2*(_context_raw_tree_bound(raw)//64+1)+67
-    _capture_credit(raw,*retained,extra_bytes=_capture_raw_workspace(raw),extra_objects=objects,maximum_bytes=maximum_bytes)
-    return decode_json(raw,source)
+    # This is a conservative temporary forest forecast, separate from the
+    # unchanged actual retained/input/performance16k object guard.
+    if _capture_objects((raw,*retained)) + objects > CAPTURE_PROSPECTIVE_OBJECTS:
+        fail('budget_exceeded', 'capture prospective decoder object cap exceeded')
+    _capture_credit(raw,*retained,extra_bytes=_capture_raw_workspace(raw),maximum_bytes=maximum_bytes)
+    value = decode_json(raw,source)
+    _capture_credit(raw,value,*retained,maximum_bytes=maximum_bytes)
+    return value
 
 
 def _capture_decoded_bound(value):
@@ -1684,10 +1785,94 @@ class NativePerformanceCapture:
         self.generation += 1
         return returned
 
+def _observe_native_publication_fixture(root, spec, output, pid, start_ticks, control_fd, budget):
+    """Read-only native3 birth observation, not creator/Q1 physical closure proof."""
+    guard = None
+    reserved = 0
+
+    def technical_absent():
+        for directory, names in ((root, ('performance', 'performance-source.json', 'live')),
+            (output, ('performance', 'performance-source.json',
+                      'performance-anchor-current.json', 'performance-anchors'))):
+            if any(os.path.lexists(directory / name) for name in names):
+                raise ValueError('publication fixture requires technical capture absent')
+
+    try:
+        if spec['schema'] != 'qcl-negf.capture-spec.v3':
+            raise ValueError('publication fixture requires original native3 capture')
+        for directory in (root, output):
+            if (not directory.is_absolute() or str(directory) != os.path.abspath(directory)
+                    or len(str(directory).encode()) > 4096):
+                raise ValueError('publication fixture original directory exceeds bound')
+        while not (root / 'capture-source.json').exists():
+            try:
+                os.read(control_fd, 64)
+            except BlockingIOError:
+                time.sleep(.1)
+            else:
+                raise ValueError('publication fixture has no birth before terminal')
+        locator, actual = _locator(root, spec, budget=budget, native_output=output)
+        technical_absent()
+        free = os.statvfs(actual)
+        if free.f_bavail * free.f_frsize < spec['credits']['reserve_bytes']:
+            raise ValueError('publication fixture admitted storage reserve exhausted')
+        # Each chain includes its own held /. Prepay the exact existing guard's
+        # final validation before holding anything; create_technical is skipped.
+        count = len(root.parts) + len(output.parts)
+        allowance = 129 + 2 * count * 4097
+        budget.reserve(allowance)
+        reserved = allowance
+        budget.require(258 + 3 * count * 4097 + 16384)
+        guard = _NativeResultGuard(root, output, locator['root_birth'], pid, start_ticks, budget)
+        guard.cleanup_reserved = reserved
+        reserved = 0  # The guard now owns this reservation, including on error.
+        terminal = bytearray()
+        while True:
+            try:
+                raw = os.read(control_fd, 64 - len(terminal))
+            except BlockingIOError:
+                time.sleep(.1)
+                continue
+            if not raw:
+                raise ValueError('publication fixture terminal observation missing')
+            terminal.extend(raw)
+            if terminal == b'exit 0\n':
+                break
+            if b'\n' in terminal or len(terminal) >= 64:
+                raise ValueError('publication fixture terminal observation differs')
+        current, current_root = _locator(root, spec, budget=budget, native_output=output)
+        if current != locator or current_root != actual:
+            raise ValueError('publication fixture birth locator changed')
+        technical_absent()
+    finally:
+        primary = sys.exception()
+        failure = primary
+        try:
+            if guard is not None:
+                guard.close()
+            elif reserved:
+                budget.reserved -= reserved
+        except BaseException as cleanup:
+            if failure is None:
+                failure = cleanup
+            else:
+                failure.add_note('publication fixture final validation/close: ' + str(cleanup))
+        try:
+            os.close(control_fd)
+        except BaseException as cleanup:
+            if failure is None:
+                failure = cleanup
+            else:
+                failure.add_note('publication fixture control close: ' + str(cleanup))
+        if primary is None and failure is not None:
+            raise failure
+
+
 def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetry_selection_factory=None,
             native_execution_path=None, solver_arguments=(), native_performance_inputs=None):
     """Only this disposable process imports Arrow or touches job/scratch/NFS files."""
     budget = ObserverIO(16384)
+    fixture = bool(solver_arguments and solver_arguments[0] == "native-publication-fixture")
     try:
         root, spec, known = _spec(spec_path, budget=budget)
     except BaseException as error:
@@ -1700,6 +1885,8 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
     performance_capture = None
     native_guard = None
     try:
+        if fixture and (native_execution_path is None or spec["schema"] != "qcl-negf.capture-spec.v3"):
+            raise ValueError("publication fixture requires original native3 ingress")
         if native_performance_inputs is not None and (native_execution_path is None or not isinstance(native_performance_inputs, NativePerformanceInputs)):
             raise ValueError('explicit typed native operands require the native ingress')
         if native_execution_path is not None:
@@ -1729,6 +1916,12 @@ def observe(spec_path, pid, start_ticks, control_fd, *, transport=None, telemetr
         except BaseException as cleanup:error.add_note('observer native input control close: '+str(cleanup))
         if not isinstance(error,Exception):raise
         return 2
+    if fixture:
+        try:
+            _observe_native_publication_fixture(root, spec, native_output, pid, start_ticks, control_fd, budget)
+        except Exception:
+            return 2
+        return 0
     credits = spec["credits"]
     began = time.monotonic()
     cursors = {}
@@ -2094,7 +2287,9 @@ def capture_run(spec_path, solver, arguments, *, native_execution_path=None):
             command.extend(['--native-execution', native_path, '--', *arguments])
         return command
 
-    return supervise([solver, *arguments], observer_factory=factory)
+    # Select strict engineering completion from literal argv before any remote I/O.
+    return supervise([solver, *arguments], observer_factory=factory,
+        require_observer_success=bool(arguments and arguments[0] == "native-publication-fixture"))
 
 
 if __name__ == "__main__":
