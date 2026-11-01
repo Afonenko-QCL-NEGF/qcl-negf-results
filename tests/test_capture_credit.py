@@ -521,12 +521,13 @@ def test_F4_retained_room_above_one_mib_does_not_enlarge_public_reader_limits():
 
 
 @pytest.mark.parametrize('operation',['decode','encode'])
-def test_F4_deep_owned_codec_refuses_before_diagnostic_paths_are_allocated(tmp_path,monkeypatch,operation):
+@pytest.mark.parametrize('key_bytes,admitted',[(500,True),(3000,False)])
+def test_F4_deep_owned_codec_admits_funded_paths_or_refuses_before_allocation(tmp_path,monkeypatch,operation,key_bytes,admitted):
     import json
     import qcl_negf_results.capture as cap
     from qcl_negf_results._capture_io import ObserverIO
     value=0
-    for _ in range(64):value={'k'*1000:value}
+    for _ in range(64):value={'k'*key_bytes:value}
     raw=json.dumps(value,separators=(',',':')).encode()
     calls=[]
     if operation=='decode':
@@ -535,28 +536,33 @@ def test_F4_deep_owned_codec_refuses_before_diagnostic_paths_are_allocated(tmp_p
         def decode(*a,**k):calls.append(True);return original(*a,**k)
         monkeypatch.setattr(cap,'decode_json',decode)
         budget=ObserverIO(2<<20)
-        with pytest.raises(ValueError,match='allowance'):
-            cap._capture_small_json(path,budget,())
+        if admitted:assert cap._capture_small_json(path,budget,())[0]==value
+        else:
+            with pytest.raises(ValueError,match='allowance'):cap._capture_small_json(path,budget,())
         assert budget.read_bytes==len(raw)
     else:
         original=cap.json_bytes
         def encode(v):calls.append(True);return original(v)
         monkeypatch.setattr(cap,'json_bytes',encode)
-        with pytest.raises(ValueError,match='allowance'):cap._capture_encode(value)
-    assert calls==[]
+        if admitted:assert cap._capture_encode(value)==raw
+        else:
+            with pytest.raises(ValueError,match='allowance'):cap._capture_encode(value)
+    assert calls==([True] if admitted else [])
 
 
-def test_F4_whitespace_refusal_spends_original_read_but_never_enters_decoder(tmp_path,monkeypatch):
+@pytest.mark.parametrize('admitted',[True,False])
+def test_F4_whitespace_keeps_spent_read_and_refuses_unfunded_decoder(tmp_path,monkeypatch,admitted):
     import qcl_negf_results.capture as cap
     from qcl_negf_results._capture_io import ObserverIO
     raw=b' '*(600000-7)+b'{"v":1}';path=tmp_path/'space.json';path.write_bytes(raw)
     calls=[];original=cap.decode_json
     def decode(*a,**k):calls.append(True);return original(*a,**k)
     monkeypatch.setattr(cap,'decode_json',decode)
-    budget=ObserverIO(2<<20)
-    with pytest.raises(ValueError,match='allowance'):
-        cap._capture_small_json(path,budget,(b'p'*(3<<20),))
-    assert calls==[] and budget.read_bytes==600000
+    budget=ObserverIO(2<<20);retained=(b'p'*((3 if admitted else 15)<<20),)
+    if admitted:assert cap._capture_small_json(path,budget,retained)[0]=={'v':1}
+    else:
+        with pytest.raises(ValueError,match='allowance'):cap._capture_small_json(path,budget,retained)
+    assert calls==([True] if admitted else []) and budget.read_bytes==600000 and budget.reserved==0
 
 
 def test_F4_manifest_declared_limit_is_checked_before_actual_reader_init(tmp_path,monkeypatch):
@@ -681,24 +687,26 @@ def test_F4_public_one_mib_raw_limit_precedes_read_write_or_encoder(tmp_path,mon
         if f is not None:f['writer'].close()
 
 
-@pytest.mark.parametrize('kind',['ascii','whitespace','bmp','wide','many-small','malformed'])
+@pytest.mark.parametrize('kind',['ascii','whitespace','bmp_funded','wide_funded','bmp_over','wide_over','many-small','malformed'])
 def test_F4_owned_decoder_adversarial_controls_keep_honest_spent_io(tmp_path,monkeypatch,kind):
     import json
     import qcl_negf_results.capture as cap
     from qcl_negf_results._capture_io import ObserverIO
     raw={'ascii':b'{"v":"small"}', 'whitespace':b' '*599993+b'{"v":1}',
-         'bmp':json.dumps({'v':'я'*100000},ensure_ascii=False).encode(),
-         'wide':json.dumps({'v':'😀'*100000},ensure_ascii=False).encode(),
+         'bmp_funded':json.dumps({'v':'я'*100000},ensure_ascii=False).encode(),
+         'wide_funded':json.dumps({'v':'😀'*50000},ensure_ascii=False).encode(),
+         'bmp_over':json.dumps({'v':'я'*250000},ensure_ascii=False).encode(),
+         'wide_over':json.dumps({'v':'😀'*150000},ensure_ascii=False).encode(),
          'many-small':json.dumps({'v':[{'k':str(n)} for n in range(1000)]},separators=(',',':')).encode(),
          'malformed':b'{"v":[}'}[kind]
     path=tmp_path/'owned.json';path.write_bytes(raw);budget=ObserverIO(2<<20)
     calls=[];original=cap.decode_json
     def decode(*a,**k):calls.append(True);return original(*a,**k)
     monkeypatch.setattr(cap,'decode_json',decode)
-    if kind in ('bmp','wide'):
+    if kind in ('bmp_over','wide_over'):
         # Legal raw can exceed the conservative owned workspace. Early refusal
         # remains an honest result, never a whitespace/Unicode format ban.
-        with pytest.raises(ValueError,match='allowance'):cap._capture_small_json(path,budget,())
+        with pytest.raises(ValueError,match='allowance|object cap'):cap._capture_small_json(path,budget,())
         assert calls==[]
     elif kind=='malformed':
         with pytest.raises(ValueError,match='invalid complete'):cap._capture_small_json(path,budget,())
@@ -706,6 +714,10 @@ def test_F4_owned_decoder_adversarial_controls_keep_honest_spent_io(tmp_path,mon
     else:
         value,original_raw=cap._capture_small_json(path,budget,())
         assert original_raw==raw and value==json.loads(raw) and calls==[True]
+        if kind in ('bmp_funded','wide_funded'):
+            # A caller can still tighten the uniform operational envelope.
+            with pytest.raises(ValueError,match='allowance'):cap._capture_decode(raw,maximum_bytes=4<<20)
+            assert calls==[True]
     assert budget.read_bytes==len(raw) and budget.reserved==0
 
 
@@ -776,7 +788,8 @@ def test_F4_prospective_owned_objects_refuse_before_effect_at_retained_edge(tmp_
         monkeypatch.setattr(cap,'regular',opened)
         invoke=lambda:cap._capture_read_admitted(tmp_path,cap._capture_ref('absent.json',raw,'fixture'),budget,retained=retained)
     elif operation=='decode':
-        retained=(tuple(None for _ in range(16380)),)
+        # No actual cardinality room remains for even the supplied raw operand.
+        retained=(tuple(None for _ in range(16383)),)
         original=cap.decode_json
         def decode(*a,**k):calls.append('decode');return original(*a,**k)
         monkeypatch.setattr(cap,'decode_json',decode)
@@ -865,7 +878,7 @@ def test_F5_before_index_admission_dominates_every_owned_suffix_check(tmp_path, 
     finally:writer.close()
 
 
-@pytest.mark.parametrize('raw_bytes,admitted', [(200000, True), (600000, False)])
+@pytest.mark.parametrize('raw_bytes,admitted', [(200000, True), (600000, True), (1048577, False)])
 def test_N3_original_plan_role_keeps_public_cap_and_honest_private_admission(tmp_path, raw_bytes, admitted):
     import qcl_negf_results.capture as cap
     from qcl_negf_results._capture_io import ObserverIO
@@ -879,9 +892,9 @@ def test_N3_original_plan_role_keeps_public_cap_and_honest_private_admission(tmp
     (f['job']/'capture-spec.json').write_bytes(cap.json_bytes(f['spec']))
     budget=ObserverIO(16384)
     if not admitted:
-        with pytest.raises(ValueError,match='metadata allowance'):
+        with pytest.raises(ValueError,match='bounded frozen plan|allowance'):
             cap._spec(f['job']/'capture-spec.json',budget=budget)
-        assert budget.read_bytes>=raw_bytes and not (f['result']/'performance').exists()
+        assert 0<budget.read_bytes<raw_bytes and not (f['result']/'performance').exists()
         return
     root,spec,_=cap._spec(f['job']/'capture-spec.json',budget=budget)
     output,transport,inputs=cap._native_capture_inputs(root,spec,f['job']/'native-execution.json',f['arguments'],budget=budget)
@@ -910,3 +923,18 @@ def test_N3_guard_credit_denial_and_final_close_use_one_spent_ledger(tmp_path):
     finally:guard.close()
     assert budget.used>spent and budget.reserved==0
     assert len(list(Path('/proc/self/fd').iterdir()))==before
+
+
+@pytest.mark.parametrize('one_over',[False,True])
+def test_F4_decoded_actual_object_limit_is_independent_of_prepaid_temporary_forests(monkeypatch,one_over):
+    import qcl_negf_results.capture as cap
+    retained=tuple(None for _ in range(16380+int(one_over)))
+    calls=[];decode=cap.decode_json
+    def observed(*a,**k):calls.append(True);return decode(*a,**k)
+    monkeypatch.setattr(cap,'decode_json',observed)
+    # A temporary forest is prepaid separately, but the accepted raw+decoded+
+    # retained graph must still fit exactly16384 actual objects before return.
+    if one_over:
+        with pytest.raises(ValueError,match='object cap'):cap._capture_decode(b'{"v":1}',retained)
+    else:assert cap._capture_decode(b'{"v":1}',retained)=={'v':1}
+    assert calls==[True]
