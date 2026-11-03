@@ -31,7 +31,7 @@ def canonical(value):
     return b'm'+str(len(value)).encode()+b'{'+b''.join(canonical(k)+canonical(value[k]) for k in sorted(value))+b'}'
 
 
-def fixture(root, *, null_outputs=(), chunks=False, plan_bytes=PLAN, invalid_model=False, plan_kind="nested_sweep", nz=4, ne=3, nk=2, nb=2):
+def fixture(root, *, null_outputs=(), chunks=False, plan_bytes=PLAN, invalid_model=False, plan_kind="nested_sweep", nz=4, ne=3, nk=2, nb=2, report_metric_count=0):
     root=Path(root)
     wire = dict(spectral_integral=np.zeros((nk,nb,nb),dtype='<c16'),
         spectral_integral_eigenvalues=np.zeros((nk,nb),dtype='<f8'),
@@ -42,6 +42,10 @@ def fixture(root, *, null_outputs=(), chunks=False, plan_bytes=PLAN, invalid_mod
     diagnostic['positivity']['data']['integrals']['total_blocks_per_kind']=integer(ne*nk)
     manifest=json.loads((root/selected['manifest']['path']).read_bytes())
     state=checkpoint['state']['fields']; scba=state['scba']['fields']
+    # Dense typed reports occur independently of the scientific array sizes.
+    # All values are constructor literals; this fixture does not run Core.
+    state['final_evidence']['fields']['report']['fields']['metrics']['entries']=[
+        dict(key=symbol('manufactured_metric_'+str(i)),value=ieee()) for i in range(report_metric_count)]
     state['published_U']['shape']=state['published_n']['shape']=[str(nz)]
     for owner in [scba['green']['fields']]+[entry['value']['fields'] for entry in scba['scattering']['entries']]+[scba[n]['fields'] for n in ('embedding','embedding_plus','embedding_minus')]:
         for value in owner.values():
