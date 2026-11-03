@@ -277,6 +277,7 @@ def test_changed_contracts_package_source_rejects_before_factory_or_artifact_acc
     before, after = (b'Public', b'public') if path.suffix == '.py' else (b'Model help', b'model help')
     changed = raw.replace(before, after, 1)
     assert changed != raw and len(changed) == len(raw)
+    path.chmod(path.stat().st_mode | 0o200)
     path.write_bytes(changed)
     env = dict(os.environ, PYTHONPATH=os.pathsep.join((str(package.parent),
         str(Path(qcl_negf_results.__file__).parent.parent))))

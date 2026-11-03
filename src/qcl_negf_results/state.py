@@ -81,7 +81,7 @@ def _metadata_weight(value):
 
 
 _context_arena = ContextVar('qcl_results_metadata_context_arena', default=None)
-_CONTEXT_MAXIMUM = 128 * 1024 * 1024
+_CONTEXT_MAXIMUM = 160 * 1024 * 1024
 _CONTEXT_VALIDATION = 112 * 1024 * 1024
 _CONTEXT_PROFILE_IO = 6 * 1024 * 1024
 _context_call_lock = Lock()
@@ -588,7 +588,7 @@ class _MetadataArena:
     """
     def __init__(self, maximum):
         if type(maximum) is not int or not 0<maximum<=_CONTEXT_MAXIMUM:
-            raise ValueError('maximum_context_bytes must be an integer in 1..134217728')
+            raise ValueError('maximum_context_bytes must be an integer in 1..167772160')
         self.validation_reservation=_CONTEXT_VALIDATION;self.profile_bytes_read=0;self.profile_io_remaining=_CONTEXT_PROFILE_IO
         self.maximum=maximum;self.high_water=0;self.trace=[];self.readers=[];self.held=[];self.scratch=0;self.failure=None
         self.before('arena header')

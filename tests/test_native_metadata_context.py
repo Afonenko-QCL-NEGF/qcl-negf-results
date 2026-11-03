@@ -14,8 +14,8 @@ from consumer_context_fixture import fixture
 M=1024*1024
 
 
-def context_fixture(root, *, final=False):
-    state,observations,value,checkpoint,_=fixture(root,plan_kind='scientific_plan_v2')
+def context_fixture(root, *, final=False, report_metric_count=0):
+    state,observations,value,checkpoint,_=fixture(root,plan_kind='scientific_plan_v2',report_metric_count=report_metric_count)
     manifest=json.loads((root/state['manifest']['path']).read_bytes())
     refs={a['role']:{k:a[k] for k in ('path','bytes','sha256','schema','media_type')} for a in manifest['artifacts'] if a['role'] in ('plan','model')}
     return dict(artifact_root=root,state_ref=state,expected_identity=state['identity'],plan_ref=refs['plan'],model_ref=refs['model'],
@@ -168,7 +168,7 @@ def test_full_original_checkpoint_detached_tuple_and_whole_call_counters(tmp_pat
     assert again[0]==manifest and again[1]==checkpoint
 
 
-@pytest.mark.parametrize('field,bad',[('maximum_context_bytes',True),('maximum_context_bytes',0),('maximum_context_bytes',128*M+1),('maximum_context_bytes','134217728'),('maximum_retained_bytes',True),('maximum_retained_bytes',0),('maximum_retained_bytes',128*M+1),('maximum_retained_bytes','4194304')])
+@pytest.mark.parametrize('field,bad',[('maximum_context_bytes',True),('maximum_context_bytes',0),('maximum_context_bytes',160*M+1),('maximum_context_bytes','167772160'),('maximum_retained_bytes',True),('maximum_retained_bytes',0),('maximum_retained_bytes',128*M+1),('maximum_retained_bytes','4194304')])
 def test_bad_budget_before_root_access(tmp_path,monkeypatch,field,bad):
     args,_,_,_=context_fixture(tmp_path);args[field]=bad;calls=[]
     monkeypatch.setattr(StateReader,'_root_identity',lambda self:calls.append(True))
@@ -198,6 +198,37 @@ def test_whole_context_originals(tmp_path,monkeypatch,final):
         assert result[2].io_counters==result[3].io_counters==result[4].io_counters
     assert 112*M<=arenas[0].high_water<=128*M
     print('CONTEXT_SUCCESS',final,result[2].io_counters,arenas[0].trace)
+
+
+def test_dense_produced_original_metadata_explicit_workspace_and_retained_allowances(tmp_path,monkeypatch):
+    """Rejecting an admitted dense report or dropping its copies is a regression."""
+    from dataclasses import replace
+    from qcl_negf_results import state
+    args,manifest,checkpoint,value=context_fixture(tmp_path,final=True,report_metric_count=2000)
+    args.update(limits=replace(args['limits'],maximum_metadata_bytes=8*M),
+        maximum_context_bytes=160*M,maximum_retained_bytes=16*M)
+    arenas=[];original=api._MetadataArena
+    class MeasuredArena(original):
+        def __init__(self,*a,**k):super().__init__(*a,**k);arenas.append(self)
+    monkeypatch.setattr(api,'_MetadataArena',MeasuredArena)
+    monkeypatch.setattr(StateReader,'_read_selected_array',lambda *a,**k:pytest.fail('numerical payload selected'))
+    result=bridge()(**args)
+    assert result[0]==manifest and result[1]==checkpoint and result[4].declaration==value
+    assert result[4].declaration['source_mode']=='produced'
+    assert len(result[1]['state']['fields']['final_evidence']['fields']['report']['fields']['metrics']['entries'])==2000
+    retained=state._context_weight(result);counters=result[2].io_counters
+    assert 8*M<retained<=16*M
+    assert 128*M<counters['metadata_high_water_bytes']<=160*M
+    assert counters['bytes_read_total']<=16*M and counters['logical_selected_bytes']==0
+    assert all(r._closed and not r._handles for r in arenas[0].readers)
+    assert state._context_arena.get() is None
+    with pytest.raises(ContractError,match='arena exceeded'):
+        bridge()(**dict(args,maximum_context_bytes=128*M))
+    with pytest.raises(ContractError,match='retained metadata context exceeds allowance'):
+        bridge()(**dict(args,maximum_retained_bytes=8*M))
+    assert all(r._closed and not r._handles for a in arenas for r in a.readers)
+    assert state._context_arena.get() is None
+    print('DENSE_PRODUCED_CONTEXT',dict(retained_W=retained,checkpoint_W=state._context_weight(checkpoint),counters=counters))
 
 
 def test_one_io_object_initialization_nested_stability_and_close(tmp_path,monkeypatch):

@@ -420,7 +420,7 @@ def describe_native_metadata_context(artifact_root, *, state_ref: Document,
     """One bounded original metadata closure, without native/science authority.
 
     ``maximum_context_bytes`` is aggregate explicit metadata accounting (at most
-    128 MiB), not a Python/HDF allocator or process RSS guarantee. All operations,
+    160 MiB), not a Python/HDF allocator or process RSS guarantee. All operations,
     initialization, nested validation, stability and close share one physical
     stream-delivery allowance. On any failure no partial tuple is returned.
     """
